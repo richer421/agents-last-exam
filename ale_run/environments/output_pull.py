@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import logging
+import ntpath
 import shlex
 import shutil
 from pathlib import Path
@@ -257,11 +258,16 @@ async def pull_to_host(
     # rest, and many small files no longer serialise into a long tail.
     jobs: list[tuple[str, Path]] = []
     for entry in entries:
-        rel = entry["relpath"]
+        listed_path = entry["relpath"]
+        if not sandbox.is_linux and ntpath.isabs(listed_path):
+            rel = ntpath.relpath(listed_path, src)
+            remote_path = listed_path
+        else:
+            rel = listed_path
+            remote_path = f"{src.rstrip(sep)}{sep}{rel}"
         if entry.get("is_dir"):
             (dest_dir / rel.replace("\\", "/")).mkdir(parents=True, exist_ok=True)
             continue
-        remote_path = f"{src.rstrip(sep)}{sep}{rel}"
         local_path = dest_dir / rel.replace("\\", "/")
         local_path.parent.mkdir(parents=True, exist_ok=True)
         jobs.append((remote_path, local_path))
