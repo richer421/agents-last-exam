@@ -39,14 +39,30 @@ def test_windows_oss_command_uses_ecs_role_and_internal_endpoint() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ensure_ossutil_requires_windows_bootstrap_binary(monkeypatch) -> None:
+async def test_ensure_ossutil_uses_runtime_cache_without_env(
+    monkeypatch, tmp_path,
+) -> None:
     monkeypatch.delenv("ALE_OSSUTIL_WINDOWS_BIN", raising=False)
+    binary = tmp_path / "ossutil64.exe"
+    binary.write_bytes(b"ossutil")
+    monkeypatch.setattr(
+        "ale_run.environments.task_data.ossbucket._OSSUTIL_WINDOWS_EXE_SHA256",
+        "2d9ccdf7354fcc9afd5651bb7c5c2d1e04a1fd4ebd1612a0786142af43e3c66a",
+    )
+    monkeypatch.setattr(
+        "ale_run.environments.task_data.ossbucket._windows_ossutil_candidates",
+        lambda: [binary],
+    )
     sandbox = SimpleNamespace(
         is_linux=False,
         run_command=AsyncMock(
             return_value=SimpleNamespace(returncode=1, stdout="", stderr="")
         ),
+        write_file=AsyncMock(),
     )
 
-    with pytest.raises(RuntimeError, match="ALE_OSSUTIL_WINDOWS_BIN"):
-        await _ensure_ossutil(sandbox)
+    await _ensure_ossutil(sandbox)
+
+    sandbox.write_file.assert_awaited_once_with(
+        r"C:\Windows\Temp\ale-ossutil.exe", b"ossutil"
+    )

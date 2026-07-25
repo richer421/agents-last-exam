@@ -323,6 +323,7 @@ class DockerExecutor(BaseExecutor):
 
     async def download_range(
         self, *, src: str, start: int, max_bytes: int,
+        timeout_s: float | None = None,
     ) -> RangeResult:
         def _read() -> RangeResult:
             p = Path(src)

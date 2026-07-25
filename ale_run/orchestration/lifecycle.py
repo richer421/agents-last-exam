@@ -40,7 +40,7 @@ from ..executors import DockerExecutor, LocalExecutor, SandboxExecutor
 from ..tasks.loader import TaskLoader
 from ..tasks.driver import TaskDriver
 from .factory import EnvironmentRouter, build_config, resolve_agent
-from .run_writer import RunWriter, slug_task
+from .run_writer import RunWriter, sanitize_evaluation_log, slug_task
 from .experiment_spec import ArtifactsSpec, RunUnit, UnitResult
 from .termination import classify_error, err_dict, redact_config
 
@@ -196,6 +196,7 @@ async def run_one_unit(
     eval_status = "not_executed"
     eval_duration_s: float | None = None
     eval_error: dict[str, Any] | None = None
+    eval_details: dict[str, Any] | None = None
     output_gather_report: dict[str, Any] | None = None
     cleanup_failed = False
     # Execution window timestamps. ``started`` (above) is the ENQUEUE time, so
@@ -305,6 +306,7 @@ async def run_one_unit(
             if isinstance(executor, SandboxExecutor):
                 hot = tuple(getattr(deployer_cls, "hot_artifacts", ()) or ())
                 if hot:
+                    executor.hot_artifacts = hot
                     sep = "/" if env.sandbox.is_linux else "\\"
                     tail_targets = [
                         (
@@ -313,7 +315,10 @@ async def run_one_unit(
                         )
                         for name in hot
                     ]
-                    from ..executors.sandbox import tail_hot_artifacts
+                    from ..executors.sandbox import (
+                        _TAIL_RECONCILE_TIMEOUT_S,
+                        tail_hot_artifacts,
+                    )
                     writer.emit_event(
                         "incremental_pull_started",
                         targets=[t[0] for t in tail_targets],
@@ -356,13 +361,20 @@ async def run_one_unit(
                 if tail_task is not None:
                     stop_event.set()
                     try:
-                        reconcile_err = await asyncio.wait_for(tail_task, timeout=120)
+                        reconcile_err = await asyncio.wait_for(
+                            tail_task,
+                            timeout=_TAIL_RECONCILE_TIMEOUT_S + 5,
+                        )
                     except asyncio.TimeoutError:
                         tail_task.cancel()
-                        reconcile_err = "tail reconcile wait timed out"
+                        try:
+                            await tail_task
+                        except asyncio.CancelledError:
+                            pass
+                        reconcile_err = "tail reconcile outer wait timed out"
                     if reconcile_err:
                         writer.emit_event(
-                            "incremental_pull_final_failed", error=reconcile_err,
+                            "incremental_pull_final_partial", warning=reconcile_err,
                         )
             writer.emit_event(
                 "agent_finished",
@@ -385,15 +397,23 @@ async def run_one_unit(
                             "transport": gather_report.transport,
                             "files": gather_report.files,
                             "error": gather_report.error,
+                            "warnings": gather_report.warnings,
+                            "complete": False,
                         },
                     )
                 else:
                     writer.emit_event(
-                        "origin_log_gather_done",
+                        (
+                            "origin_log_gather_partial"
+                            if gather_report.warnings
+                            else "origin_log_gather_done"
+                        ),
                         report={
                             "transport": gather_report.transport,
                             "files": gather_report.files,
                             "bytes": gather_report.bytes,
+                            "warnings": gather_report.warnings,
+                            "complete": not gather_report.warnings,
                         },
                     )
             except Exception as e:
@@ -431,13 +451,40 @@ async def run_one_unit(
             #     `debug/eval/result.json` raw dump has no destination here.
             env.set_phase("evaluation")
             eval_start = time.monotonic()
+            writer.emit_event(
+                "evaluation_started",
+                mode=(
+                    "near_data"
+                    if callable(getattr(executor, "evaluate_task", None))
+                    else "host"
+                ),
+            )
             # End of the execution window (everything up to, but excluding, eval).
             exec_ended = eval_start
             try:
                 eval_out = await asyncio.wait_for(
-                    task_driver.evaluate(), timeout=_EVAL_TIMEOUT_S,
+                    _evaluate_task(
+                        task_driver=task_driver,
+                        executor=executor,
+                        task_path=task_path,
+                        variant=unit.variant_index,
+                        timeout_s=_EVAL_TIMEOUT_S,
+                    ),
+                    timeout=_EVAL_TIMEOUT_S,
                 )
                 eval_duration_s = round(time.monotonic() - eval_start, 4)
+                if isinstance(eval_out, dict):
+                    evaluator_log = eval_out.pop("_ale_evaluator_log", None)
+                    if isinstance(evaluator_log, str):
+                        (writer.run_dir / "evaluation.log").write_text(
+                            sanitize_evaluation_log(evaluator_log),
+                            encoding="utf-8",
+                        )
+                    eval_details = {
+                        key: value
+                        for key, value in eval_out.items()
+                        if key not in {"score", "error"}
+                    } or None
                 if eval_out is None or eval_out.get("error"):
                     eval_status = "failed"
                     eval_error = (
@@ -461,9 +508,21 @@ async def run_one_unit(
                 logger.error("evaluate timed out after %ds for %s", _EVAL_TIMEOUT_S, unit.slug)
             except Exception as e:
                 eval_duration_s = round(time.monotonic() - eval_start, 4)
+                evaluator_log = getattr(e, "evaluator_log", None)
+                if isinstance(evaluator_log, str):
+                    (writer.run_dir / "evaluation.log").write_text(
+                        sanitize_evaluation_log(evaluator_log),
+                        encoding="utf-8",
+                    )
                 eval_status = "failed"
                 eval_error = err_dict(e)
                 logger.exception("evaluate raised for %s", unit.slug)
+            writer.emit_event(
+                "evaluation_finished",
+                status=eval_status,
+                score=score,
+                duration_s=eval_duration_s,
+            )
 
             # ============================================================
             # Trajectory finalize via deployer.parse_artifacts (LOG_SPEC §5)
@@ -653,6 +712,7 @@ async def run_one_unit(
         score=score,
         eval_duration_s=eval_duration_s,
         error=eval_error,
+        details=eval_details,
     )
 
     run_meta = _build_run_meta(
@@ -1020,6 +1080,25 @@ async def pull_agent_output(
         logger.warning("push_to_gcs failed (best-effort): %s", e)
         writer.emit_event("output_gather_failed", transport="gcs", error=str(e))
         return {"status": "failed", "transport": "gcs", "error": str(e)}
+
+
+async def _evaluate_task(
+    *,
+    task_driver: TaskDriver,
+    executor: BaseExecutor,
+    task_path: Path,
+    variant: int,
+    timeout_s: float,
+) -> dict[str, Any]:
+    """Prefer an executor's near-data evaluator capability when available."""
+    near_data = getattr(executor, "evaluate_task", None)
+    if callable(near_data):
+        return await near_data(
+            task_path=task_path,
+            variant=variant,
+            timeout_s=timeout_s,
+        )
+    return await task_driver.evaluate()
 
 
 async def stage_reference(

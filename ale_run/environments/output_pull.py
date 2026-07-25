@@ -428,8 +428,9 @@ async def push_to_oss(
     logger.info("push_to_oss: %s → %s", src, oss_dst)
     r = await sandbox.run_command(cmd, timeout=_OSS_PUSH_TIMEOUT_S)
     if r.returncode != 0:
+        diagnostic = (r.stderr or r.stdout or "unknown ossutil failure").strip()
         raise RuntimeError(
-            f"ossutil cp failed (rc={r.returncode}): {(r.stderr or '')[:300]}"
+            f"ossutil cp failed (rc={r.returncode}): {diagnostic[:300]}"
         )
     return {
         "transport": "oss",

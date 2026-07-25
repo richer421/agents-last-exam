@@ -1,0 +1,12 @@
+harness: codex
+id: codex-blind-1
+model: gpt-5.6-sol
+config:
+  provider: openrouter
+  base_url: https://true-sota.com/v1
+  api_key: ${env:TRUE_SOTA_API_KEY}
+  sandbox_mode: danger-full-access
+  yolo: true
+  reasoning_effort: low
+  otel_enabled: true
+  model_catalog_path: /Users/richer/.codex/models_cache.json
