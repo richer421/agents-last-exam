@@ -23,7 +23,9 @@ egress); the AliyunProvider images bake both.
 from __future__ import annotations
 
 import logging
+import os
 import shlex
+from pathlib import Path
 from typing import Any
 
 from ...base_interface import SandboxHandle, TaskDataSpec
@@ -35,6 +37,7 @@ logger = logging.getLogger(__name__)
 async def stage_input(
     sandbox: SandboxHandle, task_data: TaskDataSpec, *, source: str,
 ) -> dict[str, Any]:
+    await _ensure_ossutil(sandbox)
     oss_prefix = _oss_prefix(source, task_data)
     base = task_subdir(sandbox, task_data)
     await sandbox.mkdir(base)
@@ -70,6 +73,7 @@ async def stage_input(
 async def stage_reference(
     sandbox: SandboxHandle, task_data: TaskDataSpec, *, source: str,
 ) -> dict[str, Any]:
+    await _ensure_ossutil(sandbox)
     oss_prefix = _oss_prefix(source, task_data)
     base = task_subdir(sandbox, task_data)
     src = f"{oss_prefix}/reference"
@@ -113,6 +117,47 @@ async def _has_baked_files(sandbox: SandboxHandle, path: str) -> bool:
 # the owner's — mirrors gcloud's ale-data-public / aws's requester-pays bucket).
 # Every read must carry --payer requester or OSS returns AccessDenied.
 _RP = "--payer requester"
+_WINDOWS_OSSUTIL = r"C:\Windows\Temp\ale-ossutil.exe"
+_WINDOWS_OSS_ENDPOINT = "oss-ap-southeast-1-internal.aliyuncs.com"
+
+
+async def _ensure_ossutil(sandbox: SandboxHandle) -> None:
+    if sandbox.is_linux:
+        return
+    probe = await sandbox.run_command(
+        f"powershell -NoProfile -Command \"if (Test-Path -LiteralPath "
+        f"'{_WINDOWS_OSSUTIL}') {{ exit 0 }} else {{ exit 1 }}\"",
+        timeout=30,
+    )
+    if probe.returncode == 0:
+        return
+    host_binary = os.environ.get("ALE_OSSUTIL_WINDOWS_BIN", "")
+    if not host_binary:
+        raise RuntimeError(
+            "ossutil is missing on the Windows sandbox and "
+            "ALE_OSSUTIL_WINDOWS_BIN is not set"
+        )
+    binary_path = Path(host_binary)
+    if not binary_path.is_file():
+        raise RuntimeError(
+            f"ALE_OSSUTIL_WINDOWS_BIN does not exist: {binary_path}"
+        )
+    await sandbox.write_file(_WINDOWS_OSSUTIL, binary_path.read_bytes())
+
+
+def _oss_command(sandbox: SandboxHandle, arguments: str) -> str:
+    if sandbox.is_linux:
+        return f"ossutil {arguments}"
+    metadata_url = (
+        "http://100.100.100.200/latest/meta-data/ram/security-credentials/"
+    )
+    return (
+        'powershell -NoProfile -Command "'
+        f"$role=(Invoke-RestMethod -UseBasicParsing -Uri '{metadata_url}').Trim(); "
+        f"& '{_WINDOWS_OSSUTIL}' {arguments} --mode EcsRamRole "
+        f"--ecs-role-name $role -e {_WINDOWS_OSS_ENDPOINT}"
+        '"'
+    )
 
 
 async def _oss_exists(sandbox: SandboxHandle, oss_url: str) -> bool:
@@ -122,16 +167,14 @@ async def _oss_exists(sandbox: SandboxHandle, oss_url: str) -> bool:
     rather than rely on the exit code — we ask for at most one object and parse
     the ``Object Number is: N`` summary line ossutil prints."""
     url = oss_url.rstrip("/") + "/"
-    if sandbox.is_linux:
-        cmd = f"ossutil ls {_RP} {shlex.quote(url)} --limited-num 1"
-    else:
-        cmd = (
-            "powershell -NoProfile -Command \""
-            f"ossutil ls {_RP} '{url}' --limited-num 1\""
-        )
+    quoted_url = shlex.quote(url) if sandbox.is_linux else f"'{url}'"
+    cmd = _oss_command(sandbox, f"ls {_RP} {quoted_url} --limited-num 1")
     r = await sandbox.run_command(cmd, timeout=30)
     if r.returncode != 0:
-        return False
+        diagnostic = (r.stderr or r.stdout or "unknown ossutil failure").strip()
+        raise RuntimeError(
+            f"ossutil ls failed for {url} (rc={r.returncode}): {diagnostic[:300]}"
+        )
     out = (r.stdout or "")
     # "Object Number is: 0" → empty; any object line starts with the oss:// url.
     if "Object Number is: 0" in out:
@@ -148,9 +191,4 @@ def _sync_cmd(sandbox: SandboxHandle, src: str, dst: str) -> str:
             f"mkdir -p {shlex.quote(dst)} && "
             f"ossutil sync {_RP} {shlex.quote(src)} {shlex.quote(dst)}"
         )
-    return (
-        'powershell -NoProfile -Command "'
-        f"New-Item -ItemType Directory -Force -Path '{dst}' | Out-Null; "
-        f"ossutil sync {_RP} '{src}' '{dst}'"
-        '"'
-    )
+    return _oss_command(sandbox, f"sync {_RP} '{src}' '{dst}'")
