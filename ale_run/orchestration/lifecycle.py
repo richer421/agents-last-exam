@@ -196,6 +196,8 @@ async def run_one_unit(
     eval_status = "not_executed"
     eval_duration_s: float | None = None
     eval_error: dict[str, Any] | None = None
+    output_gather_report: dict[str, Any] | None = None
+    cleanup_failed = False
     # Execution window timestamps. ``started`` (above) is the ENQUEUE time, so
     # it includes the concurrency-semaphore wait. For the reported per-unit
     # duration we want the actual work window: from when the sem is acquired
@@ -203,6 +205,7 @@ async def run_one_unit(
     # eval phase (eval has its own ``eval_duration_s``).
     exec_started: float | None = None
     exec_ended: float | None = None
+    sem_acquired = False
 
     try:
         # Single-knob concurrency: holding sem for the whole unit caps both
@@ -210,6 +213,7 @@ async def run_one_unit(
         if sem is not None:
             writer.emit_event("provision_wait")
             await sem.acquire()
+            sem_acquired = True
         # Real execution starts here (after the queue wait for a slot).
         exec_started = time.monotonic()
         try:
@@ -405,7 +409,7 @@ async def run_one_unit(
             #     "local"    → provider-local pull → <run_dir>/output/
             #     "gs://..." → vm-side gsutil push → user bucket
             #     Best-effort: failure logs + emits event but doesn't abort.
-            await pull_agent_output(
+            output_gather_report = await pull_agent_output(
                 env=env, provider=provider, artifacts=artifacts, task_meta=task_meta,
                 run_id=writer.run_id, task_id=unit.task_path, writer=writer,
                 run_dir=writer.run_dir,
@@ -524,10 +528,25 @@ async def run_one_unit(
             else:
                 status = "completed"
 
-            phase = env.current_phase if status != "completed" else None
+            status, score, artifact_error = _promote_artifact_failure(
+                status=status,
+                score=score,
+                gather_report=output_gather_report,
+            )
+            if artifact_error is not None:
+                error_str = artifact_error
+                error_obj = {
+                    "type": "ArtifactInfrastructureError",
+                    "message": artifact_error,
+                }
+                eval_status = "invalidated"
+                eval_error = error_obj
+                phase = "output_gather"
+            else:
+                phase = env.current_phase if status != "completed" else None
 
         finally:
-            if sem is not None:
+            if sem is not None and sem_acquired:
                 sem.release()
 
     except (asyncio.CancelledError, KeyboardInterrupt) as e:
@@ -539,8 +558,6 @@ async def run_one_unit(
             phase=phase,
             reason="keyboard_interrupt" if isinstance(e, KeyboardInterrupt) else "cancelled",
         )
-        if not isinstance(e, KeyboardInterrupt):
-            raise
 
     except Exception as e:
         status = "failed"
@@ -557,17 +574,69 @@ async def run_one_unit(
         logger.exception("run_one_unit failed for %s", unit.slug)
 
     finally:
-        # Phase 4 — cleanup. Both branches are best-effort; never raise here.
+        # Phase 4 — cleanup. Failures are recorded and can invalidate an
+        # otherwise successful run; they must not hide an earlier terminal
+        # status such as timeout or cancellation.
         if task_driver is not None:
             try:
                 await task_driver.close()
             except Exception as e:
-                logger.debug("TaskDriver.close failed: %s", e)
+                cleanup_failed = True
+                cleanup_error = f"task driver close failed: {e}"
+                writer.emit_event(
+                    "cleanup_failed",
+                    resource="task_driver",
+                    error=cleanup_error,
+                )
+                status, score, promoted_error = _promote_cleanup_failure(
+                    status=status,
+                    score=score,
+                    message=cleanup_error,
+                )
+                if promoted_error is not None:
+                    error_str = promoted_error
+                    error_obj = {
+                        "type": "CleanupInfrastructureError",
+                        "message": promoted_error,
+                    }
+                    phase = "cleanup"
+                logger.warning(cleanup_error)
         if env is not None:
+            try:
+                sandbox_id = env.sandbox.id
+            except RuntimeError:
+                sandbox_id = None
             try:
                 await env.close_async(mode=effective_cleanup_mode)
             except Exception as e:
-                logger.debug("ALEEnv.close_async failed: %s", e)
+                cleanup_failed = True
+                cleanup_error = f"sandbox {sandbox_id or 'unknown'} release failed: {e}"
+                writer.emit_event(
+                    "cleanup_failed",
+                    resource="sandbox",
+                    sandbox_id=sandbox_id,
+                    error=cleanup_error,
+                )
+                status, score, promoted_error = _promote_cleanup_failure(
+                    status=status,
+                    score=score,
+                    message=cleanup_error,
+                )
+                if promoted_error is not None:
+                    error_str = promoted_error
+                    error_obj = {
+                        "type": "CleanupInfrastructureError",
+                        "message": promoted_error,
+                    }
+                    phase = "cleanup"
+                logger.error(cleanup_error)
+
+        if cleanup_failed and eval_status == "success":
+            eval_status = "invalidated"
+            eval_error = {
+                "type": "CleanupInfrastructureError",
+                "message": "evaluation invalidated by cleanup infrastructure failure",
+            }
 
     # Reported duration = actual execution window (sem-acquired → eval start),
     # excluding the concurrency-queue wait and the eval phase. Fall back
@@ -647,6 +716,48 @@ def _extract_score(eval_output: Any) -> float | None:
     if isinstance(eval_output, (int, float)):
         return float(eval_output)
     return None
+
+
+def _promote_artifact_failure(
+    *,
+    status: str,
+    score: float | None,
+    gather_report: dict[str, Any] | None,
+) -> tuple[str, float | None, str | None]:
+    if not gather_report:
+        return status, score, None
+    failed = (
+        gather_report.get("status") == "failed"
+        or bool(gather_report.get("errors"))
+    )
+    if not failed:
+        return status, score, None
+    if status != "completed":
+        return status, None, None
+    message = str(
+        gather_report.get("error")
+        or (
+            "partial artifact transfer failed"
+            if gather_report.get("errors")
+            else "unknown artifact error"
+        )
+    )
+    return (
+        "infra_error",
+        None,
+        f"artifact output upload failed: {message}",
+    )
+
+
+def _promote_cleanup_failure(
+    *,
+    status: str,
+    score: float | None,
+    message: str,
+) -> tuple[str, float | None, str | None]:
+    if status != "completed":
+        return status, None, None
+    return "infra_error", None, message
 
 
 def _build_env_spec(task_meta: dict[str, Any], *, unit: RunUnit | None = None) -> SandboxSpec:
@@ -791,7 +902,7 @@ async def pull_agent_output(
     task_id: str,
     writer,
     run_dir: Path,
-) -> None:
+) -> dict[str, Any]:
     """Phase 3a output dispatcher.
 
     Reads :attr:`ArtifactsSpec.output_path` and routes the env's output
@@ -814,14 +925,14 @@ async def pull_agent_output(
         task_data.domain_name and task_data.task_name and task_data.variant_name
     ):
         writer.emit_event("output_gather_skipped", reason="no_task_identity")
-        return
+        return {"status": "skipped", "reason": "no_task_identity"}
     from ..environments import output_pull
 
     output_path = artifacts.output_path if artifacts is not None else None
 
     if output_path is None:
         writer.emit_event("output_gather_skipped", reason="output_path_unconfigured")
-        return
+        return {"status": "skipped", "reason": "output_path_unconfigured"}
 
     if output_path == "local":
         dest_dir = run_dir / "output"
@@ -834,6 +945,7 @@ async def pull_agent_output(
                     "output_gather_skipped",
                     reason=report.get("reason", "unknown"),
                 )
+                return {"status": "skipped", **report}
             else:
                 writer.emit_event(
                     "output_gather_done",
@@ -843,10 +955,11 @@ async def pull_agent_output(
                     bytes=report.get("bytes"),
                     errors=len(report.get("errors") or []),
                 )
+                return {"status": "success", **report}
         except Exception as e:
             logger.warning("pull_to_host failed (best-effort): %s", e)
             writer.emit_event("output_gather_failed", transport="local", error=str(e))
-        return
+            return {"status": "failed", "transport": "local", "error": str(e)}
 
     # s3:// case
     if output_path.startswith("s3://"):
@@ -859,10 +972,11 @@ async def pull_agent_output(
                 transport="s3",
                 s3_path=report.get("s3_path"),
             )
+            return {"status": "success", **report}
         except Exception as e:
             logger.warning("push_to_s3 failed (best-effort): %s", e)
             writer.emit_event("output_gather_failed", transport="s3", error=str(e))
-        return
+            return {"status": "failed", "transport": "s3", "error": str(e)}
 
     # oss:// case
     if output_path.startswith("oss://"):
@@ -875,10 +989,11 @@ async def pull_agent_output(
                 transport="oss",
                 oss_path=report.get("oss_path"),
             )
+            return {"status": "success", **report}
         except Exception as e:
             logger.warning("push_to_oss failed (best-effort): %s", e)
             writer.emit_event("output_gather_failed", transport="oss", error=str(e))
-        return
+            return {"status": "failed", "transport": "oss", "error": str(e)}
 
     # gs:// case
     if not output_path.startswith("gs://"):
@@ -887,7 +1002,10 @@ async def pull_agent_output(
             "output_gather_skipped",
             reason=f"output_path_unrecognised:{output_path!r}",
         )
-        return
+        return {
+            "status": "skipped",
+            "reason": f"output_path_unrecognised:{output_path!r}",
+        }
     try:
         report = await output_pull.push_to_gcs(
             env.sandbox, task_data, run_id=run_id, bucket=output_path,
@@ -897,9 +1015,11 @@ async def pull_agent_output(
             transport="gcs",
             gcs_path=report.get("gcs_path"),
         )
+        return {"status": "success", **report}
     except Exception as e:
         logger.warning("push_to_gcs failed (best-effort): %s", e)
         writer.emit_event("output_gather_failed", transport="gcs", error=str(e))
+        return {"status": "failed", "transport": "gcs", "error": str(e)}
 
 
 async def stage_reference(

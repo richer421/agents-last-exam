@@ -160,6 +160,16 @@ def _oss_command(sandbox: SandboxHandle, arguments: str) -> str:
     )
 
 
+# Output upload and task-data staging must use the same resolved executable,
+# endpoint, and RAM-role authentication contract.
+ensure_ossutil = _ensure_ossutil
+oss_command = _oss_command
+
+
+def powershell_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
 async def _oss_exists(sandbox: SandboxHandle, oss_url: str) -> bool:
     """True if the prefix has at least one object.
 
@@ -167,7 +177,7 @@ async def _oss_exists(sandbox: SandboxHandle, oss_url: str) -> bool:
     rather than rely on the exit code — we ask for at most one object and parse
     the ``Object Number is: N`` summary line ossutil prints."""
     url = oss_url.rstrip("/") + "/"
-    quoted_url = shlex.quote(url) if sandbox.is_linux else f"'{url}'"
+    quoted_url = shlex.quote(url) if sandbox.is_linux else powershell_literal(url)
     cmd = _oss_command(sandbox, f"ls {_RP} {quoted_url} --limited-num 1")
     r = await sandbox.run_command(cmd, timeout=30)
     if r.returncode != 0:
@@ -191,4 +201,7 @@ def _sync_cmd(sandbox: SandboxHandle, src: str, dst: str) -> str:
             f"mkdir -p {shlex.quote(dst)} && "
             f"ossutil sync {_RP} {shlex.quote(src)} {shlex.quote(dst)}"
         )
-    return _oss_command(sandbox, f"sync {_RP} '{src}' '{dst}'")
+    return _oss_command(
+        sandbox,
+        f"sync {_RP} {powershell_literal(src)} {powershell_literal(dst)}",
+    )

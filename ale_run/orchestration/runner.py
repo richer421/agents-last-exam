@@ -19,12 +19,33 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 from .factory import EnvironmentRouter
 from .experiment_spec import ExperimentSpec, RunUnit, UnitResult
 
 logger = logging.getLogger(__name__)
+
+
+async def _gather_until_shutdown(
+    tasks: list[asyncio.Task],
+    *,
+    shutdown_event: asyncio.Event,
+) -> list[Any]:
+    combined = asyncio.gather(*tasks)
+    shutdown_wait = asyncio.create_task(shutdown_event.wait())
+    done, _ = await asyncio.wait(
+        {combined, shutdown_wait},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if shutdown_wait in done and shutdown_event.is_set():
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        return list(await combined)
+    shutdown_wait.cancel()
+    await asyncio.gather(shutdown_wait, return_exceptions=True)
+    return list(await combined)
 
 
 class Runner:
@@ -71,9 +92,15 @@ class Runner:
 
         No aggregation, no summary — caller does whatever rollup it wants.
         """
-        from .lifecycle import install_signal_handlers, run_one_unit
+        from .lifecycle import (
+            get_shutdown_event,
+            install_signal_handlers,
+            run_one_unit,
+        )
 
         install_signal_handlers()
+        shutdown_event = get_shutdown_event()
+        shutdown_event.clear()
         unit_list = list(units) if units is not None else self.enumerate_units()
         if not unit_list:
             logger.warning("Runner.run: no units to execute")
@@ -101,8 +128,12 @@ class Runner:
                         u.slug, result.status, result.score, result.duration_s or 0)
             return result
 
-        results = await asyncio.gather(
-            *(_drive(u) for u in unit_list),
-            return_exceptions=False,
+        tasks = [
+            asyncio.create_task(_drive(u), name=f"ale-unit:{u.slug}")
+            for u in unit_list
+        ]
+        results = await _gather_until_shutdown(
+            tasks,
+            shutdown_event=shutdown_event,
         )
         return list(results)

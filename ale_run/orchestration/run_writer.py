@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -67,7 +68,10 @@ class RunWriter:
         task_path: str,
         variant_index: int,
     ):
-        self._ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+        self._ts = (
+            f"{time.strftime('%Y%m%d_%H%M%S', time.gmtime())}-"
+            f"{uuid.uuid4().hex[:8]}"
+        )
         self._slug_agent = slug_agent(agent_id)
         self._slug_model = slug_model(model)
         self._slug_task = slug_task(task_path)
