@@ -17,6 +17,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from ._secrets import inject_env, read_and_delete_secrets
+
 
 _MODULE_NAME = "ale_run.executors._sandbox_eval_entry"
 
@@ -159,6 +161,8 @@ async def _start_remote_session(session: Any) -> None:
 
 def main() -> int:
     spec = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    if spec.get("secrets_path"):
+        inject_env(read_and_delete_secrets(Path(spec["secrets_path"]).parent))
     log_path = Path(spec["log_path"])
     log_path.parent.mkdir(parents=True, exist_ok=True)
     is_worker = os.environ.get("ALE_EVAL_WORKER") == "1"

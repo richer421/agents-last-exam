@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from ..base_interface import SandboxHandle
+from ._secrets import SECRETS_FILE
 
 
 _POLL_INTERVAL_S = 2.0
@@ -228,6 +229,7 @@ async def evaluate_in_sandbox(
     task_path: Path,
     variant: int,
     timeout_s: float,
+    evaluator_env: dict[str, str] | None = None,
 ) -> SandboxEvaluationResult:
     """Execute a task's evaluator in the sandbox and return its small result."""
     repo_root = _task_repo_root(task_path)
@@ -242,6 +244,7 @@ async def evaluate_in_sandbox(
     log_path = f"{job}{sep}eval.log"
     done_path = f"{job}{sep}done.marker"
     pid_path = f"{job}{sep}pid"
+    secrets_path = f"{job}{sep}{SECRETS_FILE}"
 
     spec = {
         "archive_path": archive_path,
@@ -258,6 +261,7 @@ async def evaluate_in_sandbox(
         "done_path": done_path,
         "pid_path": pid_path,
         "task_data_root": sandbox.task_data_root,
+        "secrets_path": secrets_path if evaluator_env else None,
     }
     await sandbox.mkdir(job)
     await sandbox.write_file(archive_path, archive.payload)
@@ -265,6 +269,11 @@ async def evaluate_in_sandbox(
         spec_path,
         (json.dumps(spec, ensure_ascii=True, separators=(",", ":")) + "\n").encode(),
     )
+    if evaluator_env:
+        await sandbox.write_file(
+            secrets_path,
+            json.dumps(dict(evaluator_env), ensure_ascii=True).encode(),
+        )
 
     command = _launch_command(
         sandbox,
@@ -273,13 +282,18 @@ async def evaluate_in_sandbox(
         pid_path=pid_path,
     )
     launched = await sandbox.run_command(command, timeout=30)
-    if launched.returncode != 0:
+    if launched.returncode > 0:
         detail = (launched.stderr or launched.stdout or "unknown launch failure").strip()
         raise RuntimeError(f"sandbox evaluator launch failed: {detail[:500]}")
 
     pid = _parse_pid(launched.stdout)
     if pid is None:
-        raise RuntimeError("sandbox evaluator launcher did not return a PID")
+        pid = await _read_remote_pid(sandbox, pid_path)
+    if pid is None:
+        detail = (launched.stderr or launched.stdout or "missing PID acknowledgement").strip()
+        raise RuntimeError(
+            f"sandbox evaluator launcher did not produce a PID: {detail[:500]}"
+        )
 
     completed = False
     try:
@@ -337,8 +351,10 @@ def _launch_command(
         spec = shlex.quote(spec_path)
         pid_file = shlex.quote(pid_path)
         return (
-            f"PYTHONPATH={env} nohup setsid {python} -m {module} {spec} "
-            f">/dev/null 2>&1 & pid=$!; echo $pid > {pid_file}; "
+            f"if [ -s {pid_file} ] && kill -0 \"$(cat {pid_file})\" 2>/dev/null; "
+            f"then pid=\"$(cat {pid_file})\"; else PYTHONPATH={env} nohup setsid "
+            f"{python} -m {module} {spec} >/dev/null 2>&1 & pid=$!; "
+            f"echo $pid > {pid_file}; fi; "
             "echo __ALE_EVAL_PID__=$pid"
         )
     args = subprocess.list2cmdline(["-m", module, spec_path])
@@ -348,16 +364,46 @@ def _launch_command(
     escaped_args = args.replace("'", "''")
     return (
         "powershell -NoProfile -NonInteractive -Command \""
+        f"$existing=$null; if (Test-Path -LiteralPath '{pid_file}') {{ "
+        f"$oldPid=[int](Get-Content -LiteralPath '{pid_file}' -Raw); "
+        "$existing=Get-Process -Id $oldPid -ErrorAction SilentlyContinue }; "
+        "if ($existing) { $pidValue=$existing.Id } else { "
         f"$env:PYTHONPATH='{ale}'; $p=Start-Process -FilePath '{py}' "
         f"-ArgumentList '{escaped_args}' -WindowStyle Hidden -PassThru; "
-        f"Set-Content -LiteralPath '{pid_file}' -Value $p.Id; "
-        "Write-Output ('__ALE_EVAL_PID__=' + $p.Id)\""
+        f"Set-Content -LiteralPath '{pid_file}' -Value $p.Id; $pidValue=$p.Id }}; "
+        "Write-Output ('__ALE_EVAL_PID__=' + $pidValue)\""
     )
 
 
 def _parse_pid(stdout: str | None) -> int | None:
     match = re.search(r"__ALE_EVAL_PID__=(\d+)", stdout or "")
     return int(match.group(1)) if match else None
+
+
+async def _read_remote_pid(sandbox: SandboxHandle, pid_path: str) -> int | None:
+    if sandbox.is_linux:
+        import shlex
+
+        quoted = shlex.quote(pid_path)
+        command = (
+            f"if [ -s {quoted} ]; then printf '__ALE_EVAL_PID__=%s\\n' "
+            f'"$(cat {quoted})"; else exit 3; fi'
+        )
+    else:
+        escaped = pid_path.replace("'", "''")
+        command = (
+            'powershell -NoProfile -NonInteractive -Command "'
+            f"if (Test-Path -LiteralPath '{escaped}') {{ "
+            f"$pidValue=(Get-Content -LiteralPath '{escaped}' -Raw).Trim(); "
+            "Write-Output ('__ALE_EVAL_PID__=' + $pidValue) } else { exit 3 }\""
+        )
+    for _ in range(3):
+        result = await sandbox.run_command(command, timeout=10)
+        pid = _parse_pid(result.stdout)
+        if pid is not None:
+            return pid
+        await asyncio.sleep(0.3)
+    return None
 
 
 async def _process_alive(sandbox: SandboxHandle, pid: int) -> bool:

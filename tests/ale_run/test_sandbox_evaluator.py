@@ -15,6 +15,7 @@ from ale_run.executors.sandbox_evaluator import (
     evaluate_in_sandbox,
 )
 from ale_run.executors._sandbox_eval_entry import _start_remote_session, _worker_argv
+from ale_run.executors.sandbox import _evaluator_env
 from ale_run.orchestration.lifecycle import _evaluate_task
 
 
@@ -60,6 +61,20 @@ class _FakeSandbox:
             return self.eval_log
         assert path.endswith("result.json")
         return json.dumps(self.result_payload).encode()
+
+
+class _DroppedLaunchAckSandbox(_FakeSandbox):
+    async def run_command(self, command: str, timeout: float | None = None):
+        self.commands.append((command, timeout))
+        if "Start-Process" in command:
+            return SimpleNamespace(returncode=-1, stdout="", stderr="transport error")
+        if "__ALE_EVAL_PID__" in command:
+            return SimpleNamespace(
+                returncode=0, stdout="__ALE_EVAL_PID__=4242\n", stderr=""
+            )
+        if "Get-Item" in command and ".Length" in command:
+            return SimpleNamespace(returncode=0, stdout="128\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
 
 def test_task_archive_is_deterministic_and_excludes_generated_data(tmp_path: Path) -> None:
@@ -171,6 +186,95 @@ async def test_evaluate_in_sandbox_only_reads_small_result_protocol(
     assert any(path.endswith("spec.json") for path, _ in sandbox.writes)
     assert len(sandbox.commands) >= 3
     assert "Start-Process" in sandbox.commands[0][0]
+
+
+@pytest.mark.asyncio
+async def test_evaluator_recovers_when_launch_ack_is_dropped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "task-repo"
+    task = repo / "tasks" / "demo"
+    task.mkdir(parents=True)
+    (repo / "pyproject.toml").write_text("[project]\nname='demo'\nversion='0'\n")
+    (task / "main.py").write_text("VALUE = 1\n")
+    sandbox = _DroppedLaunchAckSandbox()
+    monkeypatch.setattr("ale_run.executors.sandbox_evaluator.asyncio.sleep", _no_sleep)
+
+    result = await evaluate_in_sandbox(
+        sandbox=sandbox,
+        ale_src_root=r"C:\Users\User\.ale\src",
+        task_path=task,
+        variant=0,
+        timeout_s=30,
+    )
+
+    assert result.result["score"] == 0.75
+    assert any("__ALE_EVAL_PID__" in command for command, _ in sandbox.commands[1:])
+
+
+@pytest.mark.asyncio
+async def test_evaluator_secrets_use_sidecar_not_spec(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "task-repo"
+    task = repo / "tasks" / "demo"
+    task.mkdir(parents=True)
+    (repo / "pyproject.toml").write_text("[project]\nname='demo'\nversion='0'\n")
+    (task / "main.py").write_text("VALUE = 1\n")
+    sandbox = _FakeSandbox()
+    monkeypatch.setattr("ale_run.executors.sandbox_evaluator.asyncio.sleep", _no_sleep)
+
+    await evaluate_in_sandbox(
+        sandbox=sandbox,
+        ale_src_root=r"C:\Users\User\.ale\src",
+        task_path=task,
+        variant=0,
+        timeout_s=30,
+        evaluator_env={"OPENAI_API_KEY": "top-secret"},
+    )
+
+    written = {path: payload for path, payload in sandbox.writes}
+    spec_payload = next(payload for path, payload in sandbox.writes if path.endswith("spec.json"))
+    secret_payload = next(
+        payload for path, payload in sandbox.writes if path.endswith("_secrets.json")
+    )
+    assert b"top-secret" not in spec_payload
+    assert json.loads(secret_payload) == {"OPENAI_API_KEY": "top-secret"}
+    assert any(path.endswith("_secrets.json") for path in written)
+
+
+def test_evaluator_env_normalizes_openai_compatible_agent_config() -> None:
+    config = SimpleNamespace(
+        api_key="agent-config-key",
+        base_url="https://true-sota.com/v1",
+        model="gpt-5.6-sol",
+    )
+
+    env = _evaluator_env(config, {"EXISTING": "value"})
+
+    assert env == {
+        "EXISTING": "value",
+        "OPENAI_API_KEY": "agent-config-key",
+        "OPENAI_API_BASE": "https://true-sota.com/v1",
+        "LLM_JUDGE_MODEL": "gpt-5.6-sol",
+    }
+
+
+def test_evaluator_env_normalizes_default_openrouter_credentials() -> None:
+    config = SimpleNamespace(
+        provider="openrouter",
+        api_key=None,
+        base_url=None,
+        model="openai/gpt-5.4",
+    )
+
+    env = _evaluator_env(config, {"OPENROUTER_API_KEY": "openrouter-key"})
+
+    assert env["OPENAI_API_KEY"] == "openrouter-key"
+    assert env["OPENAI_API_BASE"] == "https://openrouter.ai/api/v1"
+    assert env["LLM_JUDGE_MODEL"] == "openai/gpt-5.4"
 
 
 async def _no_sleep(_: float) -> None:

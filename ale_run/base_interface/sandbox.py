@@ -29,6 +29,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import os
@@ -47,6 +48,17 @@ ReleaseMode = Literal["delete", "stop", "keep"]
 
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _direct_requests_session():
+    """Create an HTTP session that never routes private CUA traffic via proxies."""
+    session = requests.Session()
+    session.trust_env = False
+    try:
+        yield session
+    finally:
+        session.close()
 
 
 # ============================================================================
@@ -317,14 +329,15 @@ def _read_first_sse_event(
 
 def _post_cmd(sandbox: SandboxHandle, body: dict, *, timeout: float) -> dict[str, Any] | None:
     try:
-        with requests.post(
-            sandbox.cmd_url,
-            json=body,
-            headers={"Content-Type": "application/json"},
-            timeout=timeout,
-            stream=True,
-        ) as resp:
-            return _read_first_sse_event(resp, read_timeout=timeout)
+        with _direct_requests_session() as session:
+            with session.post(
+                sandbox.cmd_url,
+                json=body,
+                headers={"Content-Type": "application/json"},
+                timeout=timeout,
+                stream=True,
+            ) as resp:
+                return _read_first_sse_event(resp, read_timeout=timeout)
     except requests.RequestException as e:
         logger.debug("POST %s failed: %s", sandbox.cmd_url, e)
         return None
@@ -696,11 +709,12 @@ def _download_range_sync(
 
 def _check_reachable_sync(sandbox: SandboxHandle, label: str) -> None:
     try:
-        resp = requests.get(
-            f"{sandbox.endpoint.rstrip('/')}/status", timeout=10,
-        )
-        resp.raise_for_status()
-        body = resp.json()
+        with _direct_requests_session() as session:
+            resp = session.get(
+                f"{sandbox.endpoint.rstrip('/')}/status", timeout=10,
+            )
+            resp.raise_for_status()
+            body = resp.json()
         if body.get("status") != "ok":
             raise SandboxUnreachableError(
                 f"{label} {sandbox.endpoint} unhealthy: {body}"

@@ -94,6 +94,26 @@ def _ale_src_root_for(sandbox: SandboxHandle) -> str:
     return rf"{home}\.ale-src"
 
 
+def _evaluator_env(config: Any, inherited: dict[str, str]) -> dict[str, str]:
+    """Build standard OpenAI-compatible evaluator env without task coupling."""
+    result = dict(inherited or {})
+    mappings = (
+        ("OPENAI_API_KEY", "api_key"),
+        ("OPENAI_API_BASE", "base_url"),
+        ("LLM_JUDGE_MODEL", "model"),
+    )
+    for env_name, attribute in mappings:
+        value = getattr(config, attribute, None)
+        if value:
+            result.setdefault(env_name, str(value))
+    if getattr(config, "provider", None) == "openrouter":
+        openrouter_key = result.get("OPENROUTER_API_KEY")
+        if openrouter_key:
+            result.setdefault("OPENAI_API_KEY", openrouter_key)
+        result.setdefault("OPENAI_API_BASE", "https://openrouter.ai/api/v1")
+    return result
+
+
 # Gather retries
 _GATHER_RETRIES = 3
 _GATHER_BACKOFFS_S = (1.0, 3.0, 9.0)
@@ -480,6 +500,7 @@ class SandboxExecutor(BaseExecutor):
             task_path=task_path,
             variant=variant,
             timeout_s=timeout_s,
+            evaluator_env=_evaluator_env(self.config, self.env),
         )
         if evaluated.log:
             logger.info("sandbox evaluator log:\n%s", evaluated.log[-20_000:])

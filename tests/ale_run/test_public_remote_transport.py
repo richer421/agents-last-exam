@@ -7,6 +7,7 @@ import pytest
 from computer.interface.generic import GenericComputerInterface
 
 from ale_run.base_interface import SandboxHandle
+from ale_run.base_interface.sandbox import _direct_requests_session
 from ale_run.environments.providers.aliyun import AliyunProvider
 from ale_run.environments.providers.gcloud import GcloudProvider
 
@@ -28,6 +29,11 @@ def _remote_vm() -> SandboxHandle:
         python=r"C:\python.exe",
         mcp_server_dir=r"C:\cua_mcp_server",
     )
+
+
+def test_cua_wire_session_ignores_environment_proxies() -> None:
+    with _direct_requests_session() as session:
+        assert session.trust_env is False
 
 
 def test_gcloud_provider_prefers_websocket_when_endpoint_uses_proxy(

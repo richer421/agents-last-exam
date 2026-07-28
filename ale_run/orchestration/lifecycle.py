@@ -47,7 +47,7 @@ from .termination import classify_error, err_dict, redact_config
 logger = logging.getLogger(__name__)
 
 
-_DEFAULT_TIMEOUT_S = 7200
+_DEFAULT_TIMEOUT_S = 5 * 60 * 60
 # Wall-clock ceiling for the evaluation phase. Without it, a wedged cua RPC
 # inside a task's evaluate() (e.g. a long eval whose result never returns)
 # hangs the whole unit until the episode budget — minutes-to-hours of a held
@@ -916,6 +916,7 @@ def _collect_env_passthrough() -> dict[str, str]:
         "ANTHROPIC_BASE_URL",
         "OPENAI_API_KEY",
         "OPENROUTER_API_KEY",
+        "LLM_JUDGE_WIRE_API",
         "BRAVE_API_KEY",
         "CURSOR_API_KEY",
         "GEMINI_API_KEY",
