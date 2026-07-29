@@ -229,6 +229,135 @@ def test_git_cleanliness_supports_linked_worktree(tmp_path: Path) -> None:
     validate_git_checkout(linked, head, category="task_checkout")
 
 
+def test_split_index_discovery_rejects_seventeenth_without_consuming_later_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, _record_payload, _registry_root = _registry_request(tmp_path)
+    git_dir = request.task_repo / ".git"
+    for index in range(18):
+        (git_dir / f"sharedindex.{index:040x}").write_bytes(b"index")
+    real_scandir = os.scandir
+    real_glob = Path.glob
+    git_dir_identity = (git_dir.stat().st_dev, git_dir.stat().st_ino)
+    shared_entries_seen = 0
+
+    class TrackingScandir:
+        def __init__(self, path: object) -> None:
+            self._entries = real_scandir(path)
+            status = os.fstat(path) if isinstance(path, int) else Path(path).stat()
+            self._tracked = (status.st_dev, status.st_ino) == git_dir_identity
+
+        def __enter__(self):
+            self._entries.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._entries.__exit__(*args)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal shared_entries_seen
+            entry = next(self._entries)
+            if self._tracked and entry.name.startswith("sharedindex."):
+                shared_entries_seen += 1
+                if shared_entries_seen > 17:
+                    pytest.fail(
+                        "split-index discovery consumed an entry after the cap was exceeded"
+                    )
+            return entry
+
+        def close(self) -> None:
+            self._entries.close()
+
+    monkeypatch.setattr(evaluator_registry.os, "scandir", TrackingScandir)
+
+    def tracking_glob(path: Path, pattern: str):
+        nonlocal shared_entries_seen
+        for entry in real_glob(path, pattern):
+            if entry.name.startswith("sharedindex."):
+                shared_entries_seen += 1
+                if shared_entries_seen > 17:
+                    pytest.fail(
+                        "split-index discovery consumed an entry after the cap was exceeded"
+                    )
+            yield entry
+
+    monkeypatch.setattr(Path, "glob", tracking_glob)
+
+    with pytest.raises(AtomicInfrastructureError, match="too many shared files"):
+        validate_git_checkout(
+            request.task_repo,
+            request.evaluator_version,
+            category="task_checkout",
+        )
+
+    assert shared_entries_seen == 17
+
+
+def test_split_index_limit_is_shared_with_linked_worktree_common_metadata(
+    tmp_path: Path,
+) -> None:
+    request, _record_payload, _registry_root = _registry_request(tmp_path)
+    linked = tmp_path / "linked"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(request.task_repo),
+            "worktree",
+            "add",
+            "-qb",
+            "linked-split",
+            str(linked),
+        ],
+        check=True,
+    )
+    source_git_dir = Path(
+        subprocess.check_output(
+            ["git", "-C", str(linked), "rev-parse", "--git-dir"],
+            text=True,
+        ).strip()
+    )
+    common_git_dir = Path(
+        subprocess.check_output(
+            ["git", "-C", str(linked), "rev-parse", "--git-common-dir"],
+            text=True,
+        ).strip()
+    )
+    for index in range(8):
+        (source_git_dir / f"sharedindex.{index:040x}").write_bytes(b"index")
+    for index in range(8, 17):
+        (common_git_dir / f"sharedindex.{index:040x}").write_bytes(b"index")
+
+    with pytest.raises(AtomicInfrastructureError, match="too many shared files"):
+        validate_git_checkout(
+            linked,
+            request.evaluator_version,
+            category="task_checkout",
+        )
+
+
+def test_private_git_view_construction_has_one_absolute_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, _record_payload, _registry_root = _registry_request(tmp_path)
+    ticks = iter((0.0, evaluator_registry._GIT_OPERATION_TIMEOUT_SECONDS + 1))
+    monkeypatch.setattr(evaluator_registry.time, "monotonic", lambda: next(ticks))
+
+    with (
+        pytest.raises(AtomicInfrastructureError, match="Git operation timed out"),
+        evaluator_registry._isolated_git_repository(
+            request.task_repo,
+            category="task_checkout",
+        ),
+    ):
+        pytest.fail("expired private Git view was yielded")
+
+
 @pytest.mark.parametrize(
     "failure",
     [

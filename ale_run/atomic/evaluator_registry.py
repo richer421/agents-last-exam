@@ -34,6 +34,7 @@ _MAX_GIT_ERROR_BYTES = 500
 _MAX_GIT_COMMAND_BYTES = 1024 * 1024
 _MAX_GIT_CONTROL_FILE_BYTES = 1024 * 1024
 _MAX_GIT_INDEX_BYTES = 64 * 1024 * 1024
+_MAX_GIT_SHARED_INDEXES = 16
 _GIT_MATERIALIZATION_TIMEOUT_SECONDS = 120
 _GIT_OPERATION_TIMEOUT_SECONDS = 120
 _GIT_PROCESS_KILL_WAIT_SECONDS = 1
@@ -615,8 +616,15 @@ def _isolated_git_repository(
     *,
     category: str,
 ) -> Iterator[_IsolatedGitRepository]:
+    deadline = time.monotonic() + _GIT_OPERATION_TIMEOUT_SECONDS
+    _check_git_operation_deadline(deadline, category=category)
     work_tree = repo.resolve(strict=True)
-    source_git_dir = _resolve_git_directory(work_tree, category=category)
+    _check_git_operation_deadline(deadline, category=category)
+    source_git_dir = _resolve_git_directory(
+        work_tree,
+        category=category,
+        deadline=deadline,
+    )
     common_dir_file = source_git_dir / "commondir"
     if common_dir_file.exists():
         common_dir_value = (
@@ -625,6 +633,7 @@ def _isolated_git_repository(
                 max_bytes=4096,
                 category=category,
                 label="Git commondir",
+                deadline=deadline,
             )
             .decode("utf-8", errors="strict")
             .strip()
@@ -634,6 +643,7 @@ def _isolated_git_repository(
         common_dir = (source_git_dir / common_dir_value).resolve(strict=True)
     else:
         common_dir = source_git_dir
+    _check_git_operation_deadline(deadline, category=category)
     if not common_dir.is_dir():
         raise AtomicInfrastructureError(category, "Git common directory is not a directory")
 
@@ -642,22 +652,27 @@ def _isolated_git_repository(
         max_bytes=_MAX_GIT_CONTROL_FILE_BYTES,
         category=category,
         label="Git config",
+        deadline=deadline,
     )
     head = _read_regular_file_bounded(
         source_git_dir / "HEAD",
         max_bytes=4096,
         category=category,
         label="Git HEAD",
+        deadline=deadline,
     )
     index = _read_regular_file_bounded(
         source_git_dir / "index",
         max_bytes=_MAX_GIT_INDEX_BYTES,
         category=category,
         label="Git index",
+        deadline=deadline,
     )
     config = _build_isolated_git_config(source_config, category=category)
+    _check_git_operation_deadline(deadline, category=category)
 
     with _PrivateTemporaryDirectory(prefix="ale-git-view-") as temp_dir:
+        _check_git_operation_deadline(deadline, category=category)
         git_dir = Path(temp_dir) / "git"
         git_dir.mkdir(mode=0o700)
         (git_dir / "refs").mkdir(mode=0o700)
@@ -665,8 +680,10 @@ def _isolated_git_repository(
         (git_dir / "config").write_text(config, encoding="utf-8")
         (git_dir / "HEAD").write_bytes(head)
         (git_dir / "index").write_bytes(index)
+        _check_git_operation_deadline(deadline, category=category)
 
         objects = (common_dir / "objects").resolve(strict=True)
+        _check_git_operation_deadline(deadline, category=category)
         if not objects.is_dir():
             raise AtomicInfrastructureError(category, "Git object directory is not a directory")
         os.symlink(objects, git_dir / "objects", target_is_directory=True)
@@ -684,6 +701,7 @@ def _isolated_git_repository(
         if head_namespace is not None:
             namespaces.add(head_namespace)
         for namespace in sorted(namespaces):
+            _check_git_operation_deadline(deadline, category=category)
             source_namespace = source_git_dir / "refs" / namespace
             if not source_namespace.exists():
                 source_namespace = common_dir / "refs" / namespace
@@ -699,11 +717,13 @@ def _isolated_git_repository(
                     git_dir / "refs" / namespace,
                     target_is_directory=True,
                 )
+                _check_git_operation_deadline(deadline, category=category)
 
         for name, max_bytes in (
             ("packed-refs", _MAX_GIT_CONTROL_FILE_BYTES),
             ("shallow", _MAX_GIT_CONTROL_FILE_BYTES),
         ):
+            _check_git_operation_deadline(deadline, category=category)
             source = common_dir / name
             if source.exists():
                 (git_dir / name).write_bytes(
@@ -712,8 +732,10 @@ def _isolated_git_repository(
                         max_bytes=max_bytes,
                         category=category,
                         label=f"Git {name}",
+                        deadline=deadline,
                     )
                 )
+                _check_git_operation_deadline(deadline, category=category)
 
         exclude = common_dir / "info" / "exclude"
         if exclude.exists():
@@ -723,26 +745,20 @@ def _isolated_git_repository(
                     max_bytes=_MAX_GIT_CONTROL_FILE_BYTES,
                     category=category,
                     label="Git exclude file",
+                    deadline=deadline,
                 )
             )
+            _check_git_operation_deadline(deadline, category=category)
 
-        shared_indexes = list(source_git_dir.glob("sharedindex.*"))
+        shared_index_directories = [source_git_dir]
         if common_dir != source_git_dir:
-            shared_indexes.extend(common_dir.glob("sharedindex.*"))
-        if len(shared_indexes) > 16:
-            raise AtomicInfrastructureError(category, "Git split index has too many shared files")
-        for shared_index in shared_indexes:
-            destination = git_dir / shared_index.name
-            if destination.exists():
-                continue
-            destination.write_bytes(
-                _read_regular_file_bounded(
-                    shared_index,
-                    max_bytes=_MAX_GIT_INDEX_BYTES,
-                    category=category,
-                    label="Git shared index",
-                )
-            )
+            shared_index_directories.append(common_dir)
+        _copy_shared_indexes_bounded(
+            shared_index_directories,
+            git_dir,
+            category=category,
+            deadline=deadline,
+        )
 
         reftable = common_dir / "reftable"
         if "refstorage = reftable" in config and reftable.exists():
@@ -750,18 +766,27 @@ def _isolated_git_repository(
             if not resolved_reftable.is_dir():
                 raise AtomicInfrastructureError(category, "Git reftable is not a directory")
             os.symlink(resolved_reftable, git_dir / "reftable", target_is_directory=True)
+        _check_git_operation_deadline(deadline, category=category)
 
         yield _IsolatedGitRepository(work_tree=work_tree, git_dir=git_dir)
 
 
-def _resolve_git_directory(work_tree: Path, *, category: str) -> Path:
+def _resolve_git_directory(
+    work_tree: Path,
+    *,
+    category: str,
+    deadline: float,
+) -> Path:
+    _check_git_operation_deadline(deadline, category=category)
     dot_git = work_tree / ".git"
     try:
         dot_git_status = dot_git.lstat()
     except OSError as exc:
         raise AtomicInfrastructureError(category, f"cannot inspect Git directory: {exc}") from exc
     if stat.S_ISDIR(dot_git_status.st_mode):
-        return dot_git.resolve(strict=True)
+        resolved = dot_git.resolve(strict=True)
+        _check_git_operation_deadline(deadline, category=category)
+        return resolved
     if not stat.S_ISREG(dot_git_status.st_mode):
         raise AtomicInfrastructureError(category, "Git metadata pointer is not a regular file")
     git_file = _read_regular_file_bounded(
@@ -769,6 +794,7 @@ def _resolve_git_directory(work_tree: Path, *, category: str) -> Path:
         max_bytes=4096,
         category=category,
         label="Git metadata pointer",
+        deadline=deadline,
     ).decode("utf-8", errors="strict")
     prefix = "gitdir: "
     if not git_file.startswith(prefix) or "\n" in git_file.strip():
@@ -777,6 +803,7 @@ def _resolve_git_directory(work_tree: Path, *, category: str) -> Path:
     if not target:
         raise AtomicInfrastructureError(category, "Git metadata pointer is empty")
     git_dir = (work_tree / target).resolve(strict=True)
+    _check_git_operation_deadline(deadline, category=category)
     if not git_dir.is_dir():
         raise AtomicInfrastructureError(category, "Git metadata target is not a directory")
     return git_dir
@@ -788,7 +815,9 @@ def _read_regular_file_bounded(
     max_bytes: int,
     category: str,
     label: str,
+    deadline: float,
 ) -> bytes:
+    _check_git_operation_deadline(deadline, category=category)
     descriptor: int | None = None
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -807,7 +836,174 @@ def _read_regular_file_bounded(
             os.close(descriptor)
     if len(payload) > max_bytes:
         raise AtomicInfrastructureError(category, f"{label} exceeds its size limit")
+    _check_git_operation_deadline(deadline, category=category)
     return payload
+
+
+def _copy_shared_indexes_bounded(
+    source_directories: list[Path],
+    destination: Path,
+    *,
+    category: str,
+    deadline: float,
+) -> None:
+    destination_fd: int | None = None
+    seen: set[str] = set()
+    matched = 0
+    try:
+        destination_fd = os.open(
+            destination,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        for source_directory in source_directories:
+            _check_git_operation_deadline(deadline, category=category)
+            source_fd: int | None = None
+            try:
+                source_fd = os.open(
+                    source_directory,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                )
+                with os.scandir(source_fd) as entries:
+                    for entry in entries:
+                        _check_git_operation_deadline(deadline, category=category)
+                        if not entry.name.startswith("sharedindex."):
+                            continue
+                        matched += 1
+                        if matched > _MAX_GIT_SHARED_INDEXES:
+                            raise AtomicInfrastructureError(
+                                category,
+                                "Git split index has too many shared files",
+                            )
+                        _validate_shared_index_name(entry.name, category=category)
+                        if entry.name in seen:
+                            raise AtomicInfrastructureError(
+                                category,
+                                f"duplicate Git shared index: {entry.name}",
+                            )
+                        seen.add(entry.name)
+                        if not entry.is_file(follow_symlinks=False):
+                            raise AtomicInfrastructureError(
+                                category,
+                                "Git shared index is not a regular file",
+                            )
+                        payload = _read_regular_file_at_bounded(
+                            source_fd,
+                            entry.name,
+                            max_bytes=_MAX_GIT_INDEX_BYTES,
+                            category=category,
+                            label="Git shared index",
+                            deadline=deadline,
+                        )
+                        _write_private_file_at(
+                            destination_fd,
+                            entry.name,
+                            payload,
+                            category=category,
+                            deadline=deadline,
+                        )
+            except AtomicInfrastructureError:
+                raise
+            except OSError as exc:
+                raise AtomicInfrastructureError(
+                    category,
+                    f"cannot inspect Git shared indexes: {exc}",
+                ) from exc
+            finally:
+                if source_fd is not None:
+                    os.close(source_fd)
+    except AtomicInfrastructureError:
+        raise
+    except OSError as exc:
+        raise AtomicInfrastructureError(
+            category,
+            f"cannot prepare Git shared indexes: {exc}",
+        ) from exc
+    finally:
+        if destination_fd is not None:
+            os.close(destination_fd)
+
+
+def _validate_shared_index_name(name: str, *, category: str) -> None:
+    prefix = "sharedindex."
+    object_id = name.removeprefix(prefix)
+    if (
+        not name.startswith(prefix)
+        or len(object_id) not in {40, 64}
+        or any(character not in "0123456789abcdef" for character in object_id)
+    ):
+        raise AtomicInfrastructureError(category, "Git shared index has an unsafe name")
+
+
+def _read_regular_file_at_bounded(
+    directory_fd: int,
+    name: str,
+    *,
+    max_bytes: int,
+    category: str,
+    label: str,
+    deadline: float,
+) -> bytes:
+    _check_git_operation_deadline(deadline, category=category)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory_fd,
+        )
+        file_status = os.fstat(descriptor)
+        if not stat.S_ISREG(file_status.st_mode):
+            raise AtomicInfrastructureError(category, f"{label} is not a regular file")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = None
+            payload = stream.read(max_bytes + 1)
+    except AtomicInfrastructureError:
+        raise
+    except OSError as exc:
+        raise AtomicInfrastructureError(category, f"cannot read {label}: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if len(payload) > max_bytes:
+        raise AtomicInfrastructureError(category, f"{label} exceeds its size limit")
+    _check_git_operation_deadline(deadline, category=category)
+    return payload
+
+
+def _write_private_file_at(
+    directory_fd: int,
+    name: str,
+    payload: bytes,
+    *,
+    category: str,
+    deadline: float,
+) -> None:
+    _check_git_operation_deadline(deadline, category=category)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            stream.write(payload)
+    except OSError as exc:
+        raise AtomicInfrastructureError(
+            category,
+            f"cannot copy Git shared index: {exc}",
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    _check_git_operation_deadline(deadline, category=category)
+
+
+def _check_git_operation_deadline(deadline: float, *, category: str) -> None:
+    if time.monotonic() >= deadline:
+        raise AtomicInfrastructureError(category, "Git operation timed out")
 
 
 def _build_isolated_git_config(source: bytes, *, category: str) -> str:
