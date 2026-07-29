@@ -9,6 +9,7 @@ from ale_run.atomic.contracts import (
     AtomicInfrastructureError,
     EvaluateRequest,
     EvaluationResult,
+    HarborProvenance,
     SolveRequest,
     SolveResult,
     SubmissionManifest,
@@ -42,6 +43,8 @@ def test_evaluate_request_has_no_agent_configuration(tmp_path):
         submission_root="oss://bucket",
         evaluator_id="rubric",
         evaluator_version="b" * 40,
+        evaluator_registry_record_path=tmp_path / "registry.json",
+        evaluator_registry_record_sha256="c" * 64,
     )
 
     assert "agent_id" not in type(request).model_fields
@@ -73,7 +76,12 @@ def test_requests_require_versioned_immutable_aliyun_identity(tmp_path):
 
 
 def test_submission_manifest_records_solve_provenance_and_artifacts_without_evaluator():
-    artifact = ArtifactEntry(path="output/final.png", size_bytes=1024, sha256="a" * 64)
+    artifact = ArtifactEntry(
+        path="output/final.png",
+        size_bytes=1024,
+        sha256="a" * 64,
+        media_type="image/png",
+    )
     manifest = SubmissionManifest(
         submission_id=uuid4(),
         task_path="visual_media/demo",
@@ -96,30 +104,78 @@ def test_submission_manifest_records_solve_provenance_and_artifacts_without_eval
 
 
 def test_artifact_entry_requires_a_sha256_and_non_negative_size():
-    assert ArtifactEntry(path="output/final.png", size_bytes=0, sha256="a" * 64).size_bytes == 0
+    entry = ArtifactEntry(
+        path="output/final.png",
+        size_bytes=0,
+        sha256="a" * 64,
+        media_type="image/png",
+    )
+    assert entry.size_bytes == 0
 
     with pytest.raises(ValidationError):
-        ArtifactEntry(path="output/final.png", size_bytes=1, sha256="")
+        ArtifactEntry(
+            path="output/final.png",
+            size_bytes=1,
+            sha256="",
+            media_type="image/png",
+        )
     with pytest.raises(ValidationError):
-        ArtifactEntry(path="output/final.png", size_bytes=1, sha256="g" * 64)
+        ArtifactEntry(
+            path="output/final.png",
+            size_bytes=1,
+            sha256="g" * 64,
+            media_type="image/png",
+        )
     with pytest.raises(ValidationError):
-        ArtifactEntry(path="output/final.png", size_bytes=-1, sha256="a" * 64)
+        ArtifactEntry(
+            path="output/final.png",
+            size_bytes=-1,
+            sha256="a" * 64,
+            media_type="image/png",
+        )
 
 
 def test_evaluation_result_enforces_score_and_infrastructure_failure_shape():
-    result = EvaluationResult(status="scored", outcome="valid", score=1.0)
+    identity = {
+        "submission_id": uuid4(),
+        "task_path": "visual_media/demo",
+        "variant_index": 0,
+        "task_commit": "a" * 40,
+        "image_id": "m-image-123",
+        "evaluator_id": "rubric",
+        "evaluator_version": "b" * 40,
+    }
+    scored = {
+        **identity,
+        "status": "scored",
+        "outcome": "valid",
+        "score": 1.0,
+        "rubric_hash": "c" * 64,
+        "harbor": HarborProvenance(
+            reward={"score": 1.0},
+            details_path="evidence/reward-details.json",
+        ),
+    }
+    infra = {
+        **identity,
+        "status": "infra_failed",
+        "error_category": "runtime",
+        "error_detail": "unavailable",
+        "attempt_id": "attempt-1",
+    }
+    result = EvaluationResult(**scored)
 
     assert result.score == 1.0
     with pytest.raises(ValidationError):
-        EvaluationResult(status="scored", outcome="valid", score=1.1)
+        EvaluationResult(**(scored | {"score": 1.1}))
     with pytest.raises(ValidationError):
-        EvaluationResult(status="infra_failed", outcome="valid", score=None)
+        EvaluationResult(**(infra | {"outcome": "valid"}))
     with pytest.raises(ValidationError):
-        EvaluationResult(status="infra_failed", outcome=None, score=0.0)
+        EvaluationResult(**(infra | {"score": 0.0}))
     with pytest.raises(ValidationError):
-        EvaluationResult(status="scored", outcome=None, score=0.0)
+        EvaluationResult(**(scored | {"outcome": None}))
     with pytest.raises(ValidationError):
-        EvaluationResult(status="scored", outcome="valid", score=None)
+        EvaluationResult(**(scored | {"score": None}))
 
 
 def test_solve_result_requires_a_manifest_for_submitted_status():
@@ -136,7 +192,14 @@ def test_solve_result_requires_a_manifest_for_submitted_status():
         config_digest="b" * 64,
         started_at=datetime(2026, 7, 29, tzinfo=UTC),
         completed_at=datetime(2026, 7, 29, 0, 1, tzinfo=UTC),
-        artifacts=(ArtifactEntry(path="output/final.png", size_bytes=1, sha256="a" * 64),),
+        artifacts=(
+            ArtifactEntry(
+                path="output/final.png",
+                size_bytes=1,
+                sha256="a" * 64,
+                media_type="image/png",
+            ),
+        ),
     )
     result = SolveResult(status="submitted", submission_id=submission_id, manifest=manifest)
 
@@ -185,7 +248,14 @@ def test_solve_result_requires_an_error_for_failed_status():
                 config_digest="b" * 64,
                 started_at=datetime(2026, 7, 29, tzinfo=UTC),
                 completed_at=datetime(2026, 7, 29, 0, 1, tzinfo=UTC),
-                artifacts=(ArtifactEntry(path="output/final.png", size_bytes=1, sha256="a" * 64),),
+                artifacts=(
+                    ArtifactEntry(
+                        path="output/final.png",
+                        size_bytes=1,
+                        sha256="a" * 64,
+                        media_type="image/png",
+                    ),
+                ),
             ),
             error="agent timeout",
         )

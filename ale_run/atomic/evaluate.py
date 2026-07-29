@@ -23,7 +23,13 @@ from .contracts import (
     AtomicInfrastructureError,
     EvaluateRequest,
     EvaluationResult,
+    EvaluatorRegistryRecord,
+    HarborProvenance,
     SubmissionManifest,
+)
+from .evaluator_registry import (
+    materialize_evaluator_checkout,
+    validate_evaluator_registry,
 )
 from .oss_submission import (
     _evaluator_segment,
@@ -71,102 +77,115 @@ async def evaluate(request: EvaluateRequest) -> EvaluationResult:
     """Evaluate one committed submission in a fresh immutable environment."""
     attempt_id = uuid4().hex
     try:
+        registry_record = validate_evaluator_registry(request)
         expected_manifest = await _read_submission_manifest(request)
         _validate_submission_manifest(expected_manifest, request)
 
-        existing = await _read_existing_evaluation_result(request)
+        existing = await _read_existing_evaluation_result(request, registry_record)
         if existing is not None:
             return existing
 
         committed_result: EvaluationResult | None = None
         try:
-            async with AtomicRuntime.open(request=request, run_setup=False) as runtime:
-                await _stage_reference_strict(runtime, request)
+            with materialize_evaluator_checkout(request) as evaluator_checkout:
+                runtime_request = request.model_copy(update={"task_repo": evaluator_checkout})
+                async with AtomicRuntime.open(
+                    request=runtime_request,
+                    run_setup=False,
+                    evaluator_registry_record=registry_record,
+                ) as runtime:
+                    try:
+                        staged_manifest = await stage_submission(
+                            runtime.env.sandbox,
+                            runtime.task_data,
+                            runtime_request,
+                        )
+                    except AtomicInfrastructureError:
+                        raise
+                    except Exception as exc:
+                        raise AtomicInfrastructureError(
+                            "submission_integrity",
+                            f"submission staging failed: {type(exc).__name__}: {exc}",
+                        ) from exc
+                    if staged_manifest != expected_manifest:
+                        raise AtomicInfrastructureError(
+                            "submission_integrity",
+                            "submission manifest changed between control-plane preflight and VM staging",
+                        )
 
-                try:
-                    staged_manifest = await stage_submission(
-                        runtime.env.sandbox,
-                        runtime.task_data,
-                        request,
-                    )
-                except AtomicInfrastructureError:
-                    raise
-                except Exception as exc:
-                    raise AtomicInfrastructureError(
-                        "submission_integrity",
-                        f"submission staging failed: {type(exc).__name__}: {exc}",
-                    ) from exc
-                if staged_manifest != expected_manifest:
-                    raise AtomicInfrastructureError(
-                        "submission_integrity",
-                        "submission manifest changed between control-plane preflight and VM staging",
-                    )
-
-                sandbox = runtime.env.sandbox
-                sep = "/" if sandbox.is_linux else "\\"
-                executor = SandboxExecutor(
-                    config=None,
-                    work_dir=(f"{sandbox.work_dir_base.rstrip(sep)}{sep}evaluate{sep}{attempt_id}"),
-                    sandbox=sandbox,
-                    env={},
-                )
-                try:
-                    await executor.stage_runtime()
-                except Exception as exc:
-                    raise AtomicInfrastructureError(
-                        "transport",
-                        f"ALE runtime staging failed: {type(exc).__name__}: {exc}",
-                    ) from exc
-
-                try:
-                    evaluated = await evaluate_in_sandbox(
+                    sandbox = runtime.env.sandbox
+                    sep = "/" if sandbox.is_linux else "\\"
+                    executor = SandboxExecutor(
+                        config=None,
+                        work_dir=(
+                            f"{sandbox.work_dir_base.rstrip(sep)}{sep}evaluate{sep}{attempt_id}"
+                        ),
                         sandbox=sandbox,
-                        ale_src_root=_ale_src_root_for(sandbox),
-                        task_path=runtime.task_dir,
-                        variant=request.variant_index,
-                        timeout_s=float(_EVAL_TIMEOUT_S),
-                        evaluator_env=_evaluator_environment(),
+                        env={},
                     )
-                    raw_result = evaluated.result
-                    if raw_result.get("error"):
+                    try:
+                        await executor.stage_runtime()
+                    except Exception as exc:
+                        raise AtomicInfrastructureError(
+                            "transport",
+                            f"ALE runtime staging failed: {type(exc).__name__}: {exc}",
+                        ) from exc
+
+                    try:
+                        evaluated = await evaluate_in_sandbox(
+                            sandbox=sandbox,
+                            ale_src_root=_ale_src_root_for(sandbox),
+                            task_path=runtime.task_dir,
+                            variant=request.variant_index,
+                            timeout_s=float(_EVAL_TIMEOUT_S),
+                            evaluator_env=_evaluator_environment(),
+                        )
+                        raw_result = evaluated.result
+                        if raw_result.get("error"):
+                            raise AtomicInfrastructureError(
+                                "evaluator",
+                                str(raw_result["error"]),
+                            )
+                        report = raw_result.get("report") or {}
+                        outcome = (
+                            "invalid_output"
+                            if report.get("hard_gate_passed") is False
+                            else str(raw_result.get("outcome") or "valid")
+                        )
+                        result = EvaluationResult(
+                            **_evaluation_identity(request),
+                            status="scored",
+                            outcome=outcome,
+                            score=float(raw_result["score"]),
+                            rubric_hash=registry_record.rubric_hash,
+                            harbor=HarborProvenance(
+                                reward=raw_result,
+                                details_path="evidence/reward-details.json",
+                            ),
+                        )
+                        _validate_scored_result_state(
+                            result,
+                            hard_gate_passed=report.get("hard_gate_passed"),
+                            category="evaluator",
+                        )
+                    except AtomicInfrastructureError:
+                        raise
+                    except Exception as exc:
                         raise AtomicInfrastructureError(
                             "evaluator",
-                            str(raw_result["error"]),
-                        )
-                    report = raw_result.get("report") or {}
-                    outcome = (
-                        "invalid_output"
-                        if report.get("hard_gate_passed") is False
-                        else str(raw_result.get("outcome") or "valid")
-                    )
-                    result = EvaluationResult(
-                        status="scored",
-                        outcome=outcome,
-                        score=float(raw_result["score"]),
-                    )
-                    _validate_scored_result_state(
-                        result,
-                        hard_gate_passed=report.get("hard_gate_passed"),
-                        category="evaluator",
-                    )
-                except AtomicInfrastructureError:
-                    raise
-                except Exception as exc:
-                    raise AtomicInfrastructureError(
-                        "evaluator",
-                        f"{type(exc).__name__}: {exc}",
-                    ) from exc
+                            f"{type(exc).__name__}: {exc}",
+                        ) from exc
 
-                try:
-                    await publish_evaluation_result(sandbox, request, result)
-                except AtomicInfrastructureError:
-                    raise
-                except Exception as exc:
-                    raise AtomicInfrastructureError(
-                        "submission_storage",
-                        f"result publication failed: {type(exc).__name__}: {exc}",
-                    ) from exc
-                committed_result = result
+                    try:
+                        await publish_evaluation_result(sandbox, request, result)
+                    except AtomicInfrastructureError:
+                        raise
+                    except Exception as exc:
+                        raise AtomicInfrastructureError(
+                            "submission_storage",
+                            f"result publication failed: {type(exc).__name__}: {exc}",
+                        ) from exc
+                    committed_result = result
         except Exception as exc:
             if committed_result is None:
                 raise
@@ -205,7 +224,25 @@ async def evaluate(request: EvaluateRequest) -> EvaluationResult:
                 attempt_id,
                 failure.category,
             )
-        return EvaluationResult(status="infra_failed")
+        return EvaluationResult(
+            **_evaluation_identity(request),
+            status="infra_failed",
+            error_category=failure.category,
+            error_detail=(failure.message[:4000] or failure.category),
+            attempt_id=attempt_id,
+        )
+
+
+def _evaluation_identity(request: EvaluateRequest) -> dict[str, object]:
+    return {
+        "submission_id": request.submission_id,
+        "task_path": request.task_path,
+        "variant_index": request.variant_index,
+        "task_commit": request.task_commit,
+        "image_id": request.image_id,
+        "evaluator_id": request.evaluator_id,
+        "evaluator_version": request.evaluator_version,
+    }
 
 
 def _validate_submission_manifest(
@@ -358,6 +395,7 @@ async def _read_submission_manifest(request: EvaluateRequest) -> SubmissionManif
 
 async def _read_existing_evaluation_result(
     request: EvaluateRequest,
+    registry_record: EvaluatorRegistryRecord,
 ) -> EvaluationResult | None:
     raw = await _read_oss_object(
         _evaluation_prefix(request) + "/result.json",
@@ -379,6 +417,16 @@ async def _read_existing_evaluation_result(
             "canonical result.json contains a non-scored result",
         )
     _validate_scored_result_state(result, category="idempotency_conflict")
+    expected = {
+        **_evaluation_identity(request),
+        "rubric_hash": registry_record.rubric_hash,
+    }
+    mismatches = [field for field, value in expected.items() if getattr(result, field) != value]
+    if mismatches:
+        raise AtomicInfrastructureError(
+            "idempotency_conflict",
+            f"existing result identity mismatch: {', '.join(mismatches)}",
+        )
     if raw != _canonical_json(result.model_dump(mode="json")):
         raise AtomicInfrastructureError(
             "idempotency_conflict",

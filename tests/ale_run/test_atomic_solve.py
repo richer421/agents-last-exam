@@ -130,7 +130,14 @@ def _submission_manifest(request: SolveRequest) -> SubmissionManifest:
         config_digest="a" * 64,
         started_at=datetime(2026, 7, 29, tzinfo=UTC),
         completed_at=datetime(2026, 7, 29, 0, 1, tzinfo=UTC),
-        artifacts=(ArtifactEntry(path="answer.txt", size_bytes=1, sha256="b" * 64),),
+        artifacts=(
+            ArtifactEntry(
+                path="answer.txt",
+                size_bytes=1,
+                sha256="b" * 64,
+                media_type="text/plain",
+            ),
+        ),
     )
 
 
@@ -152,6 +159,9 @@ def _patch_runtime(
     events: list[str],
     solve_module: object,
 ) -> None:
+    async def no_existing_manifest(_request):
+        return None
+
     @asynccontextmanager
     async def open_runtime(*, request: SolveRequest):
         events.extend(["open runtime", "task setup"])
@@ -161,6 +171,16 @@ def _patch_runtime(
             events.append("cleanup")
 
     monkeypatch.setattr(solve_module.AtomicRuntime, "open", staticmethod(open_runtime))
+    monkeypatch.setattr(
+        solve_module,
+        "load_experiment",
+        lambda _path: runtime.runtime_spec,
+    )
+    monkeypatch.setattr(
+        solve_module,
+        "read_existing_submission_manifest",
+        no_existing_manifest,
+    )
 
 
 @pytest.mark.asyncio
@@ -370,4 +390,4 @@ async def test_solve_requires_exactly_one_matching_agent(
     with pytest.raises(ValueError, match="exactly one"):
         await solve_module.solve(solve_request)
 
-    assert events == ["open runtime", "task setup", "cleanup"]
+    assert events == []

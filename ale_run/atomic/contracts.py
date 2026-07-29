@@ -2,16 +2,21 @@
 
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 CommitSha = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
 AliyunImageId = Annotated[str, Field(pattern=r"^m-[A-Za-z0-9-]+$")]
 OssRoot = Annotated[str, Field(pattern=r"^oss://")]
 Score = Annotated[float, Field(ge=0, le=1)]
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+MediaType = Annotated[str, Field(pattern=r"^[^\s/]+/[^\s/]+$", max_length=255)]
+NonEmptyString = Annotated[str, Field(min_length=1, max_length=1_000)]
+ErrorCategory = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")]
+ErrorDetail = Annotated[str, Field(min_length=1, max_length=4_000)]
+AttemptId = Annotated[str, Field(min_length=1, max_length=255)]
 
 
 class SolveRequest(BaseModel):
@@ -43,6 +48,8 @@ class EvaluateRequest(BaseModel):
     submission_root: OssRoot
     evaluator_id: str
     evaluator_version: CommitSha
+    evaluator_registry_record_path: Path
+    evaluator_registry_record_sha256: Sha256
 
 
 class ArtifactEntry(BaseModel):
@@ -51,12 +58,14 @@ class ArtifactEntry(BaseModel):
     path: str
     size_bytes: int = Field(ge=0, strict=True)
     sha256: Sha256
+    media_type: MediaType
 
 
 class SubmissionManifest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     schema_version: Literal[1] = 1
+    status: Literal["submitted"] = "submitted"
     submission_id: UUID
     task_path: str
     variant_index: int = Field(ge=0)
@@ -69,6 +78,60 @@ class SubmissionManifest(BaseModel):
     started_at: datetime
     completed_at: datetime
     artifacts: tuple[ArtifactEntry, ...] = Field(min_length=1)
+
+
+class EvaluatorRegistryRecord(BaseModel):
+    """Trusted control-plane authorization for one immutable evaluator."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal[1] = 1
+    status: Literal["ready"]
+    task_path: NonEmptyString
+    variant_index: int = Field(ge=0)
+    task_commit: CommitSha
+    evaluator_id: NonEmptyString
+    evaluator_version: CommitSha
+    rubric_hash: Sha256
+    reference_manifest_uri: OssRoot
+    reference_manifest_hash: Sha256
+    evaluator_sdk_version: NonEmptyString
+    harbor_version: NonEmptyString
+    rewardkit_version: NonEmptyString
+    image_id: AliyunImageId
+    pull_request_url: Annotated[
+        str,
+        Field(pattern=r"^https://github\.com/[^/]+/[^/]+/pull/[1-9][0-9]*$"),
+    ]
+    ci_run_id: NonEmptyString
+    ready_at: datetime
+
+
+class ReferenceFileEntry(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    path: NonEmptyString
+    size_bytes: int = Field(ge=0, strict=True)
+    sha256: Sha256
+
+
+class ReferenceManifest(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal[1] = 1
+    files: tuple[ReferenceFileEntry, ...]
+
+
+class HarborProvenance(BaseModel):
+    """Harbor RewardKit output recorded in every trusted score."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    reward: dict[str, Any]
+    details_path: Annotated[
+        str,
+        Field(pattern=r"^evidence/[A-Za-z0-9._/-]+$", min_length=1, max_length=1_000),
+    ]
 
 
 class SolveResult(BaseModel):
@@ -98,16 +161,45 @@ class EvaluationResult(BaseModel):
 
     schema_version: Literal[1] = 1
     status: Literal["scored", "infra_failed"]
+    submission_id: UUID
+    task_path: NonEmptyString
+    variant_index: int = Field(ge=0)
+    task_commit: CommitSha
+    image_id: AliyunImageId
+    evaluator_id: NonEmptyString
+    evaluator_version: CommitSha
     outcome: Literal["valid", "invalid_output"] | None = None
     score: Score | None = None
+    rubric_hash: Sha256 | None = None
+    harbor: HarborProvenance | None = None
+    error_category: ErrorCategory | None = None
+    error_detail: ErrorDetail | None = None
+    attempt_id: AttemptId | None = None
 
     @model_validator(mode="after")
     def require_consistent_evaluation_fields(self) -> "EvaluationResult":
-        if self.status == "infra_failed" and (self.outcome is not None or self.score is not None):
-            raise ValueError("infra_failed results must not include outcome or score")
-        if self.status == "scored" and (self.outcome is None or self.score is None):
+        error_fields = (self.error_category, self.error_detail, self.attempt_id)
+        if self.status == "infra_failed":
+            if self.outcome is not None or self.score is not None:
+                raise ValueError("infra_failed results must not include outcome or score")
+            if self.rubric_hash is not None or self.harbor is not None:
+                raise ValueError("infra_failed results must not include scored provenance")
+            if any(value is None for value in error_fields):
+                raise ValueError("infra_failed results require category, detail, and attempt_id")
+            return self
+        if self.outcome is None or self.score is None:
             raise ValueError("scored results must include outcome and score")
+        if self.rubric_hash is None or self.harbor is None:
+            raise ValueError("scored results require rubric and Harbor provenance")
+        if any(value is not None for value in error_fields):
+            raise ValueError("scored results must not include infrastructure errors")
+        if self.outcome == "invalid_output" and self.score != 0.0:
+            raise ValueError("invalid_output requires an exact 0.0 score")
         return self
+
+    @model_serializer(mode="wrap")
+    def omit_absent_fields(self, handler):
+        return {key: value for key, value in handler(self).items() if value is not None}
 
 
 class AtomicInfrastructureError(RuntimeError):

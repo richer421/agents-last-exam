@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import subprocess
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import UTC, datetime
 from importlib import import_module
 from pathlib import Path
@@ -17,6 +18,8 @@ from ale_run.atomic.contracts import (
     AtomicInfrastructureError,
     EvaluateRequest,
     EvaluationResult,
+    EvaluatorRegistryRecord,
+    HarborProvenance,
     SubmissionManifest,
 )
 from ale_run.atomic.runtime import AtomicRuntime
@@ -27,6 +30,8 @@ from tests.ale_run.test_atomic_solve import _FakeProvider, _make_solve_request
 
 def _make_evaluate_request(tmp_path: Path) -> EvaluateRequest:
     solve_request = _make_solve_request(tmp_path)
+    record_path = tmp_path / "registry.json"
+    record_path.write_text("{}\n", encoding="utf-8")
     return EvaluateRequest(
         submission_id=solve_request.submission_id,
         runtime_spec_path=solve_request.runtime_spec_path,
@@ -38,6 +43,8 @@ def _make_evaluate_request(tmp_path: Path) -> EvaluateRequest:
         submission_root=solve_request.submission_root,
         evaluator_id="strict-evaluator",
         evaluator_version=solve_request.task_commit,
+        evaluator_registry_record_path=record_path,
+        evaluator_registry_record_sha256=hashlib.sha256(b"{}\n").hexdigest(),
     )
 
 
@@ -59,8 +66,100 @@ def _manifest(request: EvaluateRequest) -> SubmissionManifest:
                 path="output/final.txt",
                 size_bytes=6,
                 sha256="b" * 64,
+                media_type="text/plain",
             ),
         ),
+    )
+
+
+def _registry_record(request: EvaluateRequest) -> EvaluatorRegistryRecord:
+    return EvaluatorRegistryRecord(
+        status="ready",
+        task_path=request.task_path,
+        variant_index=request.variant_index,
+        task_commit=request.task_commit,
+        evaluator_id=request.evaluator_id,
+        evaluator_version=request.evaluator_version,
+        rubric_hash="c" * 64,
+        reference_manifest_uri="oss://trusted/reference/manifest.json",
+        reference_manifest_hash="d" * 64,
+        evaluator_sdk_version="1.2.3",
+        harbor_version="0.20.0",
+        rewardkit_version="0.4.0",
+        image_id=request.image_id,
+        pull_request_url="https://github.com/example/tasks/pull/42",
+        ci_run_id="123456",
+        ready_at=datetime(2026, 7, 29, tzinfo=UTC),
+    )
+
+
+def _scored_result(
+    request: EvaluateRequest,
+    *,
+    score: float = 0.75,
+    outcome: str = "valid",
+    reward: dict[str, object] | None = None,
+) -> EvaluationResult:
+    raw_reward = reward or {
+        "score": score,
+        "outcome": "valid",
+        "report": {"hard_gate_passed": outcome != "invalid_output"},
+    }
+    return EvaluationResult(
+        status="scored",
+        submission_id=request.submission_id,
+        task_path=request.task_path,
+        variant_index=request.variant_index,
+        task_commit=request.task_commit,
+        image_id=request.image_id,
+        evaluator_id=request.evaluator_id,
+        evaluator_version=request.evaluator_version,
+        outcome=outcome,
+        score=score,
+        rubric_hash=_registry_record(request).rubric_hash,
+        harbor=HarborProvenance(
+            reward=raw_reward,
+            details_path="evidence/reward-details.json",
+        ),
+    )
+
+
+def _assert_infra_result(
+    result: EvaluationResult,
+    request: EvaluateRequest,
+) -> None:
+    assert result.status == "infra_failed"
+    assert result.submission_id == request.submission_id
+    assert result.task_path == request.task_path
+    assert result.variant_index == request.variant_index
+    assert result.task_commit == request.task_commit
+    assert result.image_id == request.image_id
+    assert result.evaluator_id == request.evaluator_id
+    assert result.evaluator_version == request.evaluator_version
+    assert result.outcome is None
+    assert result.score is None
+    assert result.error_category
+    assert result.error_detail
+    assert result.attempt_id
+
+
+@pytest.fixture(autouse=True)
+def _trusted_registry_boundary(monkeypatch: pytest.MonkeyPatch):
+    evaluate_module = import_module("ale_run.atomic.evaluate")
+
+    @contextmanager
+    def materialize(request: EvaluateRequest):
+        yield request.task_repo
+
+    monkeypatch.setattr(
+        evaluate_module,
+        "validate_evaluator_registry",
+        _registry_record,
+    )
+    monkeypatch.setattr(
+        evaluate_module,
+        "materialize_evaluator_checkout",
+        materialize,
     )
 
 
@@ -103,34 +202,43 @@ def _patch_happy_path(
     diagnostics: list[tuple[str, object]] = []
     manifest = _manifest(request)
     runtime = _runtime(request)
+    registry_record = _registry_record(request)
 
     async def read_manifest(actual_request: EvaluateRequest) -> SubmissionManifest:
         events.append("read manifest")
         assert actual_request is request
         return manifest
 
-    async def read_result(actual_request: EvaluateRequest) -> None:
+    async def read_result(
+        actual_request: EvaluateRequest,
+        actual_record: EvaluatorRegistryRecord,
+    ) -> None:
         assert actual_request is request
+        assert actual_record is registry_record
 
     @asynccontextmanager
-    async def open_runtime(*, request: EvaluateRequest, run_setup: bool):
-        events.extend(["open fresh runtime", "stage input"])
-        assert request is request_under_test
+    async def open_runtime(
+        *,
+        request: EvaluateRequest,
+        run_setup: bool,
+        evaluator_registry_record: EvaluatorRegistryRecord,
+    ):
+        events.extend(["open fresh runtime", "stage input", "stage reference"])
+        assert (
+            request.model_copy(update={"task_repo": request_under_test.task_repo})
+            == request_under_test
+        )
         assert run_setup is False
+        assert evaluator_registry_record is registry_record
         assert runtime.env.sandbox.metadata["image_id"] == request.image_id
         try:
             yield runtime
         finally:
             events.append("cleanup")
 
-    async def stage_reference(_sandbox, _task_data, *, source: str):
-        events.append("stage reference")
-        assert source == "baked_in_sandbox"
-        return {"staged": ["reference"], "source": source}
-
     async def stage_submission(_sandbox, _task_data, actual_request):
         events.append("stage submission")
-        assert actual_request is request
+        assert actual_request.model_copy(update={"task_repo": request.task_repo}) == request
         return manifest
 
     class Executor:
@@ -172,14 +280,28 @@ def _patch_happy_path(
         assert actual_request is request
 
     request_under_test = request
+
+    @contextmanager
+    def materialize(_request):
+        yield request.task_repo
+
+    monkeypatch.setattr(
+        evaluate_module,
+        "validate_evaluator_registry",
+        lambda actual_request: (
+            registry_record
+            if actual_request is request
+            else (_ for _ in ()).throw(AssertionError("wrong registry request"))
+        ),
+    )
+    monkeypatch.setattr(
+        evaluate_module,
+        "materialize_evaluator_checkout",
+        materialize,
+    )
     monkeypatch.setattr(evaluate_module, "_read_submission_manifest", read_manifest)
     monkeypatch.setattr(evaluate_module, "_read_existing_evaluation_result", read_result)
     monkeypatch.setattr(evaluate_module.AtomicRuntime, "open", open_runtime)
-    monkeypatch.setattr(
-        evaluate_module.task_data_pkg,
-        "select",
-        lambda source: SimpleNamespace(stage_reference=stage_reference),
-    )
     monkeypatch.setattr(evaluate_module, "stage_submission", stage_submission)
     monkeypatch.setattr(evaluate_module, "SandboxExecutor", Executor)
     monkeypatch.setattr(evaluate_module, "evaluate_in_sandbox", run_evaluator)
@@ -207,7 +329,7 @@ async def test_evaluate_runs_precise_independent_order_and_returns_normal_score(
 
     result = await evaluate_module.evaluate(request)
 
-    assert result == EvaluationResult(status="scored", outcome="valid", score=0.75)
+    assert result == _scored_result(request)
     assert events == [
         "read manifest",
         "open fresh runtime",
@@ -333,7 +455,7 @@ async def test_evaluate_real_atomic_runtime_orders_input_and_independent_boundar
         events.append("read manifest")
         return manifest
 
-    async def read_result(_request):
+    async def read_result(_request, _registry_record):
         return None
 
     async def stage_input(_sandbox, task_data, *, source):
@@ -352,10 +474,21 @@ async def test_evaluate_real_atomic_runtime_orders_input_and_independent_boundar
         stage_reference=stage_reference,
     )
 
+    @asynccontextmanager
+    async def prepare_reference(**_kwargs):
+        events.append("prepare reference")
+        yield SimpleNamespace()
+
+    async def stage_trusted_input(sandbox, task_data, *, source, **_kwargs):
+        await backend.stage_input(sandbox, task_data, source=source)
+
+    async def stage_trusted_reference(sandbox, task_data, *, source, **_kwargs):
+        await backend.stage_reference(sandbox, task_data, source=source)
+
     async def stage_submission(_sandbox, task_data, actual_request):
         events.append("stage submission")
         assert task_data.requires_task_data is True
-        assert actual_request is request
+        assert actual_request.model_copy(update={"task_repo": request.task_repo}) == request
         return manifest
 
     class Executor:
@@ -382,11 +515,26 @@ async def test_evaluate_real_atomic_runtime_orders_input_and_independent_boundar
     async def publish(_sandbox, actual_request, result):
         events.append("publish result")
         assert actual_request is request
-        assert result == EvaluationResult(status="scored", outcome="valid", score=0.75)
+        assert result == _scored_result(request)
         return "oss://canonical/result.json"
 
     monkeypatch.setattr(runtime_module, "load_experiment", lambda _path: runtime_spec)
     monkeypatch.setattr(runtime_module, "EnvironmentRouter", Router)
+    monkeypatch.setattr(
+        runtime_module,
+        "prepare_atomic_reference",
+        prepare_reference,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "stage_atomic_input",
+        stage_trusted_input,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "stage_atomic_reference",
+        stage_trusted_reference,
+    )
     monkeypatch.setattr(evaluate_module, "_read_submission_manifest", read_manifest)
     monkeypatch.setattr(evaluate_module, "_read_existing_evaluation_result", read_result)
     monkeypatch.setattr(evaluate_module.task_data_pkg, "select", lambda _source: backend)
@@ -398,9 +546,10 @@ async def test_evaluate_real_atomic_runtime_orders_input_and_independent_boundar
 
     result = await evaluate_module.evaluate(request)
 
-    assert result == EvaluationResult(status="scored", outcome="valid", score=0.75)
+    assert result == _scored_result(request)
     assert events == [
         "read manifest",
+        "prepare reference",
         "open fresh runtime",
         "stage input",
         "stage reference",
@@ -430,10 +579,15 @@ async def test_evaluate_maps_only_a_legal_hard_gate_to_invalid_output_zero(
 
     result = await evaluate_module.evaluate(request)
 
-    assert result == EvaluationResult(
-        status="scored",
+    assert result == _scored_result(
+        request,
         outcome="invalid_output",
         score=0.0,
+        reward={
+            "score": 0.0,
+            "outcome": "valid",
+            "report": {"hard_gate_passed": False},
+        },
     )
     assert "publish result" in events
     assert diagnostics == []
@@ -474,7 +628,7 @@ async def test_evaluate_rejects_illegal_evaluator_scored_states(
 
     result = await evaluate_module.evaluate(request)
 
-    assert result == EvaluationResult(status="infra_failed")
+    _assert_infra_result(result, request)
     assert "publish result" not in events
     assert len(diagnostics) == 1
     assert diagnostics[0][1].category == "evaluator"
@@ -517,7 +671,7 @@ async def test_illegal_existing_canonical_result_is_not_a_successful_fast_path(
 
     result = await evaluate_module.evaluate(request)
 
-    assert result == EvaluationResult(status="infra_failed")
+    _assert_infra_result(result, request)
     assert len(diagnostics) == 1
     assert diagnostics[0].category == "idempotency_conflict"
 
@@ -565,7 +719,7 @@ async def test_evaluate_rejects_manifest_request_or_agent_provenance_before_vm(
 
     result = await evaluate_module.evaluate(request)
 
-    assert result == EvaluationResult(status="infra_failed")
+    _assert_infra_result(result, request)
     assert len(diagnostics) == 1
     assert diagnostics[0].category == "submission_integrity"
 
@@ -585,24 +739,27 @@ async def test_declared_reference_is_strict_and_missing_data_is_infrastructure_f
     )
     evaluate_module, events, diagnostics = _patch_happy_path(monkeypatch, request)
 
-    async def fail_reference(_sandbox, _task_data, *, source: str):
-        events.append("stage reference")
-        if backend_failure == "exception":
-            raise RuntimeError("reference transport failed")
-        return {"skipped": True, "reason": "missing reference"}
+    @asynccontextmanager
+    async def fail_runtime(**_kwargs):
+        events.extend(["open fresh runtime", "stage input", "stage reference"])
+        detail = (
+            "reference transport failed" if backend_failure == "exception" else "missing reference"
+        )
+        raise AtomicInfrastructureError("reference", detail)
+        yield  # pragma: no cover
 
     monkeypatch.setattr(
-        evaluate_module.task_data_pkg,
-        "select",
-        lambda source: SimpleNamespace(stage_reference=fail_reference),
+        evaluate_module.AtomicRuntime,
+        "open",
+        fail_runtime,
     )
 
     result = await evaluate_module.evaluate(request)
 
-    assert result == EvaluationResult(status="infra_failed")
+    _assert_infra_result(result, request)
     assert "stage submission" not in events
     assert "run evaluator" not in events
-    assert events[-1] == "cleanup"
+    assert events[-1] == "stage reference"
     assert len(diagnostics) == 1
     assert diagnostics[0][1].category == "reference"
 
@@ -616,19 +773,24 @@ async def test_reference_backend_atomic_error_is_recategorized_with_bounded_caus
     evaluate_module, events, diagnostics = _patch_happy_path(monkeypatch, request)
     backend_error = AtomicInfrastructureError("submission_storage", "x" * 10_000)
 
-    async def fail_reference(*_args, **_kwargs):
-        events.append("stage reference")
-        raise backend_error
+    @asynccontextmanager
+    async def fail_runtime(**_kwargs):
+        events.extend(["open fresh runtime", "stage input", "stage reference"])
+        raise AtomicInfrastructureError(
+            "reference",
+            f"reference staging failed: {backend_error}"[:2000],
+        ) from backend_error
+        yield  # pragma: no cover
 
     monkeypatch.setattr(
-        evaluate_module.task_data_pkg,
-        "select",
-        lambda source: SimpleNamespace(stage_reference=fail_reference),
+        evaluate_module.AtomicRuntime,
+        "open",
+        fail_runtime,
     )
 
     result = await evaluate_module.evaluate(request)
 
-    assert result == EvaluationResult(status="infra_failed")
+    _assert_infra_result(result, request)
     assert "stage submission" not in events
     assert len(diagnostics) == 1
     failure = diagnostics[0][1]
@@ -653,7 +815,7 @@ async def test_artifact_hash_mismatch_never_runs_or_publishes_evaluator(
 
     result = await evaluate_module.evaluate(request)
 
-    assert result == EvaluationResult(status="infra_failed")
+    _assert_infra_result(result, request)
     assert "run evaluator" not in events
     assert "publish result" not in events
     assert events[-1] == "cleanup"
@@ -684,7 +846,7 @@ async def test_evaluator_timeout_or_runtime_failure_is_unscored_infrastructure_f
 
     result = await evaluate_module.evaluate(request)
 
-    assert result == EvaluationResult(status="infra_failed", outcome=None, score=None)
+    _assert_infra_result(result, request)
     assert "publish result" not in events
     assert events[-1] == "cleanup"
     assert len(diagnostics) == 1
@@ -705,7 +867,7 @@ async def test_evaluator_error_result_is_not_converted_to_zero(
 
     result = await evaluate_module.evaluate(request)
 
-    assert result == EvaluationResult(status="infra_failed")
+    _assert_infra_result(result, request)
     assert "publish result" not in events
     assert diagnostics[0][1].category == "evaluator"
 
@@ -717,14 +879,22 @@ async def test_existing_valid_result_returns_without_vm_provisioning(
 ) -> None:
     request = _make_evaluate_request(tmp_path)
     evaluate_module = import_module("ale_run.atomic.evaluate")
-    existing = EvaluationResult(status="scored", outcome="valid", score=0.625)
+    existing = _scored_result(
+        request,
+        score=0.625,
+        reward={
+            "score": 0.625,
+            "outcome": "valid",
+            "report": {"hard_gate_passed": True},
+        },
+    )
     events: list[str] = []
 
     async def read_manifest(_request):
         events.append("read manifest")
         return _manifest(request)
 
-    async def read_result(_request):
+    async def read_result(_request, _registry_record):
         events.append("read result")
         return existing
 
@@ -767,7 +937,7 @@ async def test_diagnostic_write_failure_cannot_disguise_infrastructure_failure_a
 
     result = await evaluate_module.evaluate(request)
 
-    assert result == EvaluationResult(status="infra_failed", outcome=None, score=None)
+    _assert_infra_result(result, request)
     assert "publish result" not in events
 
 
@@ -803,7 +973,7 @@ async def test_cleanup_failure_after_publish_preserves_durable_scored_result(
 
     result = await evaluate_module.evaluate(request)
 
-    assert result == EvaluationResult(status="scored", outcome="valid", score=0.75)
+    assert result == _scored_result(request)
     assert events == [
         "read manifest",
         "open fresh runtime",
@@ -851,7 +1021,7 @@ async def test_cleanup_diagnostic_failure_does_not_change_durable_scored_result(
 
     result = await evaluate_module.evaluate(request)
 
-    assert result == EvaluationResult(status="scored", outcome="valid", score=0.75)
+    assert result == _scored_result(request)
     assert events[-2:] == ["publish result", "cleanup"]
     assert diagnostics == []
 
@@ -924,7 +1094,7 @@ async def test_cleanup_failure_before_publish_remains_unscored(
 
     result = await evaluate_module.evaluate(request)
 
-    assert result == EvaluationResult(status="infra_failed")
+    _assert_infra_result(result, request)
     assert "publish result" not in events
     assert len(diagnostics) == 1
 

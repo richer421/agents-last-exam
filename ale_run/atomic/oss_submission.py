@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import mimetypes
+import os
+import re
 import shlex
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
@@ -22,6 +27,11 @@ from .contracts import (
     SolveRequest,
     SubmissionManifest,
 )
+from .host_oss import (
+    host_command_diagnostic,
+    read_host_oss_object,
+    run_host_ossutil,
+)
 
 _COMMAND_TIMEOUT_SECONDS = 3600
 _MAX_DECLARED_ARTIFACTS = 1024
@@ -30,10 +40,39 @@ _MAX_MANIFEST_BYTES = 1024 * 1024
 _MAX_RESULT_BYTES = 64 * 1024
 _MAX_SCRIPT_OUTPUT_BYTES = 2 * 1024 * 1024
 _MAX_PATH_BYTES = 4096
+_MAX_ARTIFACT_BYTES = 4 * 1024 * 1024 * 1024
+_MAX_ARTIFACT_TOTAL_BYTES = 16 * 1024 * 1024 * 1024
 _OSS_ARGUMENT_TOKEN = "__ALE_OSS_ARGUMENTS__"
 _PROVENANCE_FIELDS = frozenset(
     {"ale_run_id", "model_id", "config_digest", "started_at", "completed_at"}
 )
+
+
+async def read_existing_submission_manifest(
+    request: SolveRequest,
+) -> SubmissionManifest | None:
+    """Read the canonical commit marker on the trusted host before provisioning."""
+    raw = await read_host_oss_object(
+        f"{_submission_prefix(request)}/manifest.json",
+        limit=_MAX_MANIFEST_BYTES,
+        missing_ok=True,
+        integrity_category="idempotency_conflict",
+    )
+    if raw is None:
+        return None
+    try:
+        manifest = SubmissionManifest.model_validate_json(raw)
+    except ValidationError as exc:
+        raise AtomicInfrastructureError(
+            "idempotency_conflict",
+            f"occupied submission manifest is invalid: {exc}",
+        ) from exc
+    if raw != _canonical_json(manifest.model_dump(mode="json")):
+        raise AtomicInfrastructureError(
+            "idempotency_conflict",
+            "occupied submission manifest is not canonical",
+        )
+    return manifest
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -183,7 +222,9 @@ def _task_card_path(request: SolveRequest | EvaluateRequest) -> Path:
     return candidate
 
 
-def _declared_output_paths(request: SolveRequest) -> tuple[str, ...]:
+def _declared_output_entries(
+    request: SolveRequest,
+) -> tuple[tuple[str, str], ...]:
     try:
         task_card_path = _task_card_path(request)
         with task_card_path.open("rb") as stream:
@@ -215,7 +256,7 @@ def _declared_output_paths(request: SolveRequest) -> tuple[str, ...]:
             f"outputFiles exceeds the {_MAX_DECLARED_ARTIFACTS}-file limit",
         )
 
-    paths: list[str] = []
+    entries: list[tuple[str, str]] = []
     for entry in output_files:
         raw_path = entry.get("path") if isinstance(entry, dict) else None
         if not isinstance(raw_path, str):
@@ -223,12 +264,24 @@ def _declared_output_paths(request: SolveRequest) -> tuple[str, ...]:
                 "submission_integrity", "each outputFiles entry must have a string path"
             )
         path = _validate_artifact_path(raw_path)
-        if path in paths:
+        if any(existing_path == path for existing_path, _media_type in entries):
             raise AtomicInfrastructureError(
                 "submission_integrity", f"duplicate declared output path: {path}"
             )
-        paths.append(path)
-    return tuple(paths)
+        raw_media_type = (
+            entry.get("mediaType") or entry.get("media_type") if isinstance(entry, dict) else None
+        )
+        media_type = (
+            str(raw_media_type)
+            if raw_media_type
+            else mimetypes.guess_type(path)[0] or "application/octet-stream"
+        )
+        entries.append((path, media_type))
+    return tuple(entries)
+
+
+def _declared_output_paths(request: SolveRequest) -> tuple[str, ...]:
+    return tuple(path for path, _media_type in _declared_output_entries(request))
 
 
 def _validate_artifact_path(raw_path: str) -> str:
@@ -275,6 +328,7 @@ def _manifest_base(
         )
     base: dict[str, object] = {
         "schema_version": 1,
+        "status": "submitted",
         "submission_id": str(request.submission_id),
         "task_path": request.task_path,
         "variant_index": request.variant_index,
@@ -316,84 +370,172 @@ async def publish_submission(
     provenance: Mapping[str, object],
 ) -> SubmissionManifest:
     """Publish declared solve outputs and commit them with ``manifest.json``."""
-    declared_paths = _declared_output_paths(request)
+    declared_entries = _declared_output_entries(request)
+    declared_paths = tuple(path for path, _media_type in declared_entries)
     manifest_base = _manifest_base(request, provenance)
     submission_prefix = _submission_prefix(request)
     output_root = _output_root(sandbox, task_data)
 
-    await ossbucket.ensure_ossutil(sandbox)
-    existing = await _load_existing_submission_manifest(
-        sandbox,
-        request,
-        declared_paths=declared_paths,
-        manifest_base=manifest_base,
-    )
-    inspected = await _inspect_submission_artifacts(
+    await _inspect_submission_artifacts(
         sandbox,
         output_root=output_root,
         declared_paths=declared_paths,
-        allow_missing_root=existing is not None,
+        allow_missing_root=False,
     )
-    if inspected is None:
-        if existing is None:
-            raise AtomicInfrastructureError(
-                "submission_integrity", "submission output directory is missing"
+    with tempfile.TemporaryDirectory(prefix="ale-submission-staging-") as temp_dir:
+        staging = Path(temp_dir)
+        os.chmod(staging, 0o700)
+        artifact_root = staging / "artifacts"
+        artifact_rows: list[dict[str, object]] = []
+        total_bytes = 0
+        for declared_path, media_type in declared_entries:
+            relative = PurePosixPath(declared_path).relative_to("output")
+            remote_path = join(sandbox, output_root, *relative.parts)
+            local_path = artifact_root.joinpath(*PurePosixPath(declared_path).parts)
+            local_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            downloaded = await sandbox.download_to_local(
+                remote_path,
+                str(local_path),
+                timeout=_COMMAND_TIMEOUT_SECONDS,
             )
-        return existing
-
-    try:
-        validated_manifest = SubmissionManifest.model_validate(
-            manifest_base | {"artifacts": inspected}
-        )
-    except ValidationError as exc:
-        raise AtomicInfrastructureError(
-            "submission_integrity",
-            f"invalid submission manifest before commit: {exc}",
-        ) from exc
-    if existing is not None:
-        if existing != validated_manifest:
-            raise AtomicInfrastructureError(
-                "idempotency_conflict",
-                "manifest.json already commits different artifact bytes",
+            if not downloaded or local_path.is_symlink() or not local_path.is_file():
+                raise AtomicInfrastructureError(
+                    "submission_integrity",
+                    f"failed to pull required output into trusted staging: {declared_path}",
+                )
+            size = local_path.stat().st_size
+            total_bytes += size
+            if size > _MAX_ARTIFACT_BYTES or total_bytes > _MAX_ARTIFACT_TOTAL_BYTES:
+                raise AtomicInfrastructureError(
+                    "submission_integrity",
+                    "declared outputs exceed per-file or total staging limits",
+                )
+            os.chmod(local_path, 0o600)
+            artifact_rows.append(
+                {
+                    "path": declared_path,
+                    "size_bytes": size,
+                    "sha256": _local_sha256(local_path),
+                    "media_type": media_type,
+                    "local_path": local_path,
+                }
             )
-        return existing
 
-    oss_template = ossbucket.oss_command(sandbox, _OSS_ARGUMENT_TOKEN)
-    config = {
-        "output_root": output_root,
-        "declared_paths": declared_paths,
-        "expected_manifest": validated_manifest.model_dump(mode="json"),
-        "submission_prefix": submission_prefix,
-        "oss_template": oss_template,
-        "oss_argument_token": _OSS_ARGUMENT_TOKEN,
-        "windows": not sandbox.is_linux,
-        "max_manifest_bytes": _MAX_MANIFEST_BYTES,
-    }
+        try:
+            manifest = SubmissionManifest.model_validate(
+                manifest_base
+                | {
+                    "artifacts": [
+                        {key: row[key] for key in ("path", "size_bytes", "sha256", "media_type")}
+                        for row in artifact_rows
+                    ]
+                }
+            )
+        except ValidationError as exc:
+            raise AtomicInfrastructureError(
+                "submission_integrity",
+                f"invalid submission manifest before commit: {exc}",
+            ) from exc
+        existing = await read_existing_submission_manifest(request)
+        if existing is not None:
+            if existing != manifest:
+                raise AtomicInfrastructureError(
+                    "idempotency_conflict",
+                    "manifest.json already commits different submission bytes",
+                )
+            return existing
 
-    script_path, config_path = await _write_script_bundle(
-        sandbox,
-        stem="ale-atomic-publish",
-        script=_PUBLISH_SCRIPT,
-        config=config,
-    )
-    result = await sandbox.run_command(
-        _python_command(sandbox, script_path, config_path),
-        timeout=_COMMAND_TIMEOUT_SECONDS,
-    )
-    payload = _parse_script_output(result, default_category="submission_storage")
-    try:
-        committed_manifest = SubmissionManifest.model_validate(payload["manifest"])
-    except (KeyError, ValidationError) as exc:
-        category = (
-            "idempotency_conflict" if payload.get("existing") is True else "submission_integrity"
+        for row in artifact_rows:
+            artifact_url = f"{submission_prefix}/artifacts/{row['path']}"
+            uploaded = await run_host_ossutil(
+                "cp",
+                str(row["local_path"]),
+                artifact_url,
+                "--forbid-overwrite",
+                "--meta",
+                f"x-oss-meta-sha256:{row['sha256']}",
+            )
+            if uploaded[0] != 0:
+                await _verify_host_artifact(
+                    artifact_url,
+                    expected_size=int(row["size_bytes"]),
+                    expected_sha256=str(row["sha256"]),
+                    conflict=True,
+                )
+            await _verify_host_artifact(
+                artifact_url,
+                expected_size=int(row["size_bytes"]),
+                expected_sha256=str(row["sha256"]),
+                conflict=False,
+            )
+
+        manifest_bytes = _canonical_json(manifest.model_dump(mode="json"))
+        if len(manifest_bytes) > _MAX_MANIFEST_BYTES:
+            raise AtomicInfrastructureError(
+                "submission_integrity",
+                "generated manifest exceeds the 1 MiB limit",
+            )
+        manifest_path = staging / "manifest.json"
+        manifest_path.write_bytes(manifest_bytes)
+        os.chmod(manifest_path, 0o600)
+        manifest_url = f"{submission_prefix}/manifest.json"
+        committed = await run_host_ossutil(
+            "cp",
+            str(manifest_path),
+            manifest_url,
+            "--forbid-overwrite",
         )
-        raise AtomicInfrastructureError(category, f"invalid published manifest: {exc}") from exc
-    if committed_manifest != validated_manifest:
+        if committed[0] != 0:
+            raced = await read_existing_submission_manifest(request)
+            if raced != manifest:
+                raise AtomicInfrastructureError(
+                    "idempotency_conflict" if raced is not None else "submission_storage",
+                    "manifest commit lost a race or failed without a committed result",
+                )
+        return manifest
+
+
+def _local_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+async def _verify_host_artifact(
+    url: str,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+    conflict: bool,
+) -> None:
+    result = await run_host_ossutil("stat", url)
+    if result[0] != 0:
         raise AtomicInfrastructureError(
-            "idempotency_conflict",
-            "publisher returned a manifest different from the prevalidated commit",
+            "submission_storage",
+            f"artifact remote verification failed: {host_command_diagnostic(result)}",
         )
-    return committed_manifest
+    output = result[1].decode("utf-8", errors="replace")
+    size_match = re.search(
+        r"(?im)^\s*(?:content[- ]?length|size)\s*[:=]\s*(\d+)\s*$",
+        output,
+    )
+    digest_match = re.search(
+        r"(?i)[\"']?x-oss-meta-sha256[\"']?\s*[:=]\s*[\"']?([0-9a-f]{64})",
+        output,
+    )
+    matches = (
+        size_match is not None
+        and digest_match is not None
+        and int(size_match.group(1)) == expected_size
+        and digest_match.group(1).lower() == expected_sha256
+    )
+    if not matches:
+        raise AtomicInfrastructureError(
+            "idempotency_conflict" if conflict else "submission_storage",
+            f"artifact metadata mismatch for {url}",
+        )
 
 
 async def _inspect_submission_artifacts(
@@ -657,6 +799,28 @@ async def publish_evaluation_result(
     result: EvaluationResult,
 ) -> str:
     """Publish canonical evaluator output without overwriting an occupied key."""
+    if result.status != "scored":
+        raise AtomicInfrastructureError(
+            "submission_integrity",
+            "only scored evaluation results may occupy the canonical result key",
+        )
+    expected_identity = {
+        "submission_id": request.submission_id,
+        "task_path": request.task_path,
+        "variant_index": request.variant_index,
+        "task_commit": request.task_commit,
+        "image_id": request.image_id,
+        "evaluator_id": request.evaluator_id,
+        "evaluator_version": request.evaluator_version,
+    }
+    mismatches = [
+        field for field, expected in expected_identity.items() if getattr(result, field) != expected
+    ]
+    if mismatches:
+        raise AtomicInfrastructureError(
+            "submission_integrity",
+            f"evaluation result identity mismatch: {', '.join(mismatches)}",
+        )
     await ossbucket.ensure_ossutil(sandbox)
     result_bytes = _canonical_json(result.model_dump(mode="json"))
     if len(result_bytes) > _MAX_RESULT_BYTES:

@@ -19,6 +19,7 @@ from ale_run.atomic.contracts import (
     AtomicInfrastructureError,
     EvaluateRequest,
     EvaluationResult,
+    HarborProvenance,
     SolveRequest,
 )
 from ale_run.atomic.oss_submission import (
@@ -52,6 +53,20 @@ class FakeSandbox:
             destination.write_bytes(content)
         else:
             destination.write_text(content, encoding="utf-8")
+
+    async def download_to_local(
+        self,
+        remote_path: str,
+        local_path: str,
+        *,
+        timeout: float = 60,
+    ) -> bool:
+        del timeout
+        source = Path(remote_path)
+        destination = Path(local_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+        return True
 
     async def run_command(
         self, command: str, *, timeout: float = 60
@@ -252,6 +267,20 @@ with log.open("a", encoding="utf-8") as stream:
     def fake_command(_sandbox: object, arguments: str) -> str:
         return f"{sys.executable} {cli} {store} {log} {arguments}"
 
+    async def fake_host_ossutil(*arguments: str):
+        completed = await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, str(cli), str(store), str(log), *arguments],
+            capture_output=True,
+            check=False,
+        )
+        if len(completed.stdout) > 64 * 1024 or len(completed.stderr) > 64 * 1024:
+            raise AtomicInfrastructureError(
+                "submission_storage",
+                "host ossutil output exceeded 64 KiB",
+            )
+        return completed.returncode, completed.stdout, completed.stderr
+
     monkeypatch.setattr(
         "ale_run.atomic.oss_submission.ossbucket.ensure_ossutil",
         fake_ensure,
@@ -261,6 +290,14 @@ with log.open("a", encoding="utf-8") as stream:
         "ale_run.atomic.oss_submission.ossbucket.oss_command",
         fake_command,
         raising=False,
+    )
+    monkeypatch.setattr(
+        "ale_run.atomic.host_oss.run_host_ossutil",
+        fake_host_ossutil,
+    )
+    monkeypatch.setattr(
+        "ale_run.atomic.oss_submission.run_host_ossutil",
+        fake_host_ossutil,
     )
     return store, log
 
@@ -312,6 +349,8 @@ def evaluate_request(task_repo: Path, tmp_path: Path) -> EvaluateRequest:
         submission_root="oss://bucket/task-prefix",
         evaluator_id="evaluator/main",
         evaluator_version=EVALUATOR_VERSION,
+        evaluator_registry_record_path=tmp_path / "registry.json",
+        evaluator_registry_record_sha256="c" * 64,
     )
 
 
@@ -631,7 +670,6 @@ async def test_publish_retry_returns_existing_identical_manifest_without_writes(
     task_data = _task_data(output_dir)
     first = await publish_submission(sandbox, task_data, solve_request, provenance=provenance)
     writes_before_retry = len([call for call in _calls(log) if call.get("direction") == "upload"])
-    shutil.rmtree(output_dir)
 
     second = await publish_submission(sandbox, task_data, solve_request, provenance=provenance)
 
@@ -783,6 +821,7 @@ def _seed_submission(
     artifact_path.write_bytes(artifact_bytes)
     manifest = {
         "schema_version": 1,
+        "status": "submitted",
         "submission_id": str(SUBMISSION_ID),
         "task_path": solve_request.task_path,
         "variant_index": solve_request.variant_index,
@@ -799,6 +838,7 @@ def _seed_submission(
                 "path": "output/final.txt",
                 "size_bytes": len(artifact_bytes),
                 "sha256": hashlib.sha256(artifact_bytes).hexdigest(),
+                "media_type": "text/plain",
             }
         ],
     }
@@ -809,6 +849,36 @@ def _seed_submission(
         encoding="utf-8",
     )
     return base
+
+
+def _evaluation_result(
+    request: EvaluateRequest,
+    *,
+    score: float,
+    outcome: str,
+) -> EvaluationResult:
+    reward = {
+        "score": score,
+        "outcome": outcome,
+        "report": {"hard_gate_passed": outcome != "invalid_output"},
+    }
+    return EvaluationResult(
+        status="scored",
+        submission_id=request.submission_id,
+        task_path=request.task_path,
+        variant_index=request.variant_index,
+        task_commit=request.task_commit,
+        image_id=request.image_id,
+        evaluator_id=request.evaluator_id,
+        evaluator_version=request.evaluator_version,
+        outcome=outcome,
+        score=score,
+        rubric_hash="d" * 64,
+        harbor=HarborProvenance(
+            reward=reward,
+            details_path="evidence/reward-details.json",
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -964,6 +1034,7 @@ async def test_stage_rejects_unbounded_artifact_count_before_artifact_download(
             "path": f"output/file-{index}.txt",
             "size_bytes": 0,
             "sha256": hashlib.sha256(b"").hexdigest(),
+            "media_type": "text/plain",
         }
         for index in range(1025)
     ]
@@ -1013,7 +1084,7 @@ async def test_result_publish_is_canonical_and_idempotent(
 ) -> None:
     store, log = fake_oss
     sandbox = FakeSandbox(tmp_path / "vm")
-    result = EvaluationResult(status="scored", outcome="valid", score=0.75)
+    result = _evaluation_result(evaluate_request, score=0.75, outcome="valid")
     expected_url = (
         "oss://bucket/task-prefix/output/"
         f"{SUBMISSION_ID}/evaluations/evaluator%2Fmain/"
@@ -1025,9 +1096,11 @@ async def test_result_publish_is_canonical_and_idempotent(
     second_url = await publish_evaluation_result(sandbox, evaluate_request, result)
 
     assert first_url == second_url == expected_url
-    assert _object_path(store, expected_url).read_bytes() == (
-        b'{"outcome":"valid","schema_version":1,"score":0.75,"status":"scored"}'
-    )
+    assert _object_path(store, expected_url).read_bytes() == json.dumps(
+        result.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
     assert (
         len([call for call in _calls(log) if call.get("direction") == "upload"])
         == writes_before_retry
@@ -1042,14 +1115,18 @@ async def test_result_publish_rejects_existing_different_bytes(
 ) -> None:
     store, _log = fake_oss
     sandbox = FakeSandbox(tmp_path / "vm")
-    first = EvaluationResult(status="scored", outcome="valid", score=0.75)
+    first = _evaluation_result(evaluate_request, score=0.75, outcome="valid")
     await publish_evaluation_result(sandbox, evaluate_request, first)
 
     with pytest.raises(AtomicInfrastructureError) as caught:
         await publish_evaluation_result(
             sandbox,
             evaluate_request,
-            EvaluationResult(status="scored", outcome="invalid_output", score=0.0),
+            _evaluation_result(
+                evaluate_request,
+                score=0.0,
+                outcome="invalid_output",
+            ),
         )
 
     assert caught.value.category == "idempotency_conflict"
@@ -1059,6 +1136,31 @@ async def test_result_publish_rejects_existing_different_bytes(
         f"{EVALUATOR_VERSION}/result.json"
     )
     assert json.loads(_object_path(store, result_url).read_bytes())["score"] == 0.75
+
+
+@pytest.mark.asyncio
+async def test_result_publish_rejects_result_identity_mismatch_before_upload(
+    tmp_path: Path,
+    fake_oss: tuple[Path, Path],
+    evaluate_request: EvaluateRequest,
+) -> None:
+    _store, log = fake_oss
+    result = _evaluation_result(
+        evaluate_request,
+        score=0.75,
+        outcome="valid",
+    ).model_copy(update={"evaluator_id": "different-evaluator"})
+
+    with pytest.raises(AtomicInfrastructureError) as caught:
+        await publish_evaluation_result(
+            FakeSandbox(tmp_path / "vm"),
+            evaluate_request,
+            result,
+        )
+
+    assert caught.value.category == "submission_integrity"
+    assert "evaluator_id" in caught.value.message
+    assert not [call for call in _calls(log) if call.get("direction") == "upload"]
 
 
 @pytest.mark.asyncio
@@ -1087,7 +1189,7 @@ async def test_windows_commands_encode_dynamic_root_path_and_evaluator_identity(
     result_url = await publish_evaluation_result(
         sandbox,
         request,
-        EvaluationResult(status="scored", outcome="valid", score=1.0),
+        _evaluation_result(request, score=1.0, outcome="valid"),
     )
     await _download(sandbox, f"{unsafe_root}/%OBJECT%&|<>^", unsafe_path)
 

@@ -19,6 +19,12 @@ class _BlockedModule(ModuleType):
 
 class _Request:
     submission_id = UUID("00000000-0000-0000-0000-000000000001")
+    task_path = "visual_media/demo"
+    variant_index = 0
+    task_commit = "a" * 40
+    image_id = "m-image-123"
+    evaluator_id = "rubric"
+    evaluator_version = "b" * 40
 
     @classmethod
     def model_validate_json(cls, raw: str) -> _Request:
@@ -160,6 +166,13 @@ def test_atomic_command_converts_operation_exception_to_result_json(
     if command == "solve":
         assert result["submission_id"] == str(_Request.submission_id)
         assert 0 < len(result["error"]) <= 1_000
+    else:
+        assert result["submission_id"] == str(_Request.submission_id)
+        assert result["task_path"] == _Request.task_path
+        assert result["error_category"] == "cli"
+        assert result["error_detail"] == "operation exploded"
+        assert result["attempt_id"].startswith("cli-")
+        assert {"outcome", "score", "rubric_hash", "harbor"}.isdisjoint(result)
 
 
 def test_existing_run_and_list_commands_keep_their_handlers(

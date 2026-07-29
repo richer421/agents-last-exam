@@ -8,6 +8,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 import ale_run as ale
 
@@ -104,7 +105,19 @@ def main(argv: list[str] | None = None) -> int:
                 EvaluateRequest,
                 evaluate,
                 args.request_path,
-                lambda _request, _error: EvaluationResult(status="infra_failed"),
+                lambda request, error: EvaluationResult(
+                    status="infra_failed",
+                    submission_id=request.submission_id,
+                    task_path=request.task_path,
+                    variant_index=request.variant_index,
+                    task_commit=request.task_commit,
+                    image_id=request.image_id,
+                    evaluator_id=request.evaluator_id,
+                    evaluator_version=request.evaluator_version,
+                    error_category="cli",
+                    error_detail=error,
+                    attempt_id=f"cli-{uuid4().hex}",
+                ),
             )
         )
     return 1
