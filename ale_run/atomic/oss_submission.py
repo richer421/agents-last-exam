@@ -41,6 +41,9 @@ _MAX_DECLARED_ARTIFACTS = 1024
 _MAX_TASK_CARD_BYTES = 1024 * 1024
 _MAX_MANIFEST_BYTES = 1024 * 1024
 _MAX_RESULT_BYTES = 64 * 1024
+_MAX_REWARD_EVIDENCE_BYTES = 32 * 1024
+_MAX_DETAILS_EVIDENCE_BYTES = 8 * 1024 * 1024
+_MAX_HARBOR_EVIDENCE_BYTES = 8 * 1024 * 1024
 _MAX_SCRIPT_OUTPUT_BYTES = 2 * 1024 * 1024
 _MAX_PATH_BYTES = 4096
 _MAX_ARTIFACT_BYTES = 4 * 1024 * 1024 * 1024
@@ -87,6 +90,39 @@ def _canonical_json(value: Any) -> bytes:
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
+
+
+def _parse_strict_json_object(raw: bytes, *, name: str) -> dict[str, Any]:
+    def reject_non_finite(value: str) -> None:
+        raise ValueError(f"non-finite JSON constant {value}")
+
+    try:
+        value = json.loads(raw, parse_constant=reject_non_finite)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise AtomicInfrastructureError(
+            "submission_integrity",
+            f"staged {name} must be one complete finite JSON object: {exc}",
+        ) from exc
+    if not isinstance(value, dict):
+        raise AtomicInfrastructureError(
+            "submission_integrity", f"staged {name} must be a JSON object"
+        )
+    return value
+
+
+def _json_values_equal(left: Any, right: Any) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _json_values_equal(value, right[key]) for key, value in left.items()
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _json_values_equal(left_value, right_value)
+            for left_value, right_value in zip(left, right, strict=True)
+        )
+    return left == right
 
 
 def _submission_prefix(request: SolveRequest | EvaluateRequest) -> str:
@@ -1011,9 +1047,26 @@ async def publish_evaluation_result(
         raise AtomicInfrastructureError(
             "submission_integrity", "scored result is missing Harbor provenance"
         )
+    harbor = result.harbor
+    declared_sizes = {
+        "reward.json": harbor.reward_size_bytes,
+        "reward-details.json": harbor.details_size_bytes,
+    }
+    if declared_sizes["reward.json"] > _MAX_REWARD_EVIDENCE_BYTES:
+        raise AtomicInfrastructureError(
+            "submission_integrity", "reward.json exceeds its 32 KiB limit"
+        )
+    if declared_sizes["reward-details.json"] > _MAX_DETAILS_EVIDENCE_BYTES:
+        raise AtomicInfrastructureError(
+            "submission_integrity", "reward-details.json exceeds its 8 MiB limit"
+        )
+    if sum(declared_sizes.values()) > _MAX_HARBOR_EVIDENCE_BYTES:
+        raise AtomicInfrastructureError(
+            "submission_integrity", "Harbor evidence exceeds its combined 8 MiB limit"
+        )
     expected_evidence = {
-        "reward.json": result.harbor.reward_sha256,
-        "reward-details.json": result.harbor.details_sha256,
+        "reward.json": (harbor.reward_size_bytes, harbor.reward_sha256),
+        "reward-details.json": (harbor.details_size_bytes, harbor.details_sha256),
     }
     if set(evidence_paths) != set(expected_evidence):
         raise AtomicInfrastructureError(
@@ -1021,13 +1074,15 @@ async def publish_evaluation_result(
         )
 
     evidence_rows: list[tuple[str, Path, int, str]] = []
-    for name, expected_sha256 in expected_evidence.items():
+    for name, (expected_size, expected_sha256) in expected_evidence.items():
         local_path = Path(evidence_paths[name])
         if local_path.is_symlink() or not local_path.is_file():
             raise AtomicInfrastructureError(
                 "submission_integrity", f"staged {name} is missing or unsafe"
             )
         size = local_path.stat().st_size
+        if size != expected_size:
+            raise AtomicInfrastructureError("submission_integrity", f"staged {name} size mismatch")
         actual_sha256 = await asyncio.to_thread(_local_sha256, local_path)
         if actual_sha256 != expected_sha256:
             raise AtomicInfrastructureError(
@@ -1035,14 +1090,11 @@ async def publish_evaluation_result(
             )
         evidence_rows.append((name, local_path, size, actual_sha256))
 
-    reward_raw = evidence_rows[0][1].read_bytes()
-    try:
-        reward_value = json.loads(reward_raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise AtomicInfrastructureError(
-            "submission_integrity", f"staged reward.json is invalid: {exc}"
-        ) from exc
-    if reward_value != result.harbor.reward:
+    parsed_evidence = {
+        name: _parse_strict_json_object(path.read_bytes(), name=name)
+        for name, path, _size, _sha256 in evidence_rows
+    }
+    if not _json_values_equal(parsed_evidence["reward.json"], harbor.reward):
         raise AtomicInfrastructureError(
             "submission_integrity",
             "staged reward.json does not match Harbor provenance",

@@ -1582,6 +1582,150 @@ async def test_result_publication_rejects_staged_evidence_digest_mismatch_before
     assert not [call for call in _calls(log) if call.get("direction") == "upload"]
 
 
+@pytest.mark.parametrize("name", ["reward", "details"])
+@pytest.mark.asyncio
+async def test_result_publication_rejects_provenance_size_spoof_before_oss(
+    name: str,
+    tmp_path: Path,
+    fake_oss: tuple[Path, Path],
+    evaluate_request: EvaluateRequest,
+) -> None:
+    _store, log = fake_oss
+    reward_bytes = b'{"score":0.75}'
+    details_bytes = b"{}"
+    result = _evaluation_result(
+        evaluate_request,
+        score=0.75,
+        outcome="valid",
+        reward_bytes=reward_bytes,
+        details_bytes=details_bytes,
+    )
+    result = result.model_copy(
+        update={
+            "harbor": result.harbor.model_copy(
+                update={f"{name}_size_bytes": getattr(result.harbor, f"{name}_size_bytes") + 1}
+            )
+        }
+    )
+
+    with pytest.raises(AtomicInfrastructureError, match=f"{name}.*size") as caught:
+        await publish_evaluation_result(
+            evaluate_request,
+            result,
+            _local_evidence(
+                tmp_path,
+                reward_bytes=reward_bytes,
+                details_bytes=details_bytes,
+            ),
+        )
+
+    assert caught.value.category == "submission_integrity"
+    assert not [call for call in _calls(log) if call.get("direction") == "upload"]
+
+
+@pytest.mark.asyncio
+async def test_result_publication_revalidates_combined_evidence_cap_before_oss(
+    tmp_path: Path,
+    fake_oss: tuple[Path, Path],
+    evaluate_request: EvaluateRequest,
+) -> None:
+    _store, log = fake_oss
+    reward_bytes = b'{"score":0.75}'
+    details_bytes = b"{}" + b" " * (8 * 1024 * 1024 - len(reward_bytes) - 1)
+    result = _evaluation_result(
+        evaluate_request,
+        score=0.75,
+        outcome="valid",
+        reward_bytes=reward_bytes,
+        details_bytes=details_bytes,
+    )
+
+    with pytest.raises(AtomicInfrastructureError, match="combined") as caught:
+        await publish_evaluation_result(
+            evaluate_request,
+            result,
+            _local_evidence(
+                tmp_path,
+                reward_bytes=reward_bytes,
+                details_bytes=details_bytes,
+            ),
+        )
+
+    assert caught.value.category == "submission_integrity"
+    assert not [call for call in _calls(log) if call.get("direction") == "upload"]
+
+
+@pytest.mark.parametrize(
+    "details_bytes",
+    [b'{"nested":NaN}', b"[]"],
+)
+@pytest.mark.asyncio
+async def test_result_publication_requires_strict_details_object_before_oss(
+    details_bytes: bytes,
+    tmp_path: Path,
+    fake_oss: tuple[Path, Path],
+    evaluate_request: EvaluateRequest,
+) -> None:
+    _store, log = fake_oss
+    reward_bytes = b'{"score":0.75}'
+    result = _evaluation_result(
+        evaluate_request,
+        score=0.75,
+        outcome="valid",
+        reward_bytes=reward_bytes,
+        details_bytes=details_bytes,
+    )
+
+    with pytest.raises(AtomicInfrastructureError, match="reward-details.json") as caught:
+        await publish_evaluation_result(
+            evaluate_request,
+            result,
+            _local_evidence(
+                tmp_path,
+                reward_bytes=reward_bytes,
+                details_bytes=details_bytes,
+            ),
+        )
+
+    assert caught.value.category == "submission_integrity"
+    assert not [call for call in _calls(log) if call.get("direction") == "upload"]
+
+
+@pytest.mark.asyncio
+async def test_result_publication_rejects_bool_number_reward_alias_before_oss(
+    tmp_path: Path,
+    fake_oss: tuple[Path, Path],
+    evaluate_request: EvaluateRequest,
+) -> None:
+    _store, log = fake_oss
+    reward_bytes = b'{"value":1}'
+    details_bytes = b"{}"
+    result = _evaluation_result(
+        evaluate_request,
+        score=0.75,
+        outcome="valid",
+        reward_bytes=reward_bytes,
+        details_bytes=details_bytes,
+    )
+    result = result.model_copy(
+        update={"harbor": result.harbor.model_copy(update={"reward": {"value": True}})}
+    )
+
+    with pytest.raises(AtomicInfrastructureError, match="reward.json") as caught:
+        await publish_evaluation_result(
+            evaluate_request,
+            result,
+            _local_evidence(
+                tmp_path,
+                reward_bytes=reward_bytes,
+                details_bytes=details_bytes,
+            ),
+        )
+
+    assert caught.value.category == "submission_integrity"
+    assert not [call for call in _calls(log) if call.get("direction") == "upload"]
+
+
 @pytest.mark.asyncio
 async def test_windows_commands_encode_dynamic_root_path_and_evaluator_identity(
     evaluate_request: EvaluateRequest,

@@ -735,21 +735,19 @@ async def _verify_existing_harbor_evidence(
             "reward.json",
             harbor.reward_size_bytes,
             harbor.reward_sha256,
-            _MAX_REWARD_EVIDENCE_BYTES,
         ),
         (
             "reward-details.json",
             harbor.details_size_bytes,
             harbor.details_sha256,
-            _MAX_DETAILS_EVIDENCE_BYTES,
         ),
     )
     evidence: dict[str, dict[str, Any]] = {}
-    for name, expected_size, expected_sha256, limit in evidence_specs:
+    for name, expected_size, expected_sha256 in evidence_specs:
         try:
             raw = await _read_oss_object(
                 f"{prefix}/evidence/{name}",
-                limit=limit,
+                limit=expected_size,
                 missing_ok=False,
             )
         except AtomicInfrastructureError as exc:

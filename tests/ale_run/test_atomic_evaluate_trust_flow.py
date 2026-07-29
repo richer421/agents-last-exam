@@ -303,13 +303,53 @@ async def test_existing_canonical_result_verifies_bounded_evidence_without_runti
     assert actual == expected
     assert [(url.rsplit("/", 1)[-1], limit, missing_ok) for url, limit, missing_ok in calls] == [
         ("result.json", evaluate_module._MAX_RESULT_BYTES, True),
-        ("reward.json", evaluate_module._MAX_REWARD_EVIDENCE_BYTES, False),
+        ("reward.json", expected.harbor.reward_size_bytes, False),
         (
             "reward-details.json",
-            evaluate_module._MAX_DETAILS_EVIDENCE_BYTES,
+            expected.harbor.details_size_bytes,
             False,
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_existing_result_caps_evidence_transfer_at_declared_sizes(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, record_payload, registry_root = _registry_request(tmp_path)
+    monkeypatch.setenv("ALE_EVALUATOR_REGISTRY_ROOT", str(registry_root))
+    evaluate_module = import_module("ale_run.atomic.evaluate")
+    expected, objects = _replay_objects(request, record_payload["rubric_hash"])
+    objects["reward-details.json"] += b" " * 1024
+    returned: list[str] = []
+    calls: list[tuple[str, int]] = []
+
+    async def read_object(url: str, *, limit: int, missing_ok: bool):
+        del missing_ok
+        name = url.rsplit("/", 1)[-1]
+        raw = objects[name]
+        calls.append((name, limit))
+        if len(raw) > limit:
+            raise AtomicInfrastructureError(
+                "submission_integrity",
+                f"OSS object exceeds {limit} bytes: {url}",
+            )
+        returned.append(name)
+        return raw
+
+    monkeypatch.setattr(evaluate_module, "_read_oss_object", read_object)
+    record = evaluate_module.validate_evaluator_registry(request)
+
+    with pytest.raises(AtomicInfrastructureError, match="reward-details.json") as caught:
+        await evaluate_module._read_existing_evaluation_result(request, record)
+
+    assert caught.value.category == "idempotency_conflict"
+    assert calls[-1] == (
+        "reward-details.json",
+        expected.harbor.details_size_bytes,
+    )
+    assert returned == ["result.json", "reward.json"]
 
 
 @pytest.mark.asyncio
