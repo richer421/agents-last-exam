@@ -153,6 +153,12 @@ def test_solve_result_requires_a_manifest_for_submitted_status():
             manifest=manifest,
             error="unexpected error",
         )
+    with pytest.raises(ValidationError):
+        SolveResult(
+            status="submitted",
+            submission_id=submission_id,
+            manifest=manifest.model_copy(update={"submission_id": uuid4()}),
+        )
 
 
 def test_solve_result_requires_an_error_for_failed_status():

@@ -84,6 +84,10 @@ class SolveResult(BaseModel):
     def require_consistent_solve_fields(self) -> "SolveResult":
         if self.status == "submitted" and (self.manifest is None or self.error is not None):
             raise ValueError("submitted results require a manifest and no error")
+        if self.status == "submitted" and self.manifest.submission_id != self.submission_id:
+            raise ValueError(
+                "submitted result manifest submission_id must match result submission_id"
+            )
         if self.status == "failed" and (self.manifest is not None or not self.error):
             raise ValueError("failed results require an error and no manifest")
         return self

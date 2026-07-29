@@ -10,10 +10,12 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
 from ale_run.atomic.contracts import ArtifactEntry, SolveRequest, SubmissionManifest
 from ale_run.atomic.runtime import AtomicRuntime
 from ale_run.base_interface import AgentRunResult, TaskDataSpec
+from ale_run.orchestration import lifecycle
 from ale_run.orchestration.experiment_spec import AgentSpec
 
 
@@ -135,7 +137,7 @@ def _submission_manifest(request: SolveRequest) -> SubmissionManifest:
 def _runtime_for_solve(request: SolveRequest, agents: list[AgentSpec]) -> SimpleNamespace:
     return SimpleNamespace(
         runtime_spec=SimpleNamespace(agents=agents),
-        env=SimpleNamespace(sandbox=SimpleNamespace()),
+        env=SimpleNamespace(sandbox=SimpleNamespace(is_linux=True, work_dir_base="/ordinary/work")),
         task_meta={"description": "Solve the isolated task and write answer.txt."},
         task_data=TaskDataSpec(),
         task_driver=SimpleNamespace(
@@ -173,23 +175,39 @@ async def test_solve_runs_one_selected_agent_then_publishes_without_exposing_sub
     runtime = _runtime_for_solve(solve_request, [selected, AgentSpec(id="other", class_="test")])
     _patch_runtime(monkeypatch, runtime, events, solve_module)
     config = _TestAgentConfig()
+    monkeypatch.setattr(_TestDeployer, "default_executor", "sandbox")
+    monkeypatch.setattr(solve_module, "uuid4", lambda: SimpleNamespace(hex="opaque-run-id"))
+    monkeypatch.setenv("OPENAI_API_KEY", "allowed-key")
+    monkeypatch.setenv("SUBMISSION_ID", str(solve_request.submission_id))
+    monkeypatch.setenv("EVALUATOR_IDENTITY", "strict-evaluator")
 
     class Executor:
-        work_dir = "/ordinary/agent-output"
+        def __init__(self, *, config, work_dir, sandbox, env):
+            assert config is solve_config
+            assert work_dir == "/ordinary/work/test-agent/opaque-run-id"
+            assert sandbox is runtime.env.sandbox
+            assert env["OPENAI_API_KEY"] == "allowed-key"
+            assert str(solve_request.submission_id) not in str(env)
+            assert "strict-evaluator" not in str(env)
+            self.work_dir = work_dir
 
         async def run_deployer(self, *, deployer_cls, prompt, timeout_s):
             events.append("run deployer")
             assert deployer_cls is _TestDeployer
             assert prompt == runtime.task_meta["description"]
             assert str(solve_request.submission_id) not in prompt
-            assert self.work_dir == "/ordinary/agent-output"
+            assert "strict-evaluator" not in prompt
             assert timeout_s == 18_000.0
             return AgentRunResult(status="completed")
 
-    def build_executor(**kwargs):
-        assert kwargs["agent_name"] == config.name
-        assert str(solve_request.submission_id) not in str(kwargs["host_artifacts_dir"])
-        return Executor()
+    def resolve_agent(spec):
+        assert spec is selected
+        return _TestDeployer, _TestAgentConfig
+
+    def build_config(config_cls, raw):
+        assert config_cls is _TestAgentConfig
+        assert raw is selected.config
+        return solve_config
 
     async def publish(sandbox, task_data, request, *, provenance):
         events.append("publish submission")
@@ -205,11 +223,10 @@ async def test_solve_runs_one_selected_agent_then_publishes_without_exposing_sub
         }
         return _submission_manifest(request)
 
-    monkeypatch.setattr(
-        solve_module, "resolve_agent", lambda spec: (_TestDeployer, _TestAgentConfig)
-    )
-    monkeypatch.setattr(solve_module, "build_config", lambda *_args: config)
-    monkeypatch.setattr(solve_module, "_build_executor", build_executor)
+    solve_config = config
+    monkeypatch.setattr(solve_module, "resolve_agent", resolve_agent)
+    monkeypatch.setattr(solve_module, "build_config", build_config)
+    monkeypatch.setattr(lifecycle, "SandboxExecutor", Executor)
     monkeypatch.setattr(solve_module, "publish_submission", publish)
 
     result = await solve_module.solve(solve_request)
@@ -218,6 +235,42 @@ async def test_solve_runs_one_selected_agent_then_publishes_without_exposing_sub
     assert result.status == "submitted"
     assert result.submission_id == solve_request.submission_id
     assert result.manifest == _submission_manifest(solve_request)
+
+
+@pytest.mark.asyncio
+async def test_solve_fails_closed_when_publisher_returns_a_different_submission_manifest(
+    solve_request: SolveRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    solve_module = import_module("ale_run.atomic.solve")
+
+    events: list[str] = []
+    runtime = _runtime_for_solve(
+        solve_request,
+        [AgentSpec(id=solve_request.agent_id, class_="test", config={})],
+    )
+    _patch_runtime(monkeypatch, runtime, events, solve_module)
+
+    class Executor:
+        async def run_deployer(self, **_kwargs):
+            events.append("run deployer")
+            return AgentRunResult(status="completed")
+
+    async def publish(*_args, **_kwargs):
+        events.append("publish submission")
+        return _submission_manifest(solve_request).model_copy(update={"submission_id": uuid4()})
+
+    monkeypatch.setattr(
+        solve_module, "resolve_agent", lambda _spec: (_TestDeployer, _TestAgentConfig)
+    )
+    monkeypatch.setattr(solve_module, "build_config", lambda *_args: _TestAgentConfig())
+    monkeypatch.setattr(solve_module, "_build_executor", lambda **_kwargs: Executor())
+    monkeypatch.setattr(solve_module, "publish_submission", publish)
+
+    with pytest.raises(ValidationError, match="submission_id"):
+        await solve_module.solve(solve_request)
+
+    assert events == ["open runtime", "task setup", "run deployer", "publish submission", "cleanup"]
 
 
 @pytest.mark.asyncio
