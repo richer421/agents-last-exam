@@ -6,7 +6,7 @@ import base64
 import json
 import shlex
 from collections.abc import Mapping
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 from urllib.parse import quote
 from uuid import uuid4
@@ -68,7 +68,22 @@ def _quote_oss_argument(sandbox: SandboxHandle, value: str) -> str:
 
 
 def _oss_call(sandbox: SandboxHandle, arguments: str) -> str:
-    return ossbucket.oss_command(sandbox, arguments)
+    command = ossbucket.oss_command(sandbox, arguments)
+    if sandbox.is_linux:
+        return command
+    return _encode_windows_powershell(command)
+
+
+def _encode_windows_powershell(command: str) -> str:
+    prefix = 'powershell -NoProfile -Command "'
+    if not command.startswith(prefix) or not command.endswith('"'):
+        raise AtomicInfrastructureError(
+            "submission_integrity",
+            "shared Windows OSS command has an unsupported shell shape",
+        )
+    script = command[len(prefix) : -1]
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return f"powershell -NoProfile -EncodedCommand {encoded}"
 
 
 def _command_diagnostic(result: Any) -> str:
@@ -105,9 +120,56 @@ def _parse_script_output(
     return payload
 
 
-def _task_card_path(request: SolveRequest) -> Path:
-    tasks_root = (request.task_repo / "tasks").resolve(strict=True)
-    candidate = (tasks_root / request.task_path / "task_card.json").resolve(strict=True)
+def _task_card_path(request: SolveRequest | EvaluateRequest) -> Path:
+    raw_path = request.task_path
+    posix_path = PurePosixPath(raw_path)
+    if (
+        not raw_path
+        or "\x00" in raw_path
+        or "\\" in raw_path
+        or posix_path.is_absolute()
+        or PureWindowsPath(raw_path).is_absolute()
+        or any(part in {"", ".", ".."} for part in posix_path.parts)
+        or posix_path.as_posix() != raw_path
+    ):
+        raise AtomicInfrastructureError(
+            "submission_integrity",
+            f"task_path must be a canonical relative identity: {raw_path!r}",
+        )
+    try:
+        tasks_root_raw = request.task_repo / "tasks"
+        if tasks_root_raw.is_symlink():
+            raise AtomicInfrastructureError(
+                "submission_integrity", "task repository tasks root is a symlink"
+            )
+        tasks_root = tasks_root_raw.resolve(strict=True)
+        task_dir = tasks_root
+        for part in posix_path.parts:
+            task_dir /= part
+            if task_dir.is_symlink():
+                raise AtomicInfrastructureError(
+                    "submission_integrity",
+                    f"task_path traverses a symlink: {raw_path!r}",
+                )
+            if not task_dir.is_dir():
+                raise AtomicInfrastructureError(
+                    "submission_integrity",
+                    f"task_path does not name a task directory: {raw_path!r}",
+                )
+        candidate_raw = task_dir / "task_card.json"
+        if candidate_raw.is_symlink():
+            raise AtomicInfrastructureError(
+                "submission_integrity",
+                f"task_card.json is a symlink for task {raw_path!r}",
+            )
+        candidate = candidate_raw.resolve(strict=True)
+    except AtomicInfrastructureError:
+        raise
+    except (FileNotFoundError, OSError) as exc:
+        raise AtomicInfrastructureError(
+            "submission_integrity",
+            f"cannot resolve canonical task identity {raw_path!r}: {exc}",
+        ) from exc
     try:
         candidate.relative_to(tasks_root)
     except ValueError as exc:
@@ -257,11 +319,50 @@ async def publish_submission(
     declared_paths = _declared_output_paths(request)
     manifest_base = _manifest_base(request, provenance)
     submission_prefix = _submission_prefix(request)
-    oss_template = _oss_call(sandbox, _OSS_ARGUMENT_TOKEN)
+    output_root = _output_root(sandbox, task_data)
+
+    await ossbucket.ensure_ossutil(sandbox)
+    existing = await _load_existing_submission_manifest(
+        sandbox,
+        request,
+        declared_paths=declared_paths,
+        manifest_base=manifest_base,
+    )
+    inspected = await _inspect_submission_artifacts(
+        sandbox,
+        output_root=output_root,
+        declared_paths=declared_paths,
+        allow_missing_root=existing is not None,
+    )
+    if inspected is None:
+        if existing is None:
+            raise AtomicInfrastructureError(
+                "submission_integrity", "submission output directory is missing"
+            )
+        return existing
+
+    try:
+        validated_manifest = SubmissionManifest.model_validate(
+            manifest_base | {"artifacts": inspected}
+        )
+    except ValidationError as exc:
+        raise AtomicInfrastructureError(
+            "submission_integrity",
+            f"invalid submission manifest before commit: {exc}",
+        ) from exc
+    if existing is not None:
+        if existing != validated_manifest:
+            raise AtomicInfrastructureError(
+                "idempotency_conflict",
+                "manifest.json already commits different artifact bytes",
+            )
+        return existing
+
+    oss_template = ossbucket.oss_command(sandbox, _OSS_ARGUMENT_TOKEN)
     config = {
-        "output_root": _output_root(sandbox, task_data),
+        "output_root": output_root,
         "declared_paths": declared_paths,
-        "manifest_base": manifest_base,
+        "expected_manifest": validated_manifest.model_dump(mode="json"),
         "submission_prefix": submission_prefix,
         "oss_template": oss_template,
         "oss_argument_token": _OSS_ARGUMENT_TOKEN,
@@ -269,7 +370,6 @@ async def publish_submission(
         "max_manifest_bytes": _MAX_MANIFEST_BYTES,
     }
 
-    await ossbucket.ensure_ossutil(sandbox)
     script_path, config_path = await _write_script_bundle(
         sandbox,
         stem="ale-atomic-publish",
@@ -282,18 +382,113 @@ async def publish_submission(
     )
     payload = _parse_script_output(result, default_category="submission_storage")
     try:
-        return SubmissionManifest.model_validate(payload["manifest"])
+        committed_manifest = SubmissionManifest.model_validate(payload["manifest"])
     except (KeyError, ValidationError) as exc:
         category = (
             "idempotency_conflict" if payload.get("existing") is True else "submission_integrity"
         )
         raise AtomicInfrastructureError(category, f"invalid published manifest: {exc}") from exc
+    if committed_manifest != validated_manifest:
+        raise AtomicInfrastructureError(
+            "idempotency_conflict",
+            "publisher returned a manifest different from the prevalidated commit",
+        )
+    return committed_manifest
+
+
+async def _inspect_submission_artifacts(
+    sandbox: SandboxHandle,
+    *,
+    output_root: str,
+    declared_paths: tuple[str, ...],
+    allow_missing_root: bool,
+) -> list[dict[str, object]] | None:
+    script_path, config_path = await _write_script_bundle(
+        sandbox,
+        stem="ale-atomic-inspect",
+        script=_INSPECT_SCRIPT,
+        config={
+            "output_root": output_root,
+            "declared_paths": declared_paths,
+            "allow_missing_root": allow_missing_root,
+        },
+    )
+    result = await sandbox.run_command(
+        _python_command(sandbox, script_path, config_path),
+        timeout=_COMMAND_TIMEOUT_SECONDS,
+    )
+    payload = _parse_script_output(result, default_category="submission_integrity")
+    if payload.get("missing_root") is True:
+        return None
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise AtomicInfrastructureError(
+            "submission_integrity", "artifact inspector omitted artifact metadata"
+        )
+    return artifacts
+
+
+async def _load_existing_submission_manifest(
+    sandbox: SandboxHandle,
+    request: SolveRequest,
+    *,
+    declared_paths: tuple[str, ...],
+    manifest_base: Mapping[str, object],
+) -> SubmissionManifest | None:
+    nonce = uuid4().hex
+    local_manifest = _sandbox_temp_path(
+        sandbox, f"ale-atomic-existing-manifest-{request.submission_id}-{nonce}.json"
+    )
+    manifest_url = f"{_submission_prefix(request)}/manifest.json"
+    downloaded = await _download(sandbox, manifest_url, local_manifest)
+    if downloaded.returncode != 0:
+        diagnostic = _command_diagnostic(downloaded)
+        lowered = diagnostic.lower()
+        if any(
+            marker in lowered
+            for marker in (
+                "nosuchkey",
+                "nosuchobject",
+                "not found",
+                "status=404",
+                "status: 404",
+            )
+        ):
+            return None
+        raise AtomicInfrastructureError(
+            "submission_storage",
+            f"cannot inspect existing manifest: {diagnostic}",
+        )
+    raw = await _read_remote_bounded(
+        sandbox,
+        local_manifest,
+        limit=_MAX_MANIFEST_BYTES,
+        category="idempotency_conflict",
+    )
+    try:
+        existing = SubmissionManifest.model_validate_json(raw)
+        expected_with_existing_artifacts = SubmissionManifest.model_validate(
+            dict(manifest_base) | {"artifacts": existing.artifacts}
+        )
+    except ValidationError as exc:
+        raise AtomicInfrastructureError(
+            "idempotency_conflict", f"existing or requested manifest is invalid: {exc}"
+        ) from exc
+    if [artifact.path for artifact in existing.artifacts] != list(
+        declared_paths
+    ) or existing != expected_with_existing_artifacts:
+        raise AtomicInfrastructureError(
+            "idempotency_conflict",
+            "manifest.json already exists with conflicting submission identity",
+        )
+    return existing
 
 
 def _validate_manifest_identity(
     manifest: SubmissionManifest,
     request: SolveRequest | EvaluateRequest,
 ) -> None:
+    _task_card_path(request)
     identity = {
         "submission_id": request.submission_id,
         "task_path": request.task_path,
@@ -531,6 +726,70 @@ async def _require_identical_result(
         )
 
 
+_INSPECT_SCRIPT = r"""
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+CHUNK_BYTES = 8 * 1024 * 1024
+
+def fail(message):
+    print(json.dumps(
+        {"ok": False, "category": "submission_integrity", "error": str(message)[:1000]},
+        separators=(",", ":"),
+    ))
+    raise SystemExit(2)
+
+try:
+    config = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    output_root = Path(config["output_root"])
+    if not output_root.exists() and config["allow_missing_root"]:
+        print(json.dumps(
+            {"ok": True, "missing_root": True},
+            separators=(",", ":"),
+        ))
+        raise SystemExit(0)
+    if output_root.is_symlink() or not output_root.is_dir():
+        fail(f"output directory is missing or a symlink: {output_root}")
+    resolved_root = output_root.resolve(strict=True)
+
+    artifacts = []
+    for declared_path in config["declared_paths"]:
+        relative_parts = declared_path.split("/")[1:]
+        candidate = output_root.joinpath(*relative_parts)
+        current = output_root
+        for part in relative_parts:
+            current = current / part
+            if current.is_symlink():
+                fail(f"declared output is or traverses a symlink: {declared_path}")
+        if not candidate.is_file():
+            fail(f"missing required output: {declared_path}")
+        resolved_candidate = candidate.resolve(strict=True)
+        try:
+            resolved_candidate.relative_to(resolved_root)
+        except ValueError:
+            fail(f"declared output escapes output directory: {declared_path}")
+        digest = hashlib.sha256()
+        with candidate.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(CHUNK_BYTES), b""):
+                digest.update(chunk)
+        artifacts.append({
+            "path": declared_path,
+            "size_bytes": candidate.stat().st_size,
+            "sha256": digest.hexdigest(),
+        })
+    print(json.dumps(
+        {"ok": True, "artifacts": artifacts},
+        separators=(",", ":"),
+    ))
+except SystemExit:
+    raise
+except Exception as exc:
+    fail(exc)
+""".strip()
+
+
 _BOUNDED_READ_SCRIPT = r"""
 import base64
 import json
@@ -642,6 +901,7 @@ except Exception as exc:
 
 
 _PUBLISH_SCRIPT = r"""
+import base64
 import hashlib
 import json
 import os
@@ -649,6 +909,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 CHUNK_BYTES = 8 * 1024 * 1024
@@ -664,17 +925,73 @@ def quote_argument(value):
         return shlex.quote(value)
     return "'" + value.replace("'", "''") + "'"
 
+def run_bounded(argv):
+    process = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout = bytearray()
+    stderr = bytearray()
+
+    def drain(stream, destination):
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                return
+            remaining = MAX_STAT_BYTES + 1 - len(destination)
+            if remaining > 0:
+                destination.extend(chunk[:remaining])
+
+    stdout_thread = threading.Thread(
+        target=drain,
+        args=(process.stdout, stdout),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=drain,
+        args=(process.stderr, stderr),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    try:
+        returncode = process.wait(timeout=3600)
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        process.wait()
+        raise ProtocolFailure(
+            "submission_storage", "ossutil command exceeded 3600 seconds"
+        ) from exc
+    finally:
+        stdout_thread.join()
+        stderr_thread.join()
+    return subprocess.CompletedProcess(
+        argv,
+        returncode,
+        stdout.decode("utf-8", errors="replace"),
+        stderr.decode("utf-8", errors="replace"),
+    )
+
 def oss(arguments):
     command = config["oss_template"].replace(
         config["oss_argument_token"], arguments
     )
-    result = subprocess.run(
-        command,
-        shell=True,
-        capture_output=True,
-        text=True,
-        timeout=3600,
-    )
+    if config["windows"]:
+        prefix = 'powershell -NoProfile -Command "'
+        if not command.startswith(prefix) or not command.endswith('"'):
+            raise ProtocolFailure(
+                "submission_integrity",
+                "shared Windows OSS command has an unsupported shell shape",
+            )
+        powershell_script = command[len(prefix):-1]
+        encoded = base64.b64encode(
+            powershell_script.encode("utf-16-le")
+        ).decode("ascii")
+        argv = ["powershell", "-NoProfile", "-EncodedCommand", encoded]
+    else:
+        argv = shlex.split(command)
+    result = run_bounded(argv)
     if len((result.stdout or "").encode("utf-8", errors="replace")) > MAX_STAT_BYTES:
         raise ProtocolFailure("submission_storage", "ossutil stdout exceeded 64 KiB")
     if len((result.stderr or "").encode("utf-8", errors="replace")) > MAX_STAT_BYTES:
@@ -687,7 +1004,7 @@ def diagnostic(result):
 def stat_matches(url, expected_size, expected_digest):
     result = oss("stat " + quote_argument(url))
     if result.returncode != 0:
-        return False, diagnostic(result)
+        return False, False, diagnostic(result)
     output = result.stdout or ""
     size_match = re.search(
         r"(?im)^\s*(?:content[- ]?length|size)\s*[:=]\s*(\d+)\s*$",
@@ -698,15 +1015,15 @@ def stat_matches(url, expected_size, expected_digest):
         output,
     )
     if size_match is None or digest_match is None:
-        return False, "ossutil stat omitted size or x-oss-meta-sha256"
+        return False, True, "ossutil stat omitted size or x-oss-meta-sha256"
     actual_size = int(size_match.group(1))
     actual_digest = digest_match.group(1).lower()
     if actual_size != expected_size or actual_digest != expected_digest:
-        return False, (
+        return False, True, (
             f"remote verification mismatch for {url}: "
             f"size={actual_size} sha256={actual_digest}"
         )
-    return True, ""
+    return True, True, ""
 
 def load_existing_manifest(manifest_url, destination):
     stat_result = oss("stat " + quote_argument(manifest_url))
@@ -756,19 +1073,7 @@ try:
     local_manifest = Path(sys.argv[1]).with_suffix(".manifest.json")
     existing_manifest = load_existing_manifest(manifest_url, local_manifest)
     if existing_manifest is not None:
-        expected_base = config["manifest_base"]
-        base_matches = all(
-            existing_manifest.get(key) == value
-            for key, value in expected_base.items()
-        )
-        existing_artifacts = existing_manifest.get("artifacts")
-        paths_match = (
-            isinstance(existing_artifacts, list)
-            and all(isinstance(entry, dict) for entry in existing_artifacts)
-            and [entry.get("path") for entry in existing_artifacts]
-            == config["declared_paths"]
-        )
-        if not base_matches or not paths_match:
+        if existing_manifest != config["expected_manifest"]:
             raise ProtocolFailure(
                 "idempotency_conflict",
                 "manifest.json already exists with conflicting submission data",
@@ -822,8 +1127,7 @@ try:
             "local_path": str(candidate),
         })
 
-    manifest = dict(config["manifest_base"])
-    manifest["artifacts"] = [
+    computed_artifacts = [
         {
             "path": row["path"],
             "size_bytes": row["size_bytes"],
@@ -831,6 +1135,12 @@ try:
         }
         for row in artifact_rows
     ]
+    manifest = config["expected_manifest"]
+    if manifest.get("artifacts") != computed_artifacts:
+        raise ProtocolFailure(
+            "submission_integrity",
+            "artifact bytes changed after manifest prevalidation",
+        )
     manifest_bytes = json.dumps(
         manifest,
         ensure_ascii=False,
@@ -856,16 +1166,20 @@ try:
             + quote_argument("x-oss-meta-sha256:" + row["sha256"])
         )
         if upload.returncode != 0:
-            matches, reason = stat_matches(
+            matches, object_exists, reason = stat_matches(
                 artifact_url, row["size_bytes"], row["sha256"]
             )
             if not matches:
                 raise ProtocolFailure(
-                    "submission_storage",
+                    (
+                        "idempotency_conflict"
+                        if object_exists
+                        else "submission_storage"
+                    ),
                     f"artifact upload failed for {row['path']}: "
                     f"{diagnostic(upload)}; {reason}",
                 )
-        matches, reason = stat_matches(
+        matches, _object_exists, reason = stat_matches(
             artifact_url, row["size_bytes"], row["sha256"]
         )
         if not matches:

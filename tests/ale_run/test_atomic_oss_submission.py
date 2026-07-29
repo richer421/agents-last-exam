@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -20,6 +22,8 @@ from ale_run.atomic.contracts import (
     SolveRequest,
 )
 from ale_run.atomic.oss_submission import (
+    _PUBLISH_SCRIPT,
+    _download,
     publish_evaluation_result,
     publish_submission,
     stage_submission,
@@ -62,6 +66,39 @@ class FakeSandbox:
             timeout=timeout,
             check=False,
         )
+
+
+class FakeWindowsSandbox:
+    def __init__(self, returncodes: list[int]) -> None:
+        self.id = "fake-windows-sandbox"
+        self.os = "windows"
+        self.is_linux = False
+        self.python = r"C:\Python\python.exe"
+        self.task_data_root = r"E:\ale-data"
+        self.metadata: dict[str, str] = {}
+        self.commands: list[str] = []
+        self.writes: dict[str, bytes] = {}
+        self._returncodes = iter(returncodes)
+
+    async def write_file(self, path: str, content: str | bytes) -> None:
+        self.writes[path] = content if isinstance(content, bytes) else content.encode()
+
+    async def run_command(
+        self, command: str, *, timeout: float = 60
+    ) -> subprocess.CompletedProcess[str]:
+        self.commands.append(command)
+        return subprocess.CompletedProcess(
+            command,
+            next(self._returncodes),
+            stdout="",
+            stderr="NoSuchKey",
+        )
+
+
+def _decode_powershell_command(command: str) -> str:
+    assert re.fullmatch(r"powershell -NoProfile -EncodedCommand [A-Za-z0-9+/=]+", command)
+    encoded = command.rsplit(" ", 1)[-1]
+    return base64.b64decode(encoded).decode("utf-16-le")
 
 
 @pytest.fixture
@@ -128,21 +165,63 @@ if op == "cp":
             deadline = time.monotonic() + 5
             while len(list(barrier.iterdir())) < 2 and time.monotonic() < deadline:
                 time.sleep(0.01)
-        shutil.copyfile(source, destination)
-        entry["direction"] = "upload"
+        if (
+            dst.endswith("/final.txt")
+            and (store.parent / "concurrent-artifact-barrier").is_file()
+        ):
+            barrier = store.parent / "artifact-upload-barrier"
+            barrier.mkdir(exist_ok=True)
+            (barrier / str(os.getpid())).touch()
+            deadline = time.monotonic() + 5
+            while len(list(barrier.iterdir())) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
         digest = None
         for i, value in enumerate(op_args[2:]):
             if value in {"--meta", "--metadata"}:
                 digest = op_args[i + 3].split(":", 1)[-1].split("=", 1)[-1]
-        if digest is not None:
-            if (
-                (store.parent / "corrupt-nested-metadata").is_file()
-                and dst.endswith("/nested.bin")
-            ):
-                digest = "0" * 64
-            metadata_path(destination).write_text(
-                json.dumps({"x-oss-meta-sha256": digest}), encoding="utf-8"
+        if (
+            digest is not None
+            and (store.parent / "corrupt-nested-metadata").is_file()
+            and dst.endswith("/nested.bin")
+        ):
+            digest = "0" * 64
+        if "--forbid-overwrite" in op_args:
+            lock = destination.with_name(destination.name + ".upload-lock")
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    lock.mkdir()
+                    break
+                except FileExistsError:
+                    if time.monotonic() >= deadline:
+                        print("UploadLockTimeout", file=sys.stderr)
+                        sys.exit(1)
+                    time.sleep(0.01)
+            if destination.exists():
+                lock.rmdir()
+                print("ObjectAlreadyExists", file=sys.stderr)
+                sys.exit(1)
+            temporary = destination.with_name(
+                destination.name + f".{os.getpid()}.uploading"
             )
+            try:
+                shutil.copyfile(source, temporary)
+                if digest is not None:
+                    metadata_path(destination).write_text(
+                        json.dumps({"x-oss-meta-sha256": digest}),
+                        encoding="utf-8",
+                    )
+                os.replace(temporary, destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+                lock.rmdir()
+        else:
+            shutil.copyfile(source, destination)
+            if digest is not None:
+                metadata_path(destination).write_text(
+                    json.dumps({"x-oss-meta-sha256": digest}), encoding="utf-8"
+                )
+        entry["direction"] = "upload"
 elif op == "stat":
     url = op_args[0]
     source = object_path(url)
@@ -150,6 +229,9 @@ elif op == "stat":
     if not source.is_file():
         print("NoSuchKey", file=sys.stderr)
         sys.exit(1)
+    if (store.parent / "oversized-stat-output").is_file():
+        sys.stdout.write("x" * (64 * 1024 + 1))
+        sys.exit(0)
     metadata = {}
     if metadata_path(source).is_file():
         metadata = json.loads(metadata_path(source).read_text(encoding="utf-8"))
@@ -343,6 +425,86 @@ async def test_publish_missing_required_output_never_commits_manifest(
 
 
 @pytest.mark.asyncio
+async def test_publish_validates_full_manifest_before_any_manifest_write(
+    tmp_path: Path,
+    fake_oss: tuple[Path, Path],
+    solve_request: SolveRequest,
+    provenance: dict[str, object],
+) -> None:
+    store, log = fake_oss
+    output_dir = tmp_path / "output"
+    (output_dir / "nested").mkdir(parents=True)
+    (output_dir / "final.txt").write_text("finished\n", encoding="utf-8")
+    (output_dir / "nested" / "nested.bin").write_bytes(b"nested")
+    sandbox = FakeSandbox(tmp_path / "vm")
+    task_data = _task_data(output_dir)
+
+    with pytest.raises(AtomicInfrastructureError) as caught:
+        await publish_submission(
+            sandbox,
+            task_data,
+            solve_request,
+            provenance=provenance | {"started_at": "not-a-datetime"},
+        )
+
+    assert caught.value.category == "submission_integrity"
+    assert not [
+        call
+        for call in _calls(log)
+        if call.get("direction") == "upload" and str(call["dst"]).endswith("/manifest.json")
+    ]
+
+    manifest = await publish_submission(
+        sandbox,
+        task_data,
+        solve_request,
+        provenance=provenance,
+    )
+
+    assert manifest.started_at == provenance["started_at"]
+    manifest_url = (
+        f"{solve_request.submission_root}/output/{solve_request.submission_id}/manifest.json"
+    )
+    assert _object_path(store, manifest_url).is_file()
+
+
+@pytest.mark.parametrize("task_identity", ["traversal", "absolute", "symlink"])
+@pytest.mark.asyncio
+async def test_publish_rejects_noncanonical_task_identity_without_oss_writes(
+    task_identity: str,
+    tmp_path: Path,
+    fake_oss: tuple[Path, Path],
+    solve_request: SolveRequest,
+    task_repo: Path,
+    provenance: dict[str, object],
+) -> None:
+    _store, log = fake_oss
+    if task_identity == "traversal":
+        task_path = "folder/../toy"
+    elif task_identity == "absolute":
+        task_path = str(task_repo / "tasks" / "toy")
+    else:
+        (task_repo / "tasks" / "alias").symlink_to("toy", target_is_directory=True)
+        task_path = "alias"
+    request = solve_request.model_copy(update={"task_path": task_path})
+    output_dir = tmp_path / "output"
+    (output_dir / "nested").mkdir(parents=True)
+    (output_dir / "final.txt").write_text("finished\n", encoding="utf-8")
+    (output_dir / "nested" / "nested.bin").write_bytes(b"nested")
+
+    with pytest.raises(AtomicInfrastructureError) as caught:
+        await publish_submission(
+            FakeSandbox(tmp_path / "vm"),
+            _task_data(output_dir),
+            request,
+            provenance=provenance,
+        )
+
+    assert caught.value.category == "submission_integrity"
+    assert not [call for call in _calls(log) if call.get("direction") == "upload"]
+
+
+@pytest.mark.asyncio
 async def test_publish_remote_verification_failure_leaves_no_manifest(
     tmp_path: Path,
     fake_oss: tuple[Path, Path],
@@ -369,6 +531,33 @@ async def test_publish_remote_verification_failure_leaves_no_manifest(
     assert _object_path(store, f"{base}/artifacts/output/final.txt").is_file()
     assert _object_path(store, f"{base}/artifacts/output/nested/nested.bin").is_file()
     assert not _object_path(store, f"{base}/manifest.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_publish_bounds_ossutil_output_before_manifest_commit(
+    tmp_path: Path,
+    fake_oss: tuple[Path, Path],
+    solve_request: SolveRequest,
+    provenance: dict[str, object],
+) -> None:
+    store, _log = fake_oss
+    (store.parent / "oversized-stat-output").touch()
+    output_dir = tmp_path / "output"
+    (output_dir / "nested").mkdir(parents=True)
+    (output_dir / "final.txt").write_text("finished\n", encoding="utf-8")
+    (output_dir / "nested" / "nested.bin").write_bytes(b"nested")
+
+    with pytest.raises(AtomicInfrastructureError, match="exceeded 64 KiB"):
+        await publish_submission(
+            FakeSandbox(tmp_path / "vm"),
+            _task_data(output_dir),
+            solve_request,
+            provenance=provenance,
+        )
+
+    base = f"{solve_request.submission_root}/output/{solve_request.submission_id}"
+    assert not _object_path(store, f"{base}/manifest.json").exists()
+    assert "capture_output=True" not in _PUBLISH_SCRIPT
 
 
 @pytest.mark.asyncio
@@ -496,12 +685,8 @@ async def test_concurrent_publish_uses_isolated_local_manifest_files(
     (output_dir / "final.txt").write_text("finished\n", encoding="utf-8")
     (output_dir / "nested" / "nested.bin").write_bytes(b"nested")
     sandbox = FakeSandbox(tmp_path / "vm")
-    other_request = solve_request.model_copy(
-        update={"submission_id": UUID("87654321-4321-8765-4321-876543218765")}
-    )
-    other_provenance = provenance | {"model_id": "other-model"}
 
-    await asyncio.gather(
+    manifests = await asyncio.gather(
         publish_submission(
             sandbox,
             _task_data(output_dir),
@@ -511,25 +696,77 @@ async def test_concurrent_publish_uses_isolated_local_manifest_files(
         publish_submission(
             sandbox,
             _task_data(output_dir),
-            other_request,
-            provenance=other_provenance,
+            solve_request,
+            provenance=provenance,
         ),
     )
 
-    first_manifest = json.loads(
+    committed = json.loads(
         _object_path(
             store,
             f"{solve_request.submission_root}/output/{solve_request.submission_id}/manifest.json",
         ).read_bytes()
     )
-    second_manifest = json.loads(
-        _object_path(
-            store,
-            f"{other_request.submission_root}/output/{other_request.submission_id}/manifest.json",
-        ).read_bytes()
+    assert manifests[0] == manifests[1]
+    assert committed == manifests[0].model_dump(mode="json")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_key_different_bytes_conflict_without_overwrite(
+    tmp_path: Path,
+    fake_oss: tuple[Path, Path],
+    solve_request: SolveRequest,
+    provenance: dict[str, object],
+) -> None:
+    store, _log = fake_oss
+    (store.parent / "concurrent-artifact-barrier").touch()
+    task_card = solve_request.task_repo / "tasks" / "toy" / "task_card.json"
+    task_card.write_text(
+        json.dumps(
+            {
+                "outputFiles": [
+                    {"name": "final.txt", "path": "output/final.txt"},
+                ]
+            }
+        ),
+        encoding="utf-8",
     )
-    assert first_manifest["submission_id"] == str(solve_request.submission_id)
-    assert second_manifest["submission_id"] == str(other_request.submission_id)
+    first_output = tmp_path / "first-output"
+    second_output = tmp_path / "second-output"
+    first_output.mkdir()
+    second_output.mkdir()
+    (first_output / "final.txt").write_bytes(b"first bytes")
+    (second_output / "final.txt").write_bytes(b"second bytes")
+    sandbox = FakeSandbox(tmp_path / "vm")
+
+    outcomes = await asyncio.gather(
+        publish_submission(
+            sandbox,
+            _task_data(first_output),
+            solve_request,
+            provenance=provenance,
+        ),
+        publish_submission(
+            sandbox,
+            _task_data(second_output),
+            solve_request,
+            provenance=provenance,
+        ),
+        return_exceptions=True,
+    )
+
+    manifests = [outcome for outcome in outcomes if not isinstance(outcome, Exception)]
+    conflicts = [outcome for outcome in outcomes if isinstance(outcome, AtomicInfrastructureError)]
+    assert len(manifests) == 1
+    assert len(conflicts) == 1
+    assert conflicts[0].category == "idempotency_conflict"
+    artifact_url = (
+        f"{solve_request.submission_root}/output/{solve_request.submission_id}/"
+        "artifacts/output/final.txt"
+    )
+    committed_bytes = _object_path(store, artifact_url).read_bytes()
+    assert committed_bytes in {b"first bytes", b"second bytes"}
+    assert hashlib.sha256(committed_bytes).hexdigest() == manifests[0].artifacts[0].sha256
 
 
 def _seed_submission(
@@ -647,6 +884,37 @@ async def test_stage_checks_solve_request_agent_identity(
 
     assert caught.value.category == "submission_integrity"
     assert "agent_id" in caught.value.message
+    downloads = [call for call in _calls(log) if call.get("direction") == "download"]
+    assert [call["src"] for call in downloads] == [f"{base}/manifest.json"]
+
+
+@pytest.mark.asyncio
+async def test_stage_rejects_internal_task_symlink_identity_before_artifact_download(
+    tmp_path: Path,
+    fake_oss: tuple[Path, Path],
+    solve_request: SolveRequest,
+    evaluate_request: EvaluateRequest,
+    task_repo: Path,
+    provenance: dict[str, object],
+) -> None:
+    store, log = fake_oss
+    (task_repo / "tasks" / "alias").symlink_to("toy", target_is_directory=True)
+    aliased_solve = solve_request.model_copy(update={"task_path": "alias"})
+    aliased_evaluate = evaluate_request.model_copy(update={"task_path": "alias"})
+    base = _seed_submission(
+        store,
+        solve_request=aliased_solve,
+        provenance=provenance,
+    )
+
+    with pytest.raises(AtomicInfrastructureError) as caught:
+        await stage_submission(
+            FakeSandbox(tmp_path / "vm"),
+            _task_data(tmp_path / "output"),
+            aliased_evaluate,
+        )
+
+    assert caught.value.category == "submission_integrity"
     downloads = [call for call in _calls(log) if call.get("direction") == "download"]
     assert [call["src"] for call in downloads] == [f"{base}/manifest.json"]
 
@@ -791,3 +1059,45 @@ async def test_result_publish_rejects_existing_different_bytes(
         f"{EVALUATOR_VERSION}/result.json"
     )
     assert json.loads(_object_path(store, result_url).read_bytes())["score"] == 0.75
+
+
+@pytest.mark.asyncio
+async def test_windows_commands_encode_dynamic_root_path_and_evaluator_identity(
+    evaluate_request: EvaluateRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_ensure(_sandbox: object) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "ale_run.atomic.oss_submission.ossbucket.ensure_ossutil",
+        fake_ensure,
+    )
+    unsafe_root = "oss://bucket/%ROOT%&|<>^"
+    unsafe_evaluator = "eval/%EVALUATOR%&|<>^"
+    unsafe_path = r"E:\output\%TEMP%&|<>^\result.json"
+    request = evaluate_request.model_copy(
+        update={
+            "submission_root": unsafe_root,
+            "evaluator_id": unsafe_evaluator,
+        }
+    )
+    sandbox = FakeWindowsSandbox([1, 0, 1])
+
+    result_url = await publish_evaluation_result(
+        sandbox,
+        request,
+        EvaluationResult(status="scored", outcome="valid", score=1.0),
+    )
+    await _download(sandbox, f"{unsafe_root}/%OBJECT%&|<>^", unsafe_path)
+
+    assert "%25EVALUATOR%25%26%7C%3C%3E%5E" in result_url
+    decoded = [_decode_powershell_command(command) for command in sandbox.commands]
+    assert any(result_url in script for script in decoded)
+    assert any(unsafe_path.replace("'", "''") in script for script in decoded)
+    assert all(
+        dynamic not in command
+        for command in sandbox.commands
+        for dynamic in (unsafe_root, unsafe_evaluator, unsafe_path)
+    )
+    assert "shell=True" not in _PUBLISH_SCRIPT
