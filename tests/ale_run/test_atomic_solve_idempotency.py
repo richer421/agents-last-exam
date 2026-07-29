@@ -114,6 +114,49 @@ async def test_lost_response_retry_returns_manifest_without_second_vm_or_agent(
 
 
 @pytest.mark.asyncio
+async def test_lost_response_retry_bypasses_new_dirty_repository_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _make_solve_request(tmp_path)
+    solve_module = import_module("ale_run.atomic.solve")
+    config = _TestAgentConfig()
+    manifest = _committed_manifest(request, _config_digest(config))
+    selected = AgentSpec(id=request.agent_id, class_="test", config={})
+    (request.task_repo / "tasks" / request.task_path / "untracked.txt").write_text(
+        "retry-local state",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        solve_module,
+        "load_experiment",
+        lambda _path: SimpleNamespace(agents=[selected]),
+    )
+    monkeypatch.setattr(
+        solve_module,
+        "resolve_agent",
+        lambda _spec: (_TestDeployer, _TestAgentConfig),
+    )
+    monkeypatch.setattr(solve_module, "build_config", lambda *_args: config)
+
+    async def read_manifest(_request):
+        return manifest
+
+    monkeypatch.setattr(solve_module, "read_existing_submission_manifest", read_manifest)
+    monkeypatch.setattr(
+        solve_module.AtomicRuntime,
+        "open",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("provider acquired")),
+    )
+
+    result = await solve_module.solve(request)
+
+    assert result.status == "submitted"
+    assert result.manifest == manifest
+
+
+@pytest.mark.asyncio
 async def test_occupied_submission_key_with_different_agent_config_fails_before_vm(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -12,11 +12,16 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from ale_run.atomic.contracts import ArtifactEntry, SolveRequest, SubmissionManifest
+from ale_run.atomic.contracts import (
+    ArtifactEntry,
+    AtomicInfrastructureError,
+    SolveRequest,
+    SubmissionManifest,
+)
 from ale_run.atomic.runtime import AtomicRuntime
 from ale_run.base_interface import AgentRunResult, TaskDataSpec
 from ale_run.orchestration import lifecycle
-from ale_run.orchestration.experiment_spec import AgentSpec
+from ale_run.orchestration.experiment_spec import AgentSpec, EnvironmentSpec
 
 
 class _FakeProvider:
@@ -83,6 +88,40 @@ def _make_solve_request(tmp_path: Path) -> SolveRequest:
         task_commit=task_commit,
         image_id="m-expected",
         submission_root="oss://submissions",
+    )
+
+
+def _commit_runtime_spec(request: SolveRequest) -> SolveRequest:
+    runtime_spec_path = request.task_repo / "runtime.yaml"
+    runtime_spec_path.write_text("agents: []\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(request.task_repo), "add", "runtime.yaml"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(request.task_repo),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "runtime spec",
+        ],
+        check=True,
+    )
+    task_commit = subprocess.check_output(
+        ["git", "-C", str(request.task_repo), "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+    return request.model_copy(
+        update={
+            "runtime_spec_path": runtime_spec_path,
+            "task_commit": task_commit,
+        }
     )
 
 
@@ -184,6 +223,128 @@ def _patch_runtime(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["tracked", "untracked"])
+async def test_solve_rejects_repository_changes_before_runtime_provider_entry(
+    solve_request: SolveRequest,
+    change: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    solve_module = import_module("ale_run.atomic.solve")
+    selected = AgentSpec(id=solve_request.agent_id, class_="test", config={})
+
+    if change == "tracked":
+        changed_path = solve_request.task_repo / "tasks" / "toy" / "main.py"
+        with changed_path.open("a", encoding="utf-8") as stream:
+            stream.write("MUTABLE = True\n")
+    else:
+        changed_path = solve_request.task_repo / "tasks" / "toy" / "untracked.py"
+        changed_path.write_text("MUTABLE = True\n", encoding="utf-8")
+
+    class ProviderSentinel(_FakeProvider):
+        async def acquire(self, spec: object) -> SimpleNamespace:
+            raise AssertionError("provider acquired")
+
+    provider = ProviderSentinel(metadata={"image_id": solve_request.image_id})
+
+    class Router:
+        def __init__(self, _environment):
+            pass
+
+        def provider_for(self, _snapshot):
+            return provider
+
+    async def no_existing_manifest(_request):
+        return None
+
+    monkeypatch.setattr(
+        solve_module,
+        "read_existing_submission_manifest",
+        no_existing_manifest,
+    )
+    monkeypatch.setattr(
+        solve_module,
+        "load_experiment",
+        lambda _path: SimpleNamespace(agents=[selected]),
+    )
+    monkeypatch.setattr(
+        solve_module,
+        "resolve_agent",
+        lambda _spec: (_TestDeployer, _TestAgentConfig),
+    )
+    monkeypatch.setattr(solve_module, "build_config", lambda *_args: _TestAgentConfig())
+    monkeypatch.setattr(
+        "ale_run.atomic.runtime.load_experiment",
+        lambda _path: SimpleNamespace(environment=EnvironmentSpec(), artifacts=None),
+    )
+    monkeypatch.setattr("ale_run.atomic.runtime.EnvironmentRouter", Router)
+
+    with pytest.raises(AtomicInfrastructureError) as caught:
+        await solve_module.solve(solve_request)
+
+    assert caught.value.category == "task_checkout"
+    assert "tracked or untracked changes" in caught.value.message
+
+
+@pytest.mark.asyncio
+async def test_solve_runtime_uses_exact_committed_checkout_after_host_bytes_change(
+    solve_request: SolveRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    solve_request = _commit_runtime_spec(solve_request)
+    solve_module = import_module("ale_run.atomic.solve")
+    selected = AgentSpec(id=solve_request.agent_id, class_="test", config={})
+    runtime = _runtime_for_solve(solve_request, [selected])
+    host_main = solve_request.task_repo / "tasks" / "toy" / "main.py"
+    observed_repositories: list[Path] = []
+    loaded_runtime_specs: list[Path] = []
+
+    async def no_existing_manifest(_request):
+        return None
+
+    @asynccontextmanager
+    async def open_runtime(*, request: SolveRequest):
+        host_main.write_text("MUTABLE = True\n", encoding="utf-8")
+        observed_repositories.append(request.task_repo)
+        assert request.task_repo != solve_request.task_repo
+        assert not (request.task_repo / ".git").exists()
+        assert (
+            (request.task_repo / "tasks" / "toy" / "main.py")
+            .read_text(encoding="utf-8")
+            .startswith("class Config:")
+        )
+        yield runtime
+
+    class Executor:
+        async def run_deployer(self, **_kwargs):
+            return AgentRunResult(status="failed", error="stop after checkout assertion")
+
+    monkeypatch.setattr(
+        solve_module,
+        "read_existing_submission_manifest",
+        no_existing_manifest,
+    )
+    monkeypatch.setattr(
+        solve_module,
+        "load_experiment",
+        lambda path: loaded_runtime_specs.append(Path(path)) or SimpleNamespace(agents=[selected]),
+    )
+    monkeypatch.setattr(
+        solve_module,
+        "resolve_agent",
+        lambda _spec: (_TestDeployer, _TestAgentConfig),
+    )
+    monkeypatch.setattr(solve_module, "build_config", lambda *_args: _TestAgentConfig())
+    monkeypatch.setattr(solve_module.AtomicRuntime, "open", staticmethod(open_runtime))
+    monkeypatch.setattr(solve_module, "_build_executor", lambda **_kwargs: Executor())
+
+    result = await solve_module.solve(solve_request)
+
+    assert result.status == "failed"
+    assert len(observed_repositories) == 1
+    assert loaded_runtime_specs == [observed_repositories[0] / "runtime.yaml"]
+
+
+@pytest.mark.asyncio
 async def test_solve_runs_one_selected_agent_then_publishes_without_exposing_submission_identity(
     solve_request: SolveRequest,
     monkeypatch: pytest.MonkeyPatch,
@@ -233,7 +394,9 @@ async def test_solve_runs_one_selected_agent_then_publishes_without_exposing_sub
         events.append("publish submission")
         assert sandbox is runtime.env.sandbox
         assert task_data is runtime.task_data
-        assert request is solve_request
+        assert request.task_repo != solve_request.task_repo
+        assert not (request.task_repo / ".git").exists()
+        assert request.model_copy(update={"task_repo": solve_request.task_repo}) == solve_request
         assert set(provenance) == {
             "ale_run_id",
             "model_id",

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
@@ -58,14 +57,6 @@ class AtomicRuntime:
     ) -> AsyncIterator[AtomicRuntime]:
         """Provision, validate, stage, and deterministically tear down one VM."""
         task_dir = request.task_repo.resolve() / "tasks" / request.task_path
-        if isinstance(request, SolveRequest):
-            actual_commit = _repository_head(request.task_repo)
-            if actual_commit != request.task_commit:
-                raise AtomicInfrastructureError(
-                    "task_checkout",
-                    f"task checkout mismatch: expected {request.task_commit}, got {actual_commit!r}",
-                )
-
         runtime_spec = load_experiment(request.runtime_spec_path)
         task_meta = TaskLoader(str(task_dir)).load(request.variant_index)
         env_spec = _build_env_spec(task_meta)
@@ -197,19 +188,6 @@ class AtomicRuntime:
                 )
             finally:
                 await env.close_async(mode="delete")
-
-
-def _repository_head(task_repo: Path) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(task_repo), "rev-parse", "HEAD"],
-        capture_output=True,
-        check=False,
-        text=True,
-    )
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
-        raise AtomicInfrastructureError("task_checkout", f"cannot resolve task checkout: {detail}")
-    return result.stdout.strip()
 
 
 def _declared_input_files(task_dir: Path) -> tuple[str, ...]:

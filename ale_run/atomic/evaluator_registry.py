@@ -22,10 +22,10 @@ from .contracts import (
 )
 
 _MAX_REGISTRY_RECORD_BYTES = 1024 * 1024
-_MAX_EVALUATOR_ARCHIVE_BYTES = 64 * 1024 * 1024
-_MAX_EVALUATOR_SOURCE_BYTES = 32 * 1024 * 1024
-_MAX_EVALUATOR_FILE_BYTES = 8 * 1024 * 1024
-_MAX_EVALUATOR_FILES = 4096
+_MAX_GIT_ARCHIVE_BYTES = 64 * 1024 * 1024
+_MAX_GIT_CHECKOUT_BYTES = 32 * 1024 * 1024
+_MAX_GIT_FILE_BYTES = 8 * 1024 * 1024
+_MAX_GIT_FILES = 4096
 
 
 def validate_evaluator_registry(
@@ -108,20 +108,71 @@ def materialize_evaluator_checkout(
     request: EvaluateRequest,
 ) -> Iterator[Path]:
     """Yield a bounded, link-free task repository from the exact Git commit."""
-    with tempfile.TemporaryDirectory(prefix="ale-evaluator-checkout-") as temp_dir:
+    with materialize_git_checkout(
+        request.task_repo,
+        request.evaluator_version,
+        category="evaluator_registry",
+        prefix="ale-evaluator-checkout-",
+    ) as checkout:
+        task_dir = checkout / "tasks" / request.task_path
+        if not task_dir.is_dir():
+            raise AtomicInfrastructureError(
+                "evaluator_registry",
+                "evaluator commit does not contain the requested task",
+            )
+        yield checkout
+
+
+def validate_git_checkout(
+    repo: Path,
+    commit: str,
+    *,
+    category: str,
+) -> None:
+    """Require a clean repository whose HEAD is the requested commit."""
+    status = _run_git(
+        repo,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        category=category,
+    )
+    if status.stdout:
+        raise AtomicInfrastructureError(
+            category,
+            "task repository has tracked or untracked changes",
+        )
+    head = _run_git(repo, "rev-parse", "HEAD^{commit}", category=category).stdout.strip()
+    if head != commit:
+        raise AtomicInfrastructureError(
+            category,
+            f"task checkout mismatch: expected {commit}, got {head!r}",
+        )
+
+
+@contextmanager
+def materialize_git_checkout(
+    repo: Path,
+    commit: str,
+    *,
+    category: str,
+    prefix: str,
+) -> Iterator[Path]:
+    """Yield a bounded, link-free checkout containing exact Git commit bytes."""
+    with tempfile.TemporaryDirectory(prefix=prefix) as temp_dir:
         root = Path(temp_dir)
-        archive = root / "evaluator.tar"
+        archive = root / "checkout.tar"
         checkout = root / "checkout"
         result = subprocess.run(
             [
                 "git",
                 "-C",
-                str(request.task_repo),
+                str(repo),
                 "archive",
                 "--format=tar",
                 "-o",
                 str(archive),
-                request.evaluator_version,
+                commit,
             ],
             capture_output=True,
             check=False,
@@ -130,22 +181,22 @@ def materialize_evaluator_checkout(
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip()
             raise AtomicInfrastructureError(
-                "evaluator_registry",
-                f"cannot archive evaluator commit: {detail[:500]}",
+                category,
+                f"cannot archive Git commit: {detail[:500]}",
             )
-        if archive.stat().st_size > _MAX_EVALUATOR_ARCHIVE_BYTES:
+        if archive.stat().st_size > _MAX_GIT_ARCHIVE_BYTES:
             raise AtomicInfrastructureError(
-                "evaluator_registry",
-                "evaluator Git archive exceeds the 64 MiB limit",
+                category,
+                "Git archive exceeds the 64 MiB limit",
             )
         checkout.mkdir(mode=0o700)
         try:
             with tarfile.open(archive, mode="r:") as bundle:
                 members = bundle.getmembers()
-                if len(members) > _MAX_EVALUATOR_FILES:
+                if len(members) > _MAX_GIT_FILES:
                     raise AtomicInfrastructureError(
-                        "evaluator_registry",
-                        f"evaluator checkout exceeds {_MAX_EVALUATOR_FILES} entries",
+                        category,
+                        f"Git checkout exceeds {_MAX_GIT_FILES} entries",
                     )
                 source_bytes = 0
                 for member in members:
@@ -158,35 +209,29 @@ def materialize_evaluator_checkout(
                         or not (member.isfile() or member.isdir())
                     ):
                         raise AtomicInfrastructureError(
-                            "evaluator_registry",
-                            f"unsafe evaluator archive member: {member.name}",
+                            category,
+                            f"unsafe Git archive member: {member.name}",
                         )
                     if member.isfile():
-                        if member.size > _MAX_EVALUATOR_FILE_BYTES:
+                        if member.size > _MAX_GIT_FILE_BYTES:
                             raise AtomicInfrastructureError(
-                                "evaluator_registry",
-                                f"evaluator file exceeds 8 MiB: {member.name}",
+                                category,
+                                f"Git file exceeds 8 MiB: {member.name}",
                             )
                         source_bytes += member.size
-                        if source_bytes > _MAX_EVALUATOR_SOURCE_BYTES:
+                        if source_bytes > _MAX_GIT_CHECKOUT_BYTES:
                             raise AtomicInfrastructureError(
-                                "evaluator_registry",
-                                "evaluator checkout exceeds 32 MiB of files",
+                                category,
+                                "Git checkout exceeds 32 MiB of files",
                             )
                 bundle.extractall(checkout, members=members, filter="data")
         except AtomicInfrastructureError:
             raise
         except (OSError, tarfile.TarError) as exc:
             raise AtomicInfrastructureError(
-                "evaluator_registry",
-                f"cannot materialize evaluator archive: {exc}",
+                category,
+                f"cannot materialize Git archive: {exc}",
             ) from exc
-        task_dir = checkout / "tasks" / request.task_path
-        if not task_dir.is_dir():
-            raise AtomicInfrastructureError(
-                "evaluator_registry",
-                "evaluator commit does not contain the requested task",
-            )
         yield checkout
 
 
@@ -305,7 +350,11 @@ def _open_registry_root(root: Path) -> int:
         raise
 
 
-def _run_git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+def _run_git(
+    repo: Path,
+    *arguments: str,
+    category: str = "evaluator_registry",
+) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         ["git", "-C", str(repo), *arguments],
         capture_output=True,
@@ -315,7 +364,7 @@ def _run_git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         raise AtomicInfrastructureError(
-            "evaluator_registry",
+            category,
             f"git {' '.join(arguments)} failed: {detail[:500]}",
         )
     return result

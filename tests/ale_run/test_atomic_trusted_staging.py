@@ -158,6 +158,29 @@ async def test_atomic_runtime_removes_ram_role_before_provider_acquisition(
 
 
 @pytest.mark.asyncio
+async def test_atomic_runtime_accepts_materialized_solve_checkout_without_git_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _make_solve_request(tmp_path)
+    checkout = tmp_path / "materialized-checkout"
+    shutil.copytree(request.task_repo / "tasks", checkout / "tasks")
+    runtime_request = request.model_copy(update={"task_repo": checkout})
+    runtime_spec = SimpleNamespace(environment=SimpleNamespace(), artifacts=None)
+    provider = _FakeProvider(metadata={"image_id": request.image_id})
+
+    monkeypatch.setattr(
+        "ale_run.atomic.runtime.load_experiment",
+        lambda _path: runtime_spec,
+    )
+
+    async with AtomicRuntime.open(request=runtime_request, provider=provider) as runtime:
+        assert runtime.task_dir == checkout / "tasks" / request.task_path
+
+    assert len(provider.acquire_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_atomic_runtime_prepares_declared_input_before_provider_acquisition(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
