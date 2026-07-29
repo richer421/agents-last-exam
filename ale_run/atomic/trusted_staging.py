@@ -148,9 +148,10 @@ async def prepare_atomic_input(
         temporary = tempfile.TemporaryDirectory(prefix="ale-atomic-input-")
     except OSError as exc:
         raise _input_filesystem_error("cannot create the private staging tree", exc) from exc
-    with temporary as temp_dir:
+    primary_error: BaseException | None = None
+    try:
         try:
-            root = Path(temp_dir)
+            root = Path(temporary.name)
             os.chmod(root, 0o700)
             payload = root / "payload"
             payload.mkdir(mode=0o700)
@@ -208,6 +209,18 @@ async def prepare_atomic_input(
         except OSError as exc:
             raise _input_filesystem_error("host staging filesystem operation failed", exc) from exc
         yield prepared
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        try:
+            temporary.cleanup()
+        except OSError as exc:
+            cleanup_error = _input_filesystem_error("temporary staging cleanup failed", exc)
+            if primary_error is not None:
+                primary_error.add_note(str(cleanup_error)[:2000])
+            else:
+                raise cleanup_error from exc
 
 
 @asynccontextmanager

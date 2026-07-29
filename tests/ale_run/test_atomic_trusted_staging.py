@@ -54,6 +54,24 @@ def _oss_listing(rows: list[tuple[int, str]]) -> bytes:
     return ("\n".join(lines) + "\n").encode()
 
 
+class _CleanupFailingTemporaryDirectory:
+    def __init__(self, real_factory, *args, **kwargs) -> None:
+        self._inner = real_factory(*args, **kwargs)
+        self.name = self._inner.name
+        self.cleanup_calls = 0
+
+    def __enter__(self) -> str:
+        return self._inner.__enter__()
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.cleanup()
+
+    def cleanup(self) -> None:
+        self.cleanup_calls += 1
+        self._inner.cleanup()
+        raise PermissionError("injected temporary cleanup failure")
+
+
 class _LocalSandbox:
     def __init__(self, root: Path) -> None:
         self.is_linux = True
@@ -1216,6 +1234,101 @@ async def test_host_tree_setup_oserror_is_normalized_to_input(
 
     assert caught.value.category == "input"
     assert isinstance(caught.value.__cause__, PermissionError)
+
+
+@pytest.mark.asyncio
+async def test_host_temporary_cleanup_failure_is_normalized_to_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_factory = tempfile.TemporaryDirectory
+    created: list[_CleanupFailingTemporaryDirectory] = []
+
+    def failing_factory(*args, **kwargs):
+        temporary = _CleanupFailingTemporaryDirectory(original_factory, *args, **kwargs)
+        created.append(temporary)
+        return temporary
+
+    async def host_ossutil(*arguments: str):
+        if arguments[0] == "ls":
+            if "/software/" in arguments[3]:
+                return 0, b"Object Number is: 0\n", b""
+            return 0, _oss_listing([(1, f"{arguments[3]}required.txt")]), b""
+        Path(arguments[4]).write_bytes(b"x")
+        return 0, b"", b""
+
+    monkeypatch.setattr(
+        "ale_run.atomic.trusted_staging.tempfile.TemporaryDirectory", failing_factory
+    )
+    monkeypatch.setattr("ale_run.atomic.trusted_staging.run_host_ossutil", host_ossutil)
+
+    with pytest.raises(AtomicInfrastructureError) as caught:
+        async with prepare_atomic_input(
+            source="oss://private-bucket/tasks",
+            task_data=_task_data(),
+            declared_input_paths=("input/required.txt",),
+        ):
+            pass
+
+    assert caught.value.category == "input"
+    assert "temporary staging cleanup failed" in caught.value.message
+    assert len(caught.value.message) <= 2000
+    assert isinstance(caught.value.__cause__, PermissionError)
+    assert len(created) == 1
+    assert created[0].cleanup_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_phase", ["staging", "consumer"])
+async def test_host_temporary_cleanup_failure_does_not_mask_primary_error(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_phase: str,
+) -> None:
+    original_factory = tempfile.TemporaryDirectory
+    created: list[_CleanupFailingTemporaryDirectory] = []
+    primary = AtomicInfrastructureError(
+        "input" if failure_phase == "staging" else "consumer",
+        f"primary {failure_phase} failure",
+    )
+
+    def failing_factory(*args, **kwargs):
+        temporary = _CleanupFailingTemporaryDirectory(original_factory, *args, **kwargs)
+        created.append(temporary)
+        return temporary
+
+    async def host_ossutil(*arguments: str):
+        if failure_phase == "staging":
+            raise primary
+        if arguments[0] == "ls":
+            if "/software/" in arguments[3]:
+                return 0, b"Object Number is: 0\n", b""
+            return 0, _oss_listing([(1, f"{arguments[3]}required.txt")]), b""
+        Path(arguments[4]).write_bytes(b"x")
+        return 0, b"", b""
+
+    monkeypatch.setattr(
+        "ale_run.atomic.trusted_staging.tempfile.TemporaryDirectory", failing_factory
+    )
+    monkeypatch.setattr("ale_run.atomic.trusted_staging.run_host_ossutil", host_ossutil)
+
+    with pytest.raises(AtomicInfrastructureError) as caught:
+        async with prepare_atomic_input(
+            source="oss://private-bucket/tasks",
+            task_data=_task_data(),
+            declared_input_paths=("input/required.txt",),
+        ):
+            if failure_phase == "consumer":
+                raise primary
+
+    if failure_phase == "consumer":
+        assert caught.value is primary
+    else:
+        assert caught.value.category == "input"
+        assert caught.value.__cause__ is primary
+        assert "cannot list OSS prefix" in caught.value.message
+    assert caught.value.category == primary.category
+    assert "temporary staging cleanup failed" in "\n".join(caught.value.__notes__)
+    assert len(created) == 1
+    assert created[0].cleanup_calls == 1
 
 
 @pytest.mark.asyncio
