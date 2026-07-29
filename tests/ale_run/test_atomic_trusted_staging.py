@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import zipfile
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -673,7 +675,8 @@ async def test_oss_metadata_listing_paginates_before_exact_object_downloads(
             urls = sorted(url for url in objects if url.startswith(prefix))
             if marker is not None:
                 urls = [url for url in urls if url.removeprefix("oss://private-bucket/") > marker]
-            return 0, _oss_listing([(1, url) for url in urls[:16]]), b""
+            page = [(1, url) for url in urls[:16]]
+            return 0, _oss_listing(page) if page else b"Object Number is: 0\n", b""
         Path(arguments[4]).write_bytes(objects[arguments[3]])
         return 0, b"", b""
 
@@ -890,6 +893,138 @@ async def test_oss_metadata_listing_rejects_ambiguous_or_unsafe_objects_before_c
 
 
 @pytest.mark.asyncio
+async def test_oss_local_namespace_collisions_are_rejected_before_any_cp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    input_url = "oss://private-bucket/tasks/demo/toy/base/input/required.txt"
+
+    async def host_ossutil(*arguments: str):
+        calls.append(arguments)
+        if arguments[0] == "ls":
+            rows = (
+                [(1, input_url)]
+                if "/input/" in arguments[3]
+                else [(1, f"{arguments[3]}{name}") for name in ["a", "a/b"]]
+            )
+            return 0, _oss_listing(rows), b""
+        Path(arguments[4]).write_bytes(b"x")
+        return 0, b"", b""
+
+    monkeypatch.setattr("ale_run.atomic.trusted_staging.run_host_ossutil", host_ossutil)
+
+    with pytest.raises(AtomicInfrastructureError, match="namespace collision") as caught:
+        async with prepare_atomic_input(
+            source="oss://private-bucket/tasks",
+            task_data=_task_data(),
+            declared_input_paths=("input/required.txt",),
+        ):
+            pass
+
+    assert caught.value.category == "input"
+    assert not any(call[0] == "cp" for call in calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "relative_paths",
+    [["a", "a/b"], ["a/b", "a"]],
+    ids=["ancestor-first", "descendant-first"],
+)
+async def test_oss_download_namespace_collision_is_order_independent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative_paths: list[str],
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    async def host_ossutil(*arguments: str):
+        calls.append(arguments)
+        return 0, b"", b""
+
+    monkeypatch.setattr("ale_run.atomic.trusted_staging.run_host_ossutil", host_ossutil)
+    objects = [
+        _OssObject(
+            url=f"oss://bucket/input/{relative}",
+            key=f"input/{relative}",
+            relative_path=Path(relative),
+            size_bytes=1,
+        )
+        for relative in relative_paths
+    ]
+
+    with pytest.raises(AtomicInfrastructureError, match="namespace collision") as caught:
+        await _download_prefix(objects, tmp_path / "payload", actual_total=0)
+
+    assert caught.value.category == "input"
+    assert calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "component",
+    ["a" * 256, "\u754c" * 86],
+    ids=["ascii-256-bytes", "unicode-258-bytes"],
+)
+async def test_oss_overlong_local_components_are_rejected_before_any_cp(
+    monkeypatch: pytest.MonkeyPatch,
+    component: str,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    input_url = "oss://private-bucket/tasks/demo/toy/base/input/required.txt"
+
+    async def host_ossutil(*arguments: str):
+        calls.append(arguments)
+        if arguments[0] == "ls":
+            rows = (
+                [(1, input_url)]
+                if "/input/" in arguments[3]
+                else [(1, f"{arguments[3]}{component}")]
+            )
+            return 0, _oss_listing(rows), b""
+        Path(arguments[4]).write_bytes(b"x")
+        return 0, b"", b""
+
+    monkeypatch.setattr("ale_run.atomic.trusted_staging.run_host_ossutil", host_ossutil)
+
+    with pytest.raises(AtomicInfrastructureError, match="255 bytes") as caught:
+        async with prepare_atomic_input(
+            source="oss://private-bucket/tasks",
+            task_data=_task_data(),
+            declared_input_paths=("input/required.txt",),
+        ):
+            pass
+
+    assert caught.value.category == "input"
+    assert not any(call[0] == "cp" for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_oss_metadata_rejects_header_with_zero_summary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    header_with_zero = _oss_listing([])
+
+    async def host_ossutil(*arguments: str):
+        calls.append(arguments)
+        return 0, header_with_zero, b""
+
+    monkeypatch.setattr("ale_run.atomic.trusted_staging.run_host_ossutil", host_ossutil)
+
+    with pytest.raises(AtomicInfrastructureError, match="zero-object") as caught:
+        async with prepare_atomic_input(
+            source="oss://private-bucket/tasks",
+            task_data=_task_data(),
+            declared_input_paths=("input/required.txt",),
+        ):
+            pass
+
+    assert caught.value.category == "input"
+    assert not any(call[0] == "cp" for call in calls)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("input_rows", "software_rows", "constant", "limit", "message"),
     [
@@ -912,7 +1047,8 @@ async def test_oss_metadata_limits_are_preflighted_across_input_and_software_bef
     async def host_ossutil(*arguments: str):
         calls.append(arguments)
         names = input_rows if "/input/" in arguments[3] else software_rows
-        return 0, _oss_listing([(1, f"{arguments[3]}{name}") for name in names]), b""
+        rows = [(1, f"{arguments[3]}{name}") for name in names]
+        return 0, _oss_listing(rows) if rows else b"Object Number is: 0\n", b""
 
     monkeypatch.setattr("ale_run.atomic.trusted_staging.run_host_ossutil", host_ossutil)
 
@@ -925,6 +1061,161 @@ async def test_oss_metadata_limits_are_preflighted_across_input_and_software_bef
             pass
 
     assert [call[0] for call in calls] == ["ls", "ls"]
+
+
+@pytest.mark.asyncio
+async def test_oss_metadata_exact_count_file_and_total_limits_are_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr("ale_run.atomic.trusted_staging._MAX_STAGED_FILES", 2)
+    monkeypatch.setattr("ale_run.atomic.trusted_staging._MAX_STAGED_FILE_BYTES", 5)
+    monkeypatch.setattr("ale_run.atomic.trusted_staging._MAX_STAGED_SOURCE_BYTES", 10)
+
+    async def host_ossutil(*arguments: str):
+        calls.append(arguments)
+        if arguments[0] == "ls":
+            suffix = "required.txt" if "/input/" in arguments[3] else "tool.bin"
+            return 0, _oss_listing([(5, f"{arguments[3]}{suffix}")]), b""
+        Path(arguments[4]).write_bytes(b"12345")
+        return 0, b"", b""
+
+    monkeypatch.setattr("ale_run.atomic.trusted_staging.run_host_ossutil", host_ossutil)
+
+    async with prepare_atomic_input(
+        source="oss://private-bucket/tasks",
+        task_data=_task_data(),
+        declared_input_paths=("input/required.txt",),
+    ):
+        pass
+
+    assert [call[0] for call in calls].count("cp") == 2
+    assert not any(call[0] == "sync" for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_oss_metadata_full_terminal_page_is_followed_by_empty_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    input_prefix = "oss://private-bucket/tasks/demo/toy/base/input/"
+    rows = [(1, f"{input_prefix}{index:02d}.txt") for index in range(16)]
+
+    async def host_ossutil(*arguments: str):
+        calls.append(arguments)
+        if arguments[0] == "ls":
+            if "/software/" in arguments[3] or "--marker" in arguments:
+                return 0, b"Object Number is: 0\n", b""
+            return 0, _oss_listing(rows), b""
+        Path(arguments[4]).write_bytes(b"x")
+        return 0, b"", b""
+
+    monkeypatch.setattr("ale_run.atomic.trusted_staging.run_host_ossutil", host_ossutil)
+
+    async with prepare_atomic_input(
+        source="oss://private-bucket/tasks",
+        task_data=_task_data(),
+        declared_input_paths=("input/00.txt",),
+    ):
+        pass
+
+    ls_calls = [call for call in calls if call[0] == "ls"]
+    assert len(ls_calls) == 3
+    assert ls_calls[1][-2:] == ("--marker", "tasks/demo/toy/base/input/15.txt")
+    assert [call[0] for call in calls].count("cp") == 16
+    assert not any(call[0] == "sync" for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_oss_metadata_rejects_input2_as_outside_input_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+
+    async def host_ossutil(*arguments: str):
+        calls.append(arguments)
+        return 0, _oss_listing([(1, arguments[3].replace("/input/", "/input2/") + "a")]), b""
+
+    monkeypatch.setattr("ale_run.atomic.trusted_staging.run_host_ossutil", host_ossutil)
+
+    with pytest.raises(AtomicInfrastructureError, match="outside the requested prefix"):
+        async with prepare_atomic_input(
+            source="oss://private-bucket/tasks",
+            task_data=_task_data(),
+            declared_input_paths=("input/a",),
+        ):
+            pass
+
+    assert not any(call[0] == "cp" for call in calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "raised"),
+    [
+        (
+            "list-submission-storage",
+            AtomicInfrastructureError("submission_storage", "runner failed"),
+        ),
+        ("list-permission", PermissionError("listing denied")),
+        ("copy-submission-storage", AtomicInfrastructureError("submission_storage", "copy failed")),
+        ("copy-oserror", OSError("copy transport failed")),
+    ],
+)
+async def test_host_oss_runner_exceptions_are_normalized_to_input(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    raised: Exception,
+) -> None:
+    calls: list[tuple[str, ...]] = []
+    input_url = "oss://private-bucket/tasks/demo/toy/base/input/required.txt"
+
+    async def host_ossutil(*arguments: str):
+        calls.append(arguments)
+        if operation.startswith("list") or arguments[0] == "cp":
+            raise raised
+        rows = [(1, input_url)] if "/input/" in arguments[3] else []
+        return 0, _oss_listing(rows) if rows else b"Object Number is: 0\n", b""
+
+    monkeypatch.setattr("ale_run.atomic.trusted_staging.run_host_ossutil", host_ossutil)
+
+    with pytest.raises(AtomicInfrastructureError) as caught:
+        async with prepare_atomic_input(
+            source="oss://private-bucket/tasks",
+            task_data=_task_data(),
+            declared_input_paths=("input/required.txt",),
+        ):
+            pass
+
+    assert caught.value.category == "input"
+    assert caught.value.__cause__ is raised
+    assert len(caught.value.message) <= 2000
+    assert not any(call[0] == "sync" for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_host_tree_setup_oserror_is_normalized_to_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_chmod = os.chmod
+
+    def denied_chmod(path, mode, *, dir_fd=None, follow_symlinks=True):
+        if str(path).startswith(tempfile.gettempdir()) and mode == 0o700:
+            raise PermissionError("tree chmod denied")
+        return original_chmod(path, mode, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr("ale_run.atomic.trusted_staging.os.chmod", denied_chmod)
+
+    with pytest.raises(AtomicInfrastructureError) as caught:
+        async with prepare_atomic_input(
+            source="oss://private-bucket/tasks",
+            task_data=_task_data(),
+            declared_input_paths=("input/required.txt",),
+        ):
+            pass
+
+    assert caught.value.category == "input"
+    assert isinstance(caught.value.__cause__, PermissionError)
 
 
 @pytest.mark.asyncio
@@ -951,7 +1242,7 @@ async def test_oss_download_rechecks_local_sizes_and_cumulative_actual_bytes(
         calls.append(arguments)
         if arguments[0] == "ls":
             rows = metadata_rows if "/input/" in arguments[3] else []
-            return 0, _oss_listing(rows), b""
+            return 0, _oss_listing(rows) if rows else b"Object Number is: 0\n", b""
         index = int(arguments[3].rsplit("/", 1)[1].removesuffix(".txt"))
         Path(arguments[4]).write_bytes(b"x" * actual_sizes[index])
         return 0, b"", b""
@@ -1063,6 +1354,102 @@ async def test_oss_download_rechecks_parent_containment_after_cp(
             destination,
             actual_total=0,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", ["destination", "parent", "target"])
+async def test_oss_download_rejects_path_replacement_after_cp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: str,
+) -> None:
+    destination = tmp_path / "payload"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    async def host_ossutil(*arguments: str):
+        target = Path(arguments[4])
+        if replacement == "destination":
+            shutil.rmtree(target.parent.parent)
+            target.parent.parent.mkdir()
+            target.parent.mkdir()
+            target.write_bytes(b"x")
+        elif replacement == "parent":
+            target.parent.rmdir()
+            target.parent.mkdir()
+            target.write_bytes(b"x")
+        else:
+            target.symlink_to(outside / "replacement")
+        return 0, b"", b""
+
+    monkeypatch.setattr("ale_run.atomic.trusted_staging.run_host_ossutil", host_ossutil)
+
+    with pytest.raises(AtomicInfrastructureError) as caught:
+        await _download_prefix(
+            [
+                _OssObject(
+                    url="oss://bucket/input/dir/file",
+                    key="input/dir/file",
+                    relative_path=Path("dir/file"),
+                    size_bytes=1,
+                )
+            ],
+            destination,
+            actual_total=0,
+        )
+
+    assert caught.value.category == "input"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["pre-copy", "post-copy"])
+async def test_host_filesystem_oserror_is_normalized_to_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    destination = tmp_path / "payload"
+
+    async def host_ossutil(*arguments: str):
+        Path(arguments[4]).write_bytes(b"x")
+        return 0, b"", b""
+
+    monkeypatch.setattr("ale_run.atomic.trusted_staging.run_host_ossutil", host_ossutil)
+    if phase == "pre-copy":
+        original_mkdir = Path.mkdir
+
+        def denied_mkdir(self, *args, **kwargs):
+            if self == destination:
+                raise PermissionError("destination mkdir denied")
+            return original_mkdir(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", denied_mkdir)
+    else:
+        original_chmod = os.chmod
+
+        def denied_chmod(path, mode, *, dir_fd=None, follow_symlinks=True):
+            if Path(path).name == "file":
+                raise OSError("download chmod failed")
+            return original_chmod(path, mode, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+        monkeypatch.setattr("ale_run.atomic.trusted_staging.os.chmod", denied_chmod)
+
+    with pytest.raises(AtomicInfrastructureError) as caught:
+        await _download_prefix(
+            [
+                _OssObject(
+                    url="oss://bucket/input/dir/file",
+                    key="input/dir/file",
+                    relative_path=Path("dir/file"),
+                    size_bytes=1,
+                )
+            ],
+            destination,
+            actual_total=0,
+        )
+
+    assert caught.value.category == "input"
+    assert isinstance(caught.value.__cause__, OSError)
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,7 @@ import zipfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
@@ -38,6 +39,7 @@ _MAX_STAGED_ARCHIVE_BYTES = 512 * 1024 * 1024
 _STAGING_CLEANUP_TIMEOUT_SECONDS = 35
 _OSS_LIST_PAGE_SIZE = 16
 _MAX_OSS_LIST_OUTPUT_BYTES = 64 * 1024
+_LINUX_NAME_MAX_BYTES = 255
 
 _OSS_LIST_HEADER_RE = re.compile(
     r"^LastModifiedTime\s+Size\(B\)\s+StorageClass\s+ETAG\s+ObjectName\s*$"
@@ -71,6 +73,49 @@ class _OssObject:
     size_bytes: int
 
 
+def _input_filesystem_error(context: str, exc: OSError) -> AtomicInfrastructureError:
+    detail = f"{context}: {type(exc).__name__}: {exc}"
+    return AtomicInfrastructureError("input", detail[:2000])
+
+
+async def _run_input_ossutil(
+    context: str,
+    *arguments: str,
+) -> tuple[int, bytes, bytes]:
+    try:
+        return await run_host_ossutil(*arguments)
+    except Exception as exc:
+        detail = f"{context}: {type(exc).__name__}: {exc}"
+        raise AtomicInfrastructureError("input", detail[:2000]) from exc
+
+
+def _validate_oss_local_namespace(
+    groups: tuple[tuple[str, list[_OssObject]], ...],
+) -> None:
+    local_paths: list[tuple[str, ...]] = []
+    for root_name, objects in groups:
+        for item in objects:
+            parts = (
+                (root_name, *item.relative_path.parts) if root_name else item.relative_path.parts
+            )
+            for component in parts:
+                if len(component.encode("utf-8")) > _LINUX_NAME_MAX_BYTES:
+                    raise AtomicInfrastructureError(
+                        "input",
+                        "OSS object path component exceeds Linux NAME_MAX 255 bytes: "
+                        f"{item.relative_path}",
+                    )
+            local_paths.append(parts)
+    local_paths.sort()
+    for previous, current in pairwise(local_paths):
+        if len(previous) <= len(current) and current[: len(previous)] == previous:
+            raise AtomicInfrastructureError(
+                "input",
+                "OSS local namespace collision: "
+                f"{PurePosixPath(*previous)} conflicts with {PurePosixPath(*current)}",
+            )
+
+
 def sanitize_solve_environment(environment: EnvironmentSpec) -> EnvironmentSpec:
     """Clone an environment and remove instance identities capable of OSS access."""
     sanitized = copy.deepcopy(environment)
@@ -99,59 +144,70 @@ async def prepare_atomic_input(
             f"unsupported atomic remote task-data backend: {source.split(':', 1)[0]}",
         )
 
-    with tempfile.TemporaryDirectory(prefix="ale-atomic-input-") as temp_dir:
-        root = Path(temp_dir)
-        os.chmod(root, 0o700)
-        payload = root / "payload"
-        payload.mkdir(mode=0o700)
-        prefix = (
-            f"{source.rstrip('/')}/{task_data.domain_name}/"
-            f"{task_data.task_name}/{task_data.variant_name}"
-        )
-        input_objects = await _list_prefix_objects(
-            f"{prefix}/input/",
-            required=True,
-        )
-        software_objects = await _list_prefix_objects(
-            f"{prefix}/software/",
-            required=False,
-        )
-        objects = [*input_objects, *software_objects]
-        if len(objects) > _MAX_STAGED_FILES:
-            raise AtomicInfrastructureError(
-                "input",
-                "OSS task data exceeds the file-count limit",
+    try:
+        temporary = tempfile.TemporaryDirectory(prefix="ale-atomic-input-")
+    except OSError as exc:
+        raise _input_filesystem_error("cannot create the private staging tree", exc) from exc
+    with temporary as temp_dir:
+        try:
+            root = Path(temp_dir)
+            os.chmod(root, 0o700)
+            payload = root / "payload"
+            payload.mkdir(mode=0o700)
+            prefix = (
+                f"{source.rstrip('/')}/{task_data.domain_name}/"
+                f"{task_data.task_name}/{task_data.variant_name}"
             )
-        total = 0
-        for item in objects:
-            if item.size_bytes > _MAX_STAGED_FILE_BYTES:
+            input_objects = await _list_prefix_objects(
+                f"{prefix}/input/",
+                required=True,
+            )
+            software_objects = await _list_prefix_objects(
+                f"{prefix}/software/",
+                required=False,
+            )
+            objects = [*input_objects, *software_objects]
+            _validate_oss_local_namespace(
+                (("input", input_objects), ("software", software_objects))
+            )
+            if len(objects) > _MAX_STAGED_FILES:
                 raise AtomicInfrastructureError(
                     "input",
-                    f"OSS input file exceeds 512 MiB: {item.relative_path}",
+                    "OSS task data exceeds the file-count limit",
                 )
-            total += item.size_bytes
-            if total > _MAX_STAGED_SOURCE_BYTES:
-                raise AtomicInfrastructureError(
-                    "input",
-                    "OSS task data exceeds the total-size limit",
-                )
-        actual_total = await _download_prefix(
-            input_objects,
-            payload / "input",
-            actual_total=0,
-        )
-        await _download_prefix(
-            software_objects,
-            payload / "software",
-            actual_total=actual_total,
-        )
-        _audit_staged_tree(payload, declared_input_paths)
-        archive = root / "input.zip"
-        _build_archive(payload, archive, category="input")
-        yield PreparedInput(
-            archive_path=archive,
-            archive_sha256=_file_sha256(archive),
-        )
+            total = 0
+            for item in objects:
+                if item.size_bytes > _MAX_STAGED_FILE_BYTES:
+                    raise AtomicInfrastructureError(
+                        "input",
+                        f"OSS input file exceeds 512 MiB: {item.relative_path}",
+                    )
+                total += item.size_bytes
+                if total > _MAX_STAGED_SOURCE_BYTES:
+                    raise AtomicInfrastructureError(
+                        "input",
+                        "OSS task data exceeds the total-size limit",
+                    )
+            actual_total = await _download_prefix(
+                input_objects,
+                payload / "input",
+                actual_total=0,
+            )
+            await _download_prefix(
+                software_objects,
+                payload / "software",
+                actual_total=actual_total,
+            )
+            _audit_staged_tree(payload, declared_input_paths)
+            archive = root / "input.zip"
+            _build_archive(payload, archive, category="input")
+            prepared = PreparedInput(
+                archive_path=archive,
+                archive_sha256=_file_sha256(archive),
+            )
+        except OSError as exc:
+            raise _input_filesystem_error("host staging filesystem operation failed", exc) from exc
+        yield prepared
 
 
 @asynccontextmanager
@@ -568,7 +624,10 @@ async def _list_prefix_objects(
         ]
         if marker is not None:
             arguments.extend(("--marker", marker))
-        listed = await run_host_ossutil(*arguments)
+        listed = await _run_input_ossutil(
+            f"cannot list OSS prefix {source}",
+            *arguments,
+        )
         if listed[0] != 0:
             raise AtomicInfrastructureError(
                 "input",
@@ -621,6 +680,11 @@ async def _list_prefix_objects(
                 )
             row_lines = lines[1:-1]
             page_count = int(summary.group("count"))
+            if page_count == 0:
+                raise AtomicInfrastructureError(
+                    "input",
+                    f"malformed OSS metadata zero-object listing: {source}",
+                )
         if page_count != len(row_lines) or page_count > _OSS_LIST_PAGE_SIZE:
             raise AtomicInfrastructureError(
                 "input",
@@ -706,99 +770,118 @@ async def _download_prefix(
     *,
     actual_total: int,
 ) -> int:
+    _validate_oss_local_namespace((("", objects),))
     if not objects:
         return actual_total
     try:
-        destination.mkdir(mode=0o700)
-    except FileExistsError:
-        pass
-    destination_metadata = destination.lstat()
-    if stat.S_ISLNK(destination_metadata.st_mode) or not stat.S_ISDIR(destination_metadata.st_mode):
-        raise AtomicInfrastructureError("input", "unsafe host OSS staging root")
-    destination_root = destination.resolve(strict=True)
+        try:
+            destination.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        destination_metadata = destination.lstat()
+        if stat.S_ISLNK(destination_metadata.st_mode) or not stat.S_ISDIR(
+            destination_metadata.st_mode
+        ):
+            raise AtomicInfrastructureError("input", "unsafe host OSS staging root")
+        destination_identity = (destination_metadata.st_dev, destination_metadata.st_ino)
+        destination_root = destination.resolve(strict=True)
 
-    for item in objects:
-        target = destination.joinpath(*item.relative_path.parts)
-        current = destination
-        for part in item.relative_path.parts[:-1]:
-            current /= part
-            try:
-                current.mkdir(mode=0o700)
-            except FileExistsError:
+        for item in objects:
+            target = destination.joinpath(*item.relative_path.parts)
+            current = destination
+            parent_identities: list[tuple[Path, tuple[int, int]]] = []
+            for part in item.relative_path.parts[:-1]:
+                current /= part
+                try:
+                    current.mkdir(mode=0o700)
+                except FileExistsError:
+                    pass
                 metadata = current.lstat()
                 if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
                     raise AtomicInfrastructureError(
                         "input",
                         f"unsafe host OSS staging parent: {item.relative_path}",
                     )
-        if not target.parent.resolve(strict=True).is_relative_to(destination_root):
-            raise AtomicInfrastructureError(
-                "input",
-                f"host OSS staging path escaped its private root: {item.relative_path}",
-            )
-        if os.path.lexists(target):
-            raise AtomicInfrastructureError(
-                "input",
-                f"duplicate local OSS staging target: {item.relative_path}",
-            )
-        downloaded = await run_host_ossutil(
-            "cp",
-            "--payer",
-            "requester",
-            item.url,
-            str(target),
-            "-f",
-        )
-        if downloaded[0] != 0:
-            raise AtomicInfrastructureError(
-                "input",
-                f"host OSS object download failed: {host_command_diagnostic(downloaded)}",
-            )
-        current = destination
-        for part in item.relative_path.parts[:-1]:
-            current /= part
-            try:
-                parent_metadata = current.lstat()
-            except OSError as exc:
+                parent_identities.append((current, (metadata.st_dev, metadata.st_ino)))
+            if not target.parent.resolve(strict=True).is_relative_to(destination_root):
                 raise AtomicInfrastructureError(
                     "input",
-                    f"unsafe host OSS staging parent: {item.relative_path}",
-                ) from exc
-            if stat.S_ISLNK(parent_metadata.st_mode) or not stat.S_ISDIR(parent_metadata.st_mode):
+                    f"host OSS staging path escaped its private root: {item.relative_path}",
+                )
+            if os.path.lexists(target):
+                raise AtomicInfrastructureError(
+                    "input",
+                    f"duplicate local OSS staging target: {item.relative_path}",
+                )
+            downloaded = await _run_input_ossutil(
+                f"host OSS object download failed for {item.relative_path}",
+                "cp",
+                "--payer",
+                "requester",
+                item.url,
+                str(target),
+                "-f",
+            )
+            if downloaded[0] != 0:
+                raise AtomicInfrastructureError(
+                    "input",
+                    f"host OSS object download failed: {host_command_diagnostic(downloaded)}",
+                )
+            current_destination = destination.lstat()
+            if (
+                stat.S_ISLNK(current_destination.st_mode)
+                or not stat.S_ISDIR(current_destination.st_mode)
+                or (current_destination.st_dev, current_destination.st_ino) != destination_identity
+            ):
+                raise AtomicInfrastructureError(
+                    "input",
+                    f"unsafe host OSS staging root after download: {item.relative_path}",
+                )
+            for parent, expected_identity in parent_identities:
+                parent_metadata = parent.lstat()
+                if (
+                    stat.S_ISLNK(parent_metadata.st_mode)
+                    or not stat.S_ISDIR(parent_metadata.st_mode)
+                    or (parent_metadata.st_dev, parent_metadata.st_ino) != expected_identity
+                ):
+                    raise AtomicInfrastructureError(
+                        "input",
+                        f"unsafe host OSS staging parent: {item.relative_path}",
+                    )
+            if not target.parent.resolve(strict=True).is_relative_to(destination_root):
                 raise AtomicInfrastructureError(
                     "input",
                     f"unsafe host OSS staging parent: {item.relative_path}",
                 )
-        if not target.parent.resolve(strict=True).is_relative_to(destination_root):
-            raise AtomicInfrastructureError(
-                "input",
-                f"unsafe host OSS staging parent: {item.relative_path}",
-            )
-        try:
-            local = target.lstat()
-        except OSError as exc:
-            raise AtomicInfrastructureError(
-                "input",
-                f"host OSS download did not create a regular file: {item.relative_path}",
-            ) from exc
-        if stat.S_ISLNK(local.st_mode) or not stat.S_ISREG(local.st_mode):
-            raise AtomicInfrastructureError(
-                "input",
-                f"host OSS download did not create a regular file: {item.relative_path}",
-            )
-        actual_total += local.st_size
-        if actual_total > _MAX_STAGED_SOURCE_BYTES:
-            raise AtomicInfrastructureError(
-                "input",
-                "downloaded OSS task data exceeds the total-size limit",
-            )
-        if local.st_size != item.size_bytes:
-            raise AtomicInfrastructureError(
-                "input",
-                f"OSS object size changed during download: {item.relative_path}",
-            )
-        os.chmod(target, 0o600, follow_symlinks=False)
-    return actual_total
+            try:
+                local = target.lstat()
+            except OSError as exc:
+                raise AtomicInfrastructureError(
+                    "input",
+                    f"host OSS download did not create a regular file: {item.relative_path}",
+                ) from exc
+            if stat.S_ISLNK(local.st_mode) or not stat.S_ISREG(local.st_mode):
+                raise AtomicInfrastructureError(
+                    "input",
+                    f"host OSS download did not create a regular file: {item.relative_path}",
+                )
+            actual_total += local.st_size
+            if actual_total > _MAX_STAGED_SOURCE_BYTES:
+                raise AtomicInfrastructureError(
+                    "input",
+                    "downloaded OSS task data exceeds the total-size limit",
+                )
+            if local.st_size != item.size_bytes:
+                raise AtomicInfrastructureError(
+                    "input",
+                    f"OSS object size changed during download: {item.relative_path}",
+                )
+            os.chmod(target, 0o600, follow_symlinks=False)
+        return actual_total
+    except AtomicInfrastructureError:
+        raise
+    except OSError as exc:
+        raise _input_filesystem_error("host OSS staging path operation failed", exc) from exc
 
 
 def _audit_staged_tree(
