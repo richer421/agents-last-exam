@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -33,6 +34,7 @@ _MAX_STAGED_FILES = 4096
 _MAX_STAGED_FILE_BYTES = 512 * 1024 * 1024
 _MAX_STAGED_SOURCE_BYTES = 1024 * 1024 * 1024
 _MAX_STAGED_ARCHIVE_BYTES = 512 * 1024 * 1024
+_STAGING_CLEANUP_TIMEOUT_SECONDS = 35
 
 
 @dataclass(frozen=True)
@@ -277,44 +279,83 @@ async def stage_atomic_input(
     archive_path = join(sandbox, base, f".ale-input-{nonce}.zip")
     script_path = join(sandbox, base, f".ale-input-{nonce}.py")
     config_path = join(sandbox, base, f".ale-input-{nonce}.json")
+    staging_path = join(sandbox, base, f".ale-input-{nonce}.stage")
     archive_sha256: str | None = None
-    if prepared is not None:
-        await sandbox.upload_local_file(str(prepared.archive_path), archive_path)
-        archive_sha256 = prepared.archive_sha256
-    config = {
-        "archive_path": archive_path if prepared is not None else None,
-        "archive_sha256": archive_sha256,
-        "base": base,
-        "declared_input_paths": declared_input_paths,
-        "max_files": _MAX_STAGED_FILES,
-        "max_file_bytes": _MAX_STAGED_FILE_BYTES,
-        "max_source_bytes": _MAX_STAGED_SOURCE_BYTES,
-    }
-    await sandbox.write_file(script_path, _STAGE_SCRIPT.encode())
-    await sandbox.write_file(
-        config_path,
-        json.dumps(config, sort_keys=True, separators=(",", ":")).encode(),
-    )
-    python = sandbox.python or ("python3" if sandbox.is_linux else "python")
-    command = (
-        f"{shlex.quote(python)} {shlex.quote(script_path)} {shlex.quote(config_path)}"
-        if sandbox.is_linux
-        else f'"{python}" "{script_path}" "{config_path}"'
-    )
-    result = await sandbox.run_command(command, timeout=600)
+    primary_error: BaseException | None = None
+    run_attempted = False
+    verifier_payload_received = False
+    preserve_staging = False
     try:
-        payload = json.loads(result.stdout or "")
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise AtomicInfrastructureError(
-            "input",
-            "VM input verifier returned invalid JSON",
-        ) from exc
-    if result.returncode != 0 or not isinstance(payload, dict) or payload.get("ok") is not True:
-        detail = payload.get("error") if isinstance(payload, dict) else None
-        raise AtomicInfrastructureError(
-            "input",
-            str(detail or result.stderr or "VM input verifier failed")[:2000],
+        if prepared is not None:
+            await sandbox.upload_local_file(str(prepared.archive_path), archive_path)
+            archive_sha256 = prepared.archive_sha256
+        config = {
+            "archive_path": archive_path if prepared is not None else None,
+            "archive_sha256": archive_sha256,
+            "base": base,
+            "declared_input_paths": declared_input_paths,
+            "max_files": _MAX_STAGED_FILES,
+            "max_file_bytes": _MAX_STAGED_FILE_BYTES,
+            "max_source_bytes": _MAX_STAGED_SOURCE_BYTES,
+        }
+        await sandbox.write_file(script_path, _STAGE_SCRIPT.encode())
+        await sandbox.write_file(
+            config_path,
+            json.dumps(config, sort_keys=True, separators=(",", ":")).encode(),
         )
+        python = sandbox.python or ("python3" if sandbox.is_linux else "python")
+        command = (
+            f"{shlex.quote(python)} {shlex.quote(script_path)} {shlex.quote(config_path)}"
+            if sandbox.is_linux
+            else f'"{python}" "{script_path}" "{config_path}"'
+        )
+        run_attempted = True
+        result = await sandbox.run_command(command, timeout=600)
+        try:
+            payload = json.loads(result.stdout or "")
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise AtomicInfrastructureError(
+                "input",
+                "VM input verifier returned invalid JSON",
+            ) from exc
+        if isinstance(payload, dict):
+            verifier_payload_received = True
+            preserve_staging = payload.get("preserve_staging") is True
+        if result.returncode != 0 or not isinstance(payload, dict) or payload.get("ok") is not True:
+            detail = payload.get("error") if isinstance(payload, dict) else None
+            raise AtomicInfrastructureError(
+                "input",
+                str(detail or result.stderr or "VM input verifier failed")[:2000],
+            )
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        cleanup_paths = [
+            archive_path,
+            f"{archive_path}.b64",
+            script_path,
+            f"{script_path}.b64",
+            config_path,
+            f"{config_path}.b64",
+        ]
+        if not preserve_staging and (not run_attempted or verifier_payload_received):
+            cleanup_paths.append(staging_path)
+        cleanup_errors = []
+        for cleanup_path in cleanup_paths:
+            try:
+                await asyncio.wait_for(
+                    sandbox.rm((cleanup_path,)),
+                    timeout=_STAGING_CLEANUP_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:  # noqa: BLE001
+                cleanup_errors.append(f"{cleanup_path}: {type(exc).__name__}: {exc}"[:500])
+        if cleanup_errors:
+            detail = "VM input staging cleanup failed: " + "; ".join(cleanup_errors)
+            if primary_error is not None:
+                primary_error.add_note(detail[:2000])
+            else:
+                raise AtomicInfrastructureError("input", detail[:2000])
 
 
 async def stage_atomic_reference(
@@ -566,13 +607,11 @@ import hashlib
 import json
 import shutil
 import sys
-import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
 
-def fail(message):
-    print(json.dumps({"ok": False, "error": str(message)[:2000]}, separators=(",", ":")))
-    raise SystemExit(2)
+def reject(message):
+    raise RuntimeError(str(message))
 
 def remove_path(path):
     if path.is_symlink() or path.is_file():
@@ -588,13 +627,19 @@ def validate_declared(root, declared_paths):
         for part in path.parts:
             current = current / part
             if current.is_symlink():
-                fail(f"declared input is or traverses a symlink: {raw}")
+                reject(f"declared input is or traverses a symlink: {raw}")
         if not candidate.is_file():
-            fail(f"declared input is missing: {raw}")
+            reject(f"declared input is missing: {raw}")
 
 config_path = Path(sys.argv[1])
-archive = None
+archive = config_path.with_suffix(".zip")
+script_path = Path(__file__)
+known_staging_path = config_path.with_suffix(".stage")
 staging_root = None
+staging_created = False
+preserve_staging = False
+primary_error = None
+cleanup_errors = []
 try:
     config = json.loads(config_path.read_text(encoding="utf-8"))
     base = Path(config["base"])
@@ -606,13 +651,14 @@ try:
             for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
                 digest.update(chunk)
         if digest.hexdigest() != config["archive_sha256"]:
-            fail("trusted input archive SHA-256 mismatch")
+            reject("trusted input archive SHA-256 mismatch")
         with zipfile.ZipFile(archive) as bundle:
             infos = bundle.infolist()
             if len(infos) > config["max_files"]:
-                fail("trusted input archive exceeds file-count limit")
+                reject("trusted input archive exceeds file-count limit")
             total = 0
             names = set()
+            input_members = 0
             for info in infos:
                 path = PurePosixPath(info.filename)
                 if (
@@ -625,61 +671,125 @@ try:
                     or path.as_posix() != info.filename
                     or "\\" in info.filename
                 ):
-                    fail(f"unsafe trusted input archive member: {info.filename}")
+                    reject(f"unsafe trusted input archive member: {info.filename}")
                 if info.filename in names:
-                    fail(f"duplicate trusted input archive member: {info.filename}")
+                    reject(f"duplicate trusted input archive member: {info.filename}")
                 names.add(info.filename)
                 if info.file_size > config["max_file_bytes"]:
-                    fail(f"trusted input member exceeds size limit: {info.filename}")
+                    reject(f"trusted input member exceeds size limit: {info.filename}")
                 total += info.file_size
                 if total > config["max_source_bytes"]:
-                    fail("trusted input archive exceeds total-size limit")
+                    reject("trusted input archive exceeds total-size limit")
                 mode = info.external_attr >> 16
                 if (mode & 0o170000) != 0o100000:
-                    fail(f"trusted input archive member is not regular: {info.filename}")
+                    reject(f"trusted input archive member is not regular: {info.filename}")
                 if info.flag_bits & 1:
-                    fail(f"trusted input archive member is encrypted: {info.filename}")
-            staging_root = Path(tempfile.mkdtemp(prefix=".ale-input-stage-", dir=base))
-            staging_root.chmod(0o700)
+                    reject(f"trusted input archive member is encrypted: {info.filename}")
+                if path.parts[0] == "input":
+                    input_members += 1
+            if input_members == 0:
+                reject("trusted input archive contains no input files")
+            staging_root = known_staging_path
+            staging_root.mkdir(mode=0o700)
+            staging_created = True
             for info in infos:
                 target = staging_root.joinpath(*PurePosixPath(info.filename).parts)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with bundle.open(info) as source, target.open("wb") as destination:
                     shutil.copyfileobj(source, destination, 1024 * 1024)
+        input_root = staging_root / "input"
+        if input_root.is_symlink() or not input_root.is_dir():
+            reject("trusted input archive did not produce a real input directory")
         validate_declared(staging_root, config["declared_input_paths"])
         backup_root = staging_root / ".previous"
         backup_root.mkdir(mode=0o700)
+        moved_old = {"input": False, "software": False}
+        installed_new = {"input": False, "software": False}
+        transaction_succeeded = False
         try:
             for name in ("input", "software"):
                 live = base / name
                 if live.is_symlink() or live.exists():
                     live.replace(backup_root / name)
+                    moved_old[name] = True
             for name in ("input", "software"):
                 staged = staging_root / name
                 if staged.exists():
                     staged.replace(base / name)
-        except Exception:
+                    installed_new[name] = True
+            transaction_succeeded = True
+        except Exception as replacement_error:
+            rollback_errors = []
             for name in ("input", "software"):
-                remove_path(base / name)
+                if installed_new[name]:
+                    try:
+                        remove_path(base / name)
+                        installed_new[name] = False
+                    except Exception as exc:
+                        rollback_errors.append(
+                            f"remove new {name}: {type(exc).__name__}: {exc}"
+                        )
             for name in ("input", "software"):
-                previous = backup_root / name
-                if previous.is_symlink() or previous.exists():
-                    previous.replace(base / name)
+                if moved_old[name]:
+                    previous = backup_root / name
+                    try:
+                        previous.replace(base / name)
+                        moved_old[name] = False
+                    except Exception as exc:
+                        rollback_errors.append(
+                            f"restore old {name}: {type(exc).__name__}: {exc}"
+                        )
+            rollback_incomplete = (
+                any(installed_new.values())
+                or any(moved_old.values())
+                or bool(rollback_errors)
+            )
+            if rollback_incomplete:
+                preserve_staging = True
+                reject(
+                    f"{replacement_error}; rollback backup preserved at {staging_root}; "
+                    + "; ".join(rollback_errors)
+                )
             raise
     else:
         validate_declared(base, config["declared_input_paths"])
-    print(json.dumps({"ok": True}, separators=(",", ":")))
-except SystemExit:
-    raise
 except Exception as exc:
-    fail(exc)
+    primary_error = exc
 finally:
-    if staging_root is not None:
-        shutil.rmtree(staging_root, ignore_errors=True)
-    if archive is not None:
+    if staging_created and not preserve_staging:
+        try:
+            shutil.rmtree(staging_root)
+        except Exception as exc:
+            cleanup_errors.append(f"staging root: {type(exc).__name__}: {exc}")
+    try:
         archive.unlink(missing_ok=True)
-    config_path.unlink(missing_ok=True)
-    Path(__file__).unlink(missing_ok=True)
+    except Exception as exc:
+        cleanup_errors.append(f"archive: {type(exc).__name__}: {exc}")
+    try:
+        config_path.unlink(missing_ok=True)
+    except Exception as exc:
+        cleanup_errors.append(f"config: {type(exc).__name__}: {exc}")
+    try:
+        script_path.unlink(missing_ok=True)
+    except Exception as exc:
+        cleanup_errors.append(f"script: {type(exc).__name__}: {exc}")
+
+if primary_error is not None or cleanup_errors:
+    details = str(primary_error) if primary_error is not None else "VM input cleanup failed"
+    if cleanup_errors:
+        details += "; cleanup errors: " + "; ".join(cleanup_errors)
+    print(
+        json.dumps(
+            {
+                "ok": False,
+                "error": details[:2000],
+                "preserve_staging": preserve_staging,
+            },
+            separators=(",", ":"),
+        )
+    )
+    raise SystemExit(2)
+print(json.dumps({"ok": True}, separators=(",", ":")))
 """.strip()
 
 

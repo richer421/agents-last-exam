@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import re
 import shutil
 import stat
 import subprocess
@@ -22,6 +24,7 @@ from ale_run.atomic.contracts import (
 )
 from ale_run.atomic.runtime import AtomicRuntime
 from ale_run.atomic.trusted_staging import (
+    _STAGE_SCRIPT,
     PreparedInput,
     prepare_atomic_input,
     sanitize_solve_environment,
@@ -41,6 +44,7 @@ class _LocalSandbox:
         self.python = sys.executable
         self.task_data_root = str(root / "task-data")
         self.commands: list[str] = []
+        self.rm_calls: list[tuple[str, ...]] = []
 
     async def mkdir(self, path: str) -> None:
         Path(path).mkdir(parents=True, exist_ok=True)
@@ -56,6 +60,16 @@ class _LocalSandbox:
             destination.write_bytes(content)
         else:
             destination.write_text(content, encoding="utf-8")
+
+    async def rm(self, paths) -> None:
+        requested = tuple(paths)
+        self.rm_calls.append(requested)
+        for raw in requested:
+            path = Path(raw)
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            elif path.exists():
+                shutil.rmtree(path)
 
     async def run_command(
         self,
@@ -73,6 +87,95 @@ class _LocalSandbox:
             text=True,
             timeout=timeout,
         )
+
+
+class _ScriptFaultSandbox(_LocalSandbox):
+    def __init__(self, root: Path, faults: set[tuple[str, str]]) -> None:
+        super().__init__(root)
+        self.faults = faults
+
+    async def write_file(self, path: str, content: str | bytes) -> None:
+        if path.endswith(".py"):
+            script = content.decode() if isinstance(content, bytes) else content
+            fault_setup = (
+                f"\ninjected_faults = {self.faults!r}\n"
+                "def maybe_fail(operation, name):\n"
+                "    if (operation, name) in injected_faults:\n"
+                "        raise OSError(f'injected {operation} failure for {name}')\n"
+            )
+            script = script.replace(
+                "staging_root = None\n",
+                f"staging_root = None\n{fault_setup}",
+                1,
+            )
+            script = script.replace(
+                "                    live.replace(backup_root / name)",
+                "                    maybe_fail('move-old', name)\n"
+                "                    live.replace(backup_root / name)",
+            )
+            script = script.replace(
+                "                    staged.replace(base / name)",
+                "                    maybe_fail('install-new', name)\n"
+                "                    staged.replace(base / name)",
+            )
+            script = script.replace(
+                "            transaction_succeeded = True",
+                "            maybe_fail('commit', '*')\n            transaction_succeeded = True",
+            )
+            script = script.replace(
+                "                        remove_path(base / name)",
+                "                        maybe_fail('remove-new', name)\n"
+                "                        remove_path(base / name)",
+            )
+            script = script.replace(
+                "                        previous.replace(base / name)",
+                "                        maybe_fail('restore-old', name)\n"
+                "                        previous.replace(base / name)",
+            )
+            content = script.encode()
+        await super().write_file(path, content)
+
+
+class _OrchestrationFailingSandbox(_LocalSandbox):
+    def __init__(
+        self,
+        root: Path,
+        failure: str,
+        *,
+        cleanup_fails: bool = False,
+    ) -> None:
+        super().__init__(root)
+        self.failure = failure
+        self.cleanup_fails = cleanup_fails
+
+    async def upload_local_file(self, local_path: str, remote_path: str) -> None:
+        await super().upload_local_file(local_path, remote_path)
+        if self.failure == "upload":
+            raise RuntimeError("injected upload failure")
+
+    async def write_file(self, path: str, content: str | bytes) -> None:
+        await super().write_file(path, content)
+        if self.failure == "script-write" and path.endswith(".py"):
+            raise RuntimeError("injected script-write failure")
+        if self.failure == "config-write" and path.endswith(".json"):
+            raise RuntimeError("injected config-write failure")
+
+    async def run_command(
+        self,
+        command: str,
+        *,
+        timeout: float = 60,
+    ) -> subprocess.CompletedProcess[str]:
+        if self.failure == "run":
+            raise RuntimeError("injected run failure")
+        return await super().run_command(command, timeout=timeout)
+
+    async def rm(self, paths) -> None:
+        requested = tuple(paths)
+        self.rm_calls.append(requested)
+        if self.cleanup_fails:
+            raise OSError(f"injected cleanup failure for {requested[0]}")
+        await super().rm(requested)
 
 
 def _task_data() -> TaskDataSpec:
@@ -122,6 +225,18 @@ def _input_base(sandbox: _LocalSandbox) -> Path:
 
 def _assert_no_input_staging_artifacts(base: Path) -> None:
     assert list(base.glob(".ale-input-*")) == []
+
+
+def _populate_old_live_roots(base: Path) -> None:
+    (base / "input").mkdir(parents=True)
+    (base / "software").mkdir()
+    (base / "input" / "required.txt").write_text("old input", encoding="utf-8")
+    (base / "software" / "tool.sh").write_text("old software", encoding="utf-8")
+
+
+def _assert_old_live_roots(base: Path) -> None:
+    assert (base / "input" / "required.txt").read_text(encoding="utf-8") == "old input"
+    assert (base / "software" / "tool.sh").read_text(encoding="utf-8") == "old software"
 
 
 def test_solve_environment_removes_storage_identity_without_mutating_legacy_config() -> None:
@@ -634,6 +749,247 @@ async def test_remote_input_replaces_symlink_destinations_without_following_them
     assert (external_input / "old.txt").read_text(encoding="utf-8") == "external input"
     assert (external_software / "old.sh").read_text(encoding="utf-8") == "external software"
     _assert_no_input_staging_artifacts(base)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "name"),
+    [
+        ("move-old", "input"),
+        ("move-old", "software"),
+        ("install-new", "input"),
+        ("install-new", "software"),
+        ("commit", "*"),
+    ],
+)
+async def test_remote_input_replacement_failure_restores_both_roots(
+    tmp_path: Path,
+    operation: str,
+    name: str,
+) -> None:
+    sandbox = _ScriptFaultSandbox(tmp_path / "vm", {(operation, name)})
+    base = _input_base(sandbox)
+    _populate_old_live_roots(base)
+    prepared = _write_input_archive(
+        tmp_path,
+        {
+            "input/required.txt": b"new input",
+            "software/tool.sh": b"new software",
+        },
+    )
+
+    with pytest.raises(AtomicInfrastructureError, match="injected"):
+        await stage_atomic_input(
+            sandbox,
+            _task_data(),
+            source="oss://private-bucket/tasks",
+            declared_input_paths=("input/required.txt",),
+            prepared=prepared,
+        )
+
+    _assert_old_live_roots(base)
+    _assert_no_input_staging_artifacts(base)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rollback_operation", "name"),
+    [
+        ("remove-new", "input"),
+        ("remove-new", "software"),
+        ("restore-old", "input"),
+        ("restore-old", "software"),
+    ],
+)
+async def test_remote_input_incomplete_rollback_preserves_and_reports_backup(
+    tmp_path: Path,
+    rollback_operation: str,
+    name: str,
+) -> None:
+    sandbox = _ScriptFaultSandbox(
+        tmp_path / "vm",
+        {("commit", "*"), (rollback_operation, name)},
+    )
+    base = _input_base(sandbox)
+    _populate_old_live_roots(base)
+    prepared = _write_input_archive(
+        tmp_path,
+        {
+            "input/required.txt": b"new input",
+            "software/tool.sh": b"new software",
+        },
+    )
+
+    with pytest.raises(AtomicInfrastructureError) as caught:
+        await stage_atomic_input(
+            sandbox,
+            _task_data(),
+            source="oss://private-bucket/tasks",
+            declared_input_paths=("input/required.txt",),
+            prepared=prepared,
+        )
+
+    match = re.search(r"rollback backup preserved at ([^;]+)", str(caught.value))
+    assert match is not None
+    backup_root = Path(match.group(1))
+    assert backup_root.is_dir()
+    assert (backup_root / ".previous" / name).exists()
+    assert "injected commit failure" in str(caught.value)
+    assert f"injected {rollback_operation} failure for {name}" in str(caught.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "members",
+    [{}, {"software/tool.sh": b"software only"}],
+    ids=["empty-archive", "software-only"],
+)
+async def test_remote_archive_without_input_preserves_live_roots(
+    tmp_path: Path,
+    members: dict[str, bytes],
+) -> None:
+    sandbox = _LocalSandbox(tmp_path / "vm")
+    base = _input_base(sandbox)
+    _populate_old_live_roots(base)
+    prepared = _write_input_archive(tmp_path, members)
+
+    with pytest.raises(AtomicInfrastructureError, match="contains no input"):
+        await stage_atomic_input(
+            sandbox,
+            _task_data(),
+            source="oss://private-bucket/tasks",
+            declared_input_paths=(),
+            prepared=prepared,
+        )
+
+    _assert_old_live_roots(base)
+    _assert_no_input_staging_artifacts(base)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    ["upload", "script-write", "config-write", "run"],
+)
+async def test_host_removes_staging_artifacts_after_orchestration_failure(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    sandbox = _OrchestrationFailingSandbox(tmp_path / "vm", failure)
+    base = _input_base(sandbox)
+    prepared = _write_input_archive(tmp_path, {"input/required.txt": b"trusted"})
+
+    with pytest.raises(RuntimeError, match=f"injected {failure} failure"):
+        await stage_atomic_input(
+            sandbox,
+            _task_data(),
+            source="oss://private-bucket/tasks",
+            declared_input_paths=("input/required.txt",),
+            prepared=prepared,
+        )
+
+    _assert_no_input_staging_artifacts(base)
+    assert sandbox.rm_calls
+
+
+@pytest.mark.asyncio
+async def test_host_cleanup_errors_do_not_mask_orchestration_failure(
+    tmp_path: Path,
+) -> None:
+    sandbox = _OrchestrationFailingSandbox(
+        tmp_path / "vm",
+        "run",
+        cleanup_fails=True,
+    )
+    prepared = _write_input_archive(tmp_path, {"input/required.txt": b"trusted"})
+
+    with pytest.raises(RuntimeError, match="injected run failure") as caught:
+        await stage_atomic_input(
+            sandbox,
+            _task_data(),
+            source="oss://private-bucket/tasks",
+            declared_input_paths=("input/required.txt",),
+            prepared=prepared,
+        )
+
+    assert any("staging cleanup failed" in note for note in caught.value.__notes__)
+    assert len(sandbox.rm_calls) >= 4
+
+
+def test_vm_config_parse_failure_removes_known_archive_and_control_files(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "task-data"
+    base.mkdir()
+    script = base / ".ale-input-invalid.py"
+    config = base / ".ale-input-invalid.json"
+    archive = base / ".ale-input-invalid.zip"
+    script.write_text(_STAGE_SCRIPT, encoding="utf-8")
+    config.write_text("{", encoding="utf-8")
+    archive.write_bytes(b"uploaded archive")
+
+    result = subprocess.run(
+        [sys.executable, str(script), str(config)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    payload = json.loads(result.stdout)
+    assert result.returncode == 2
+    assert payload["ok"] is False
+    assert "Expecting property name" in payload["error"]
+    assert not archive.exists()
+    assert not config.exists()
+    assert not script.exists()
+
+
+def test_vm_cleanup_attempts_all_artifacts_without_masking_primary_failure(
+    tmp_path: Path,
+) -> None:
+    base = tmp_path / "task-data"
+    base.mkdir()
+    script = base / ".ale-input-cleanup.py"
+    config = base / ".ale-input-cleanup.json"
+    archive = base / ".ale-input-cleanup.zip"
+    prepared = _write_input_archive(tmp_path, {"software/tool.sh": b"software only"})
+    shutil.copyfile(prepared.archive_path, archive)
+    injected_script = _STAGE_SCRIPT.replace(
+        "archive.unlink(missing_ok=True)",
+        "raise OSError('injected archive cleanup failure')",
+    )
+    script.write_text(injected_script, encoding="utf-8")
+    config.write_text(
+        json.dumps(
+            {
+                "archive_path": str(archive),
+                "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+                "base": str(base),
+                "declared_input_paths": [],
+                "max_files": 100,
+                "max_file_bytes": 1024,
+                "max_source_bytes": 4096,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(script), str(config)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    payload = json.loads(result.stdout)
+    assert result.returncode == 2
+    assert payload["ok"] is False
+    assert "contains no input" in payload["error"]
+    assert "injected archive cleanup failure" in payload["error"]
+    assert archive.exists()
+    assert not config.exists()
+    assert not script.exists()
+    assert not list(base.glob("*.stage"))
 
 
 @pytest.mark.asyncio
