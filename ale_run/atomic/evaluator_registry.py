@@ -239,21 +239,10 @@ def _read_registry_record(
     root_fd: int | None = None
     record_fd: int | None = None
     try:
-        root_status = root.lstat()
-        if stat.S_ISLNK(root_status.st_mode):
-            raise AtomicInfrastructureError(
-                "evaluator_registry",
-                "evaluator registry root must not be a symlink",
-            )
-        if not stat.S_ISDIR(root_status.st_mode):
-            raise AtomicInfrastructureError(
-                "evaluator_registry",
-                "evaluator registry root is not a directory",
-            )
-        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        root_fd = _open_registry_root(root)
         record_fd = os.open(
             filename,
-            os.O_RDONLY | os.O_NOFOLLOW,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
             dir_fd=root_fd,
         )
         record_status = os.fstat(record_fd)
@@ -273,10 +262,47 @@ def _read_registry_record(
             f"cannot read evaluator registry record: {exc}",
         ) from exc
     finally:
-        if record_fd is not None:
-            os.close(record_fd)
-        if root_fd is not None:
-            os.close(root_fd)
+        try:
+            if record_fd is not None:
+                os.close(record_fd)
+        finally:
+            if root_fd is not None:
+                os.close(root_fd)
+
+
+def _open_registry_root(root: Path) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    current_fd = os.open("/", flags)
+    try:
+        for component in root.parts[1:]:
+            if component in {"", ".", ".."}:
+                raise AtomicInfrastructureError(
+                    "evaluator_registry",
+                    "evaluator registry root contains an unsafe path component",
+                )
+            component_status = os.stat(
+                component,
+                dir_fd=current_fd,
+                follow_symlinks=False,
+            )
+            if stat.S_ISLNK(component_status.st_mode):
+                raise AtomicInfrastructureError(
+                    "evaluator_registry",
+                    "evaluator registry root must not contain symlinks",
+                )
+            if not stat.S_ISDIR(component_status.st_mode):
+                raise AtomicInfrastructureError(
+                    "evaluator_registry",
+                    "evaluator registry root is not a directory",
+                )
+            next_fd = os.open(component, flags, dir_fd=current_fd)
+            previous_fd = current_fd
+            current_fd = next_fd
+            os.close(previous_fd)
+        return current_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
 
 
 def _run_git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:

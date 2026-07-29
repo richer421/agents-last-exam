@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -234,3 +236,40 @@ def test_registry_gate_requires_configured_root(
         validate_evaluator_registry(request)
 
     assert caught.value.category == "evaluator_registry"
+
+
+def test_registry_gate_rejects_symlink_in_root_ancestor(tmp_path: Path) -> None:
+    request, _record, registry_root = _registry_request(tmp_path)
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    registry_root.rename(real_parent / "control-plane")
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(AtomicInfrastructureError) as caught:
+        validate_evaluator_registry(request, linked_parent / "control-plane")
+
+    assert caught.value.category == "evaluator_registry"
+
+
+def test_registry_gate_rejects_fifo_record_without_blocking(tmp_path: Path) -> None:
+    request, _record, registry_root = _registry_request(tmp_path)
+    record_path = next(registry_root.iterdir())
+    record_path.unlink()
+    os.mkfifo(record_path)
+    errors: list[BaseException] = []
+
+    def validate() -> None:
+        try:
+            validate_evaluator_registry(request, registry_root)
+        except BaseException as exc:  # noqa: BLE001 - capture worker failure for assertion.
+            errors.append(exc)
+
+    worker = threading.Thread(target=validate, daemon=True)
+    worker.start()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive(), "FIFO registry record blocked validation"
+    assert len(errors) == 1
+    assert isinstance(errors[0], AtomicInfrastructureError)
+    assert errors[0].category == "evaluator_registry"
