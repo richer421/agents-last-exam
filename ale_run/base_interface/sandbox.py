@@ -96,7 +96,9 @@ class RangeResult:
 
     Cleanly distinguishes "remote file shrank" / "got data" / "no new
     bytes" / "error" for the caller (see
-    :func:`ale_run.executors.sandbox.tail_hot_artifacts`).
+    :func:`ale_run.executors.sandbox.tail_hot_artifacts`). On success,
+    ``new_size`` is the current total remote file size and ``new_data``
+    contains at most the requested bytes beginning at the requested offset.
     """
 
     success: bool
@@ -218,8 +220,10 @@ class SandboxHandle:
         self, remote_path: str, *, start: int, max_chunk_bytes: int,
         timeout: float = 60,
     ) -> RangeResult:
-        """Incremental fetch of a sandbox-side file. See
-        :class:`RangeResult`."""
+        """Fetch up to ``max_chunk_bytes`` at ``start`` from a sandbox file.
+
+        See :class:`RangeResult` for the returned size and data contract.
+        """
         return await asyncio.to_thread(
             _download_range_sync, self, remote_path, start, max_chunk_bytes, timeout,
         )

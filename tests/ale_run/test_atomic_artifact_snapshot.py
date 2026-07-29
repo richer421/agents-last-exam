@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import shutil
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -13,8 +12,8 @@ from uuid import uuid4
 import pytest
 
 from ale_run.atomic.contracts import SolveRequest
-from ale_run.atomic.oss_submission import publish_submission
-from ale_run.base_interface import TaskDataSpec
+from ale_run.atomic.oss_submission import download_range_to_local, publish_submission
+from ale_run.base_interface import RangeResult, TaskDataSpec
 
 
 class _MutatingSandbox:
@@ -57,9 +56,136 @@ class _MutatingSandbox:
         *,
         timeout: float = 60,
     ) -> bool:
-        shutil.copyfile(remote_path, local_path)
-        Path(remote_path).write_bytes(b"mutated after trusted pull")
-        return True
+        raise AssertionError("atomic publication must not use download_to_local")
+
+    async def download_range(
+        self,
+        remote_path: str,
+        *,
+        start: int,
+        max_chunk_bytes: int,
+        timeout: float = 60,
+    ) -> RangeResult:
+        del timeout
+        source = Path(remote_path)
+        initial = source.read_bytes()
+        chunk = initial[start : start + max_chunk_bytes]
+        if start + len(chunk) == len(initial):
+            source.write_bytes(b"mutated after trusted pull")
+        return RangeResult(
+            success=True,
+            new_data=chunk,
+            new_size=len(initial),
+        )
+
+
+class _RangeSandbox:
+    def __init__(self, results: list[RangeResult]) -> None:
+        self.results = iter(results)
+        self.calls: list[tuple[str, int, int, float]] = []
+
+    async def download_range(
+        self,
+        remote_path: str,
+        *,
+        start: int,
+        max_chunk_bytes: int,
+        timeout: float = 60,
+    ) -> RangeResult:
+        self.calls.append((remote_path, start, max_chunk_bytes, timeout))
+        return next(self.results)
+
+    async def download_to_local(self, *_args: object, **_kwargs: object) -> bool:
+        raise AssertionError("atomic download must not use download_to_local")
+
+
+@pytest.mark.asyncio
+async def test_download_range_to_local_streams_multiple_chunks_directly_to_disk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "private" / "artifact.bin"
+    sandbox = _RangeSandbox(
+        [
+            RangeResult(success=True, new_data=b"abcd", new_size=10),
+            RangeResult(success=True, new_data=b"efgh", new_size=10),
+            RangeResult(success=True, new_data=b"ij", new_size=10),
+        ]
+    )
+    monkeypatch.setattr("ale_run.atomic.oss_submission._DOWNLOAD_CHUNK_BYTES", 4)
+
+    await download_range_to_local(
+        sandbox,
+        "/remote/artifact.bin",
+        destination,
+        max_bytes=10,
+        timeout=17,
+    )
+
+    assert destination.read_bytes() == b"abcdefghij"
+    assert [call[1:3] for call in sandbox.calls] == [(0, 4), (4, 4), (8, 2)]
+    assert destination.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
+async def test_download_range_to_local_accepts_file_smaller_than_bound(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "artifact.bin"
+    sandbox = _RangeSandbox([RangeResult(success=True, new_data=b"abc", new_size=3)])
+
+    await download_range_to_local(
+        sandbox,
+        "/remote/artifact.bin",
+        destination,
+        max_bytes=10,
+        timeout=17,
+    )
+
+    assert destination.read_bytes() == b"abc"
+
+
+@pytest.mark.asyncio
+async def test_download_range_to_local_rejects_stream_overrun(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "artifact.bin"
+    sandbox = _RangeSandbox([RangeResult(success=True, new_data=b"too much", new_size=7)])
+
+    with pytest.raises(RuntimeError, match="exceeds"):
+        await download_range_to_local(
+            sandbox,
+            "/remote/artifact.bin",
+            destination,
+            max_bytes=4,
+            timeout=17,
+        )
+
+    assert not destination.exists()
+
+
+@pytest.mark.asyncio
+async def test_download_range_to_local_rejects_truncated_stream(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "artifact.bin"
+    sandbox = _RangeSandbox(
+        [
+            RangeResult(success=True, new_data=b"ab", new_size=4),
+            RangeResult(success=True, new_data=b"", new_size=4),
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="empty before"):
+        await download_range_to_local(
+            sandbox,
+            "/remote/artifact.bin",
+            destination,
+            max_bytes=4,
+            timeout=17,
+        )
+
+    assert not destination.exists()
 
 
 @pytest.mark.asyncio

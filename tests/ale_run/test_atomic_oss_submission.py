@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -29,7 +28,7 @@ from ale_run.atomic.oss_submission import (
     publish_submission,
     stage_submission,
 )
-from ale_run.base_interface import TaskDataSpec
+from ale_run.base_interface import RangeResult, TaskDataSpec
 
 SUBMISSION_ID = UUID("12345678-1234-5678-1234-567812345678")
 TASK_COMMIT = "a" * 40
@@ -45,6 +44,7 @@ class FakeSandbox:
         self.task_data_root = str(root / "task-data")
         self.metadata: dict[str, str] = {}
         self.commands: list[str] = []
+        self.range_calls: list[tuple[str, int, int, float]] = []
 
     async def write_file(self, path: str, content: str | bytes) -> None:
         destination = Path(path)
@@ -61,12 +61,26 @@ class FakeSandbox:
         *,
         timeout: float = 60,
     ) -> bool:
-        del timeout
+        raise AssertionError("atomic publication must not use download_to_local")
+
+    async def download_range(
+        self,
+        remote_path: str,
+        *,
+        start: int,
+        max_chunk_bytes: int,
+        timeout: float = 60,
+    ) -> RangeResult:
+        self.range_calls.append((remote_path, start, max_chunk_bytes, timeout))
         source = Path(remote_path)
-        destination = Path(local_path)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, destination)
-        return True
+        if not source.is_file():
+            return RangeResult(success=False, error="file not found")
+        content = await asyncio.to_thread(source.read_bytes)
+        return RangeResult(
+            success=True,
+            new_data=content[start : start + max_chunk_bytes],
+            new_size=len(content),
+        )
 
     async def run_command(
         self, command: str, *, timeout: float = 60
@@ -459,6 +473,156 @@ async def test_publish_missing_required_output_never_commits_manifest(
 
     manifest_url = f"oss://bucket/task-prefix/output/{SUBMISSION_ID}/manifest.json"
     assert not _object_path(store, manifest_url).exists()
+
+
+def _inspector_row(
+    path: str,
+    size_bytes: object,
+    *,
+    artifact_type: object = "file",
+) -> dict[str, object]:
+    return {
+        "path": path,
+        "type": artifact_type,
+        "size_bytes": size_bytes,
+        "sha256": hashlib.sha256(b"").hexdigest(),
+    }
+
+
+@pytest.mark.asyncio
+async def test_publish_rejects_oversized_file_metadata_before_first_range_call(
+    tmp_path: Path,
+    fake_oss: tuple[Path, Path],
+    solve_request: SolveRequest,
+    provenance: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def inspect(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+        return [
+            _inspector_row("output/final.txt", 6),
+            _inspector_row("output/nested/nested.bin", 1),
+        ]
+
+    monkeypatch.setattr("ale_run.atomic.oss_submission._inspect_submission_artifacts", inspect)
+    monkeypatch.setattr("ale_run.atomic.oss_submission._MAX_ARTIFACT_BYTES", 5)
+    sandbox = FakeSandbox(tmp_path / "vm")
+
+    with pytest.raises(AtomicInfrastructureError, match="per-file"):
+        await publish_submission(
+            sandbox,
+            _task_data(tmp_path / "output"),
+            solve_request,
+            provenance=provenance,
+        )
+
+    assert sandbox.range_calls == []
+
+
+@pytest.mark.asyncio
+async def test_publish_rejects_cumulative_metadata_oversize_before_first_range_call(
+    tmp_path: Path,
+    fake_oss: tuple[Path, Path],
+    solve_request: SolveRequest,
+    provenance: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def inspect(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+        return [
+            _inspector_row("output/final.txt", 4),
+            _inspector_row("output/nested/nested.bin", 4),
+        ]
+
+    monkeypatch.setattr("ale_run.atomic.oss_submission._inspect_submission_artifacts", inspect)
+    monkeypatch.setattr("ale_run.atomic.oss_submission._MAX_ARTIFACT_BYTES", 5)
+    monkeypatch.setattr("ale_run.atomic.oss_submission._MAX_ARTIFACT_TOTAL_BYTES", 7)
+    sandbox = FakeSandbox(tmp_path / "vm")
+
+    with pytest.raises(AtomicInfrastructureError, match="total"):
+        await publish_submission(
+            sandbox,
+            _task_data(tmp_path / "output"),
+            solve_request,
+            provenance=provenance,
+        )
+
+    assert sandbox.range_calls == []
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [
+            _inspector_row("output/other.txt", 0),
+            _inspector_row("output/nested/nested.bin", 0),
+        ],
+        [
+            _inspector_row("output/final.txt", 0, artifact_type="directory"),
+            _inspector_row("output/nested/nested.bin", 0),
+        ],
+        [
+            _inspector_row("output/final.txt", True),
+            _inspector_row("output/nested/nested.bin", 0),
+        ],
+    ],
+    ids=["path-mismatch", "not-regular-file", "non-integer-size"],
+)
+@pytest.mark.asyncio
+async def test_publish_rejects_unsafe_inspector_metadata_before_first_range_call(
+    rows: list[dict[str, object]],
+    tmp_path: Path,
+    fake_oss: tuple[Path, Path],
+    solve_request: SolveRequest,
+    provenance: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def inspect(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+        return rows
+
+    monkeypatch.setattr("ale_run.atomic.oss_submission._inspect_submission_artifacts", inspect)
+    sandbox = FakeSandbox(tmp_path / "vm")
+
+    with pytest.raises(AtomicInfrastructureError, match="inspector"):
+        await publish_submission(
+            sandbox,
+            _task_data(tmp_path / "output"),
+            solve_request,
+            provenance=provenance,
+        )
+
+    assert sandbox.range_calls == []
+
+
+@pytest.mark.asyncio
+async def test_publish_categorizes_malformed_range_response_and_cleans_staging(
+    tmp_path: Path,
+    fake_oss: tuple[Path, Path],
+    solve_request: SolveRequest,
+    provenance: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _store, log = fake_oss
+    output_dir = tmp_path / "output"
+    (output_dir / "nested").mkdir(parents=True)
+    (output_dir / "final.txt").write_text("finished\n", encoding="utf-8")
+    (output_dir / "nested" / "nested.bin").write_bytes(b"nested")
+    sandbox = FakeSandbox(tmp_path / "vm")
+
+    async def malformed_range(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(sandbox, "download_range", malformed_range)
+
+    with pytest.raises(AtomicInfrastructureError) as caught:
+        await publish_submission(
+            sandbox,
+            _task_data(output_dir),
+            solve_request,
+            provenance=provenance,
+        )
+
+    assert caught.value.category == "submission_integrity"
+    assert "range response" in caught.value.message
+    assert not [call for call in _calls(log) if call.get("direction") == "upload"]
 
 
 @pytest.mark.asyncio

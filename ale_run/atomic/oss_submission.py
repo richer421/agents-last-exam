@@ -18,7 +18,7 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
-from ..base_interface import SandboxHandle, TaskDataSpec
+from ..base_interface import RangeResult, SandboxHandle, TaskDataSpec
 from ..environments.task_data import join, ossbucket, task_subdir
 from .contracts import (
     AtomicInfrastructureError,
@@ -42,6 +42,7 @@ _MAX_SCRIPT_OUTPUT_BYTES = 2 * 1024 * 1024
 _MAX_PATH_BYTES = 4096
 _MAX_ARTIFACT_BYTES = 4 * 1024 * 1024 * 1024
 _MAX_ARTIFACT_TOTAL_BYTES = 16 * 1024 * 1024 * 1024
+_DOWNLOAD_CHUNK_BYTES = 8 * 1024 * 1024
 _OSS_ARGUMENT_TOKEN = "__ALE_OSS_ARGUMENTS__"
 _PROVENANCE_FIELDS = frozenset(
     {"ale_run_id", "model_id", "config_digest", "started_at", "completed_at"}
@@ -362,6 +363,136 @@ async def _write_script_bundle(
     return script_path, config_path
 
 
+async def download_range_to_local(
+    sandbox: SandboxHandle,
+    remote_path: str,
+    local_path: str | os.PathLike[str],
+    max_bytes: int,
+    timeout: float,
+) -> None:
+    """Stream one size-bounded sandbox file into a private host file."""
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0:
+        raise ValueError("max_bytes must be a non-negative integer")
+
+    destination = Path(local_path)
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(destination, flags, 0o600)
+    complete = False
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            offset = 0
+            expected_size: int | None = None
+            while expected_size is None or offset < expected_size:
+                remaining = max_bytes - offset
+                if expected_size is not None:
+                    remaining = min(remaining, expected_size - offset)
+                requested = min(_DOWNLOAD_CHUNK_BYTES, remaining)
+                if requested == 0:
+                    requested = 1
+                result = await sandbox.download_range(
+                    remote_path,
+                    start=offset,
+                    max_chunk_bytes=requested,
+                    timeout=timeout,
+                )
+                if not isinstance(result, RangeResult):
+                    raise TypeError(f"range response has invalid shape at offset {offset}")
+                if result.success is not True:
+                    raise RuntimeError(
+                        f"range download failed at offset {offset}: "
+                        f"{result.error or 'unknown error'}"
+                    )
+                if (
+                    isinstance(result.new_size, bool)
+                    or not isinstance(result.new_size, int)
+                    or result.new_size < 0
+                ):
+                    raise RuntimeError(f"range download returned a bad size at offset {offset}")
+                if result.new_size > max_bytes:
+                    raise RuntimeError(f"remote file exceeds the {max_bytes}-byte download limit")
+                if expected_size is None:
+                    expected_size = result.new_size
+                elif result.new_size != expected_size:
+                    raise RuntimeError(
+                        f"remote file size changed from {expected_size} to {result.new_size} bytes"
+                    )
+                chunk = result.new_data
+                if not isinstance(chunk, bytes):
+                    raise TypeError(f"range download returned non-bytes data at offset {offset}")
+                if len(chunk) > requested or offset + len(chunk) > max_bytes:
+                    raise RuntimeError(
+                        f"range download exceeds the {max_bytes}-byte download limit"
+                    )
+                if offset + len(chunk) > expected_size:
+                    raise RuntimeError(f"range download returned a bad offset at {offset}")
+                if expected_size == 0:
+                    if chunk:
+                        raise RuntimeError("range download exceeds the 0-byte download limit")
+                    break
+                if not chunk:
+                    raise RuntimeError(
+                        f"range download returned empty before expected offset {expected_size}"
+                    )
+                stream.write(chunk)
+                offset += len(chunk)
+        complete = True
+    finally:
+        if not complete:
+            destination.unlink(missing_ok=True)
+
+
+def _validate_inspector_artifacts(
+    artifacts: list[dict[str, object]] | None,
+    declared_paths: tuple[str, ...],
+) -> list[dict[str, object]]:
+    if artifacts is None or len(artifacts) != len(declared_paths):
+        raise AtomicInfrastructureError(
+            "submission_integrity",
+            "artifact inspector metadata does not match declared output count",
+        )
+
+    validated: list[dict[str, object]] = []
+    total_bytes = 0
+    expected_keys = {"path", "type", "size_bytes", "sha256"}
+    for index, (row, declared_path) in enumerate(zip(artifacts, declared_paths, strict=True)):
+        if not isinstance(row, dict) or set(row) != expected_keys:
+            raise AtomicInfrastructureError(
+                "submission_integrity",
+                f"artifact inspector row {index} has unsafe metadata",
+            )
+        size = row["size_bytes"]
+        digest = row["sha256"]
+        if (
+            row["path"] != declared_path
+            or row["type"] != "file"
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise AtomicInfrastructureError(
+                "submission_integrity",
+                f"artifact inspector row {index} is invalid for {declared_path}",
+            )
+        if size > _MAX_ARTIFACT_BYTES:
+            raise AtomicInfrastructureError(
+                "submission_integrity",
+                f"artifact inspector metadata exceeds per-file limit: {declared_path}",
+            )
+        total_bytes += size
+        if total_bytes > _MAX_ARTIFACT_TOTAL_BYTES:
+            raise AtomicInfrastructureError(
+                "submission_integrity",
+                "artifact inspector metadata exceeds total staging limit",
+            )
+        validated.append(row)
+    return validated
+
+
 async def publish_submission(
     sandbox: SandboxHandle,
     task_data: TaskDataSpec,
@@ -376,46 +507,60 @@ async def publish_submission(
     submission_prefix = _submission_prefix(request)
     output_root = _output_root(sandbox, task_data)
 
-    await _inspect_submission_artifacts(
-        sandbox,
-        output_root=output_root,
-        declared_paths=declared_paths,
-        allow_missing_root=False,
+    inspected_artifacts = _validate_inspector_artifacts(
+        await _inspect_submission_artifacts(
+            sandbox,
+            output_root=output_root,
+            declared_paths=declared_paths,
+            allow_missing_root=False,
+        ),
+        declared_paths,
     )
     with tempfile.TemporaryDirectory(prefix="ale-submission-staging-") as temp_dir:
         staging = Path(temp_dir)
         os.chmod(staging, 0o700)
         artifact_root = staging / "artifacts"
         artifact_rows: list[dict[str, object]] = []
-        total_bytes = 0
-        for declared_path, media_type in declared_entries:
+        for (declared_path, media_type), inspected in zip(
+            declared_entries, inspected_artifacts, strict=True
+        ):
             relative = PurePosixPath(declared_path).relative_to("output")
             remote_path = join(sandbox, output_root, *relative.parts)
             local_path = artifact_root.joinpath(*PurePosixPath(declared_path).parts)
             local_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            downloaded = await sandbox.download_to_local(
-                remote_path,
-                str(local_path),
-                timeout=_COMMAND_TIMEOUT_SECONDS,
-            )
-            if not downloaded or local_path.is_symlink() or not local_path.is_file():
+            expected_size = int(inspected["size_bytes"])
+            expected_sha256 = str(inspected["sha256"])
+            try:
+                await download_range_to_local(
+                    sandbox,
+                    remote_path,
+                    local_path,
+                    max_bytes=expected_size,
+                    timeout=_COMMAND_TIMEOUT_SECONDS,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
                 raise AtomicInfrastructureError(
                     "submission_integrity",
-                    f"failed to pull required output into trusted staging: {declared_path}",
+                    f"failed to stream required output into trusted staging: "
+                    f"{declared_path}: {exc}",
+                ) from exc
+            if local_path.is_symlink() or not local_path.is_file():
+                raise AtomicInfrastructureError(
+                    "submission_integrity",
+                    f"invalid trusted staging file: {declared_path}",
                 )
             size = local_path.stat().st_size
-            total_bytes += size
-            if size > _MAX_ARTIFACT_BYTES or total_bytes > _MAX_ARTIFACT_TOTAL_BYTES:
+            digest = _local_sha256(local_path)
+            if size != expected_size or digest != expected_sha256:
                 raise AtomicInfrastructureError(
                     "submission_integrity",
-                    "declared outputs exceed per-file or total staging limits",
+                    f"streamed output does not match inspector metadata: {declared_path}",
                 )
-            os.chmod(local_path, 0o600)
             artifact_rows.append(
                 {
                     "path": declared_path,
                     "size_bytes": size,
-                    "sha256": _local_sha256(local_path),
+                    "sha256": digest,
                     "media_type": media_type,
                     "local_path": local_path,
                 }
@@ -940,6 +1085,7 @@ try:
                 digest.update(chunk)
         artifacts.append({
             "path": declared_path,
+            "type": "file",
             "size_bytes": candidate.stat().st_size,
             "sha256": digest.hexdigest(),
         })
