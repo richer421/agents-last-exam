@@ -147,6 +147,88 @@ def test_registry_gate_preserves_ignored_entry_semantics(tmp_path: Path) -> None
     assert record.status == "ready"
 
 
+def test_registry_gate_does_not_execute_repo_local_fsmonitor(tmp_path: Path) -> None:
+    request, _record_payload, registry_root = _registry_request(tmp_path)
+    marker = tmp_path / "fsmonitor-executed"
+    hook = tmp_path / "fsmonitor-hook"
+    hook.write_text(
+        f"#!/bin/sh\nprintf x >> {marker}\nprintf '\\n'\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(request.task_repo),
+            "config",
+            "core.fsmonitor",
+            str(hook),
+        ],
+        check=True,
+    )
+
+    record = validate_evaluator_registry(request, registry_root)
+
+    assert record.status == "ready"
+    assert not marker.exists()
+
+
+def test_git_cleanliness_does_not_execute_repo_local_clean_filter(tmp_path: Path) -> None:
+    request, _record_payload, _registry_root = _registry_request(tmp_path)
+    attributes = request.task_repo / "tasks" / "toy" / ".gitattributes"
+    attributes.write_text("evaluator.py filter=host-command\n", encoding="utf-8")
+    head = _commit(request.task_repo, "add filter attributes")
+    marker = tmp_path / "filter-executed"
+    filter_command = tmp_path / "clean-filter"
+    filter_command.write_text(
+        f"#!/bin/sh\nprintf x >> {marker}\ncat\n",
+        encoding="utf-8",
+    )
+    filter_command.chmod(0o755)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(request.task_repo),
+            "config",
+            "filter.host-command.clean",
+            str(filter_command),
+        ],
+        check=True,
+    )
+    evaluator = request.task_repo / "tasks" / "toy" / "evaluator.py"
+    os.utime(evaluator, (1, 1))
+
+    validate_git_checkout(request.task_repo, head, category="task_checkout")
+
+    assert not marker.exists()
+
+
+def test_git_cleanliness_supports_linked_worktree(tmp_path: Path) -> None:
+    request, _record_payload, _registry_root = _registry_request(tmp_path)
+    linked = tmp_path / "linked"
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(request.task_repo),
+            "worktree",
+            "add",
+            "-qb",
+            "linked",
+            str(linked),
+        ],
+        check=True,
+    )
+    head = subprocess.check_output(
+        ["git", "-C", str(linked), "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+
+    validate_git_checkout(linked, head, category="task_checkout")
+
+
 @pytest.mark.parametrize(
     "failure",
     [

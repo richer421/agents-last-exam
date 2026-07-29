@@ -12,7 +12,9 @@ import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory as _PrivateTemporaryDirectory
 
 from pydantic import ValidationError
 
@@ -29,12 +31,29 @@ _MAX_GIT_FILE_BYTES = 8 * 1024 * 1024
 _MAX_GIT_FILES = 4096
 _MAX_GIT_STATUS_BYTES = 1024 * 1024
 _MAX_GIT_ERROR_BYTES = 500
+_MAX_GIT_COMMAND_BYTES = 1024 * 1024
+_MAX_GIT_CONTROL_FILE_BYTES = 1024 * 1024
+_MAX_GIT_INDEX_BYTES = 64 * 1024 * 1024
 _GIT_MATERIALIZATION_TIMEOUT_SECONDS = 120
+_GIT_OPERATION_TIMEOUT_SECONDS = 120
 _GIT_PROCESS_KILL_WAIT_SECONDS = 1
 _GIT_BLOB_MODES = {
     b"100644": 0o644,
     b"100755": 0o755,
 }
+
+
+@dataclass(frozen=True)
+class _IsolatedGitRepository:
+    work_tree: Path
+    git_dir: Path
+
+
+@dataclass(frozen=True)
+class _GitProcessResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
 
 
 def validate_evaluator_registry(
@@ -71,43 +90,49 @@ def validate_evaluator_registry(
             f"evaluator registry identity mismatch: {', '.join(mismatches)}",
         )
 
-    if _read_git_status(
+    with _isolated_git_repository(
         request.task_repo,
         category="evaluator_registry",
-        include_ignored=False,
-    ):
-        raise AtomicInfrastructureError(
-            "evaluator_registry",
-            "task repository has tracked or untracked changes",
-        )
-    main = _run_git(
-        request.task_repo,
-        "rev-parse",
-        "--verify",
-        "refs/heads/main^{commit}",
-    ).stdout.strip()
-    ancestry = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(request.task_repo),
+    ) as repository:
+        if _read_git_status(
+            repository,
+            category="evaluator_registry",
+            include_ignored=False,
+        ):
+            raise AtomicInfrastructureError(
+                "evaluator_registry",
+                "task repository has tracked or untracked changes",
+            )
+        main = _run_git(
+            repository,
+            "rev-parse",
+            "--verify",
+            "refs/heads/main^{commit}",
+        ).stdout.strip()
+        ancestry = _run_git_process_bounded(
+            repository,
             "merge-base",
             "--is-ancestor",
             request.evaluator_version,
             main,
-        ],
-        capture_output=True,
-        check=False,
-        text=True,
-        env=_git_environment(),
-    )
-    if ancestry.returncode != 0:
-        detail = (ancestry.stderr or ancestry.stdout).strip()
-        raise AtomicInfrastructureError(
-            "evaluator_registry",
-            "evaluator_version is not an ancestor of local main"
-            + (f": {detail[:500]}" if detail else ""),
+            category="evaluator_registry",
+            max_stdout=_MAX_GIT_COMMAND_BYTES,
+            deadline=time.monotonic() + _GIT_OPERATION_TIMEOUT_SECONDS,
         )
+        if ancestry.returncode != 0:
+            detail = (
+                (ancestry.stderr or ancestry.stdout)
+                .decode(
+                    "utf-8",
+                    errors="replace",
+                )
+                .strip()
+            )
+            raise AtomicInfrastructureError(
+                "evaluator_registry",
+                "evaluator_version is not an ancestor of local main"
+                + (f": {detail[:500]}" if detail else ""),
+            )
     return record
 
 
@@ -138,17 +163,23 @@ def validate_git_checkout(
     category: str,
 ) -> None:
     """Require a clean repository whose HEAD is the requested commit."""
-    if _read_git_status(repo, category=category, include_ignored=True):
-        raise AtomicInfrastructureError(
-            category,
-            "task repository has tracked or untracked changes",
-        )
-    head = _run_git(repo, "rev-parse", "HEAD^{commit}", category=category).stdout.strip()
-    if head != commit:
-        raise AtomicInfrastructureError(
-            category,
-            f"task checkout mismatch: expected {commit}, got {head!r}",
-        )
+    with _isolated_git_repository(repo, category=category) as repository:
+        if _read_git_status(repository, category=category, include_ignored=True):
+            raise AtomicInfrastructureError(
+                category,
+                "task repository has tracked or untracked changes",
+            )
+        head = _run_git(
+            repository,
+            "rev-parse",
+            "HEAD^{commit}",
+            category=category,
+        ).stdout.strip()
+        if head != commit:
+            raise AtomicInfrastructureError(
+                category,
+                f"task checkout mismatch: expected {commit}, got {head!r}",
+            )
 
 
 @contextmanager
@@ -160,6 +191,26 @@ def materialize_git_checkout(
     prefix: str,
 ) -> Iterator[Path]:
     """Yield a bounded, link-free checkout containing exact Git commit bytes."""
+    with (
+        _isolated_git_repository(repo, category=category) as repository,
+        _materialize_isolated_git_checkout(
+            repository,
+            commit,
+            category=category,
+            prefix=prefix,
+        ) as checkout,
+    ):
+        yield checkout
+
+
+@contextmanager
+def _materialize_isolated_git_checkout(
+    repo: _IsolatedGitRepository,
+    commit: str,
+    *,
+    category: str,
+    prefix: str,
+) -> Iterator[Path]:
     with tempfile.TemporaryDirectory(prefix=prefix) as temp_dir:
         deadline = time.monotonic() + _GIT_MATERIALIZATION_TIMEOUT_SECONDS
         resolved_commit_bytes = _run_git_bounded(
@@ -328,21 +379,49 @@ def _preflight_git_tree(
 
 
 def _run_git_bounded(
-    repo: Path,
+    repo: _IsolatedGitRepository,
     *arguments: str,
     category: str,
     max_stdout: int,
     deadline: float,
 ) -> bytes:
-    command = ["git", "-C", str(repo), *arguments]
+    result = _run_git_process_bounded(
+        repo,
+        *arguments,
+        category=category,
+        max_stdout=max_stdout,
+        deadline=deadline,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise AtomicInfrastructureError(
+            category,
+            f"git {arguments[0]} failed" + (f": {detail}" if detail else ""),
+        )
+    return result.stdout
+
+
+def _run_git_process_bounded(
+    repo: _IsolatedGitRepository,
+    *arguments: str,
+    category: str,
+    max_stdout: int,
+    deadline: float,
+) -> _GitProcessResult:
+    command = [
+        "git",
+        f"--git-dir={repo.git_dir}",
+        f"--work-tree={repo.work_tree}",
+        *arguments,
+    ]
     if time.monotonic() >= deadline:
-        raise AtomicInfrastructureError(category, "Git materialization timed out")
+        raise AtomicInfrastructureError(category, "Git operation timed out")
     try:
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=_git_environment(),
+            env=_git_environment(repo),
         )
     except OSError as exc:
         raise AtomicInfrastructureError(
@@ -365,10 +444,10 @@ def _run_git_bounded(
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise AtomicInfrastructureError(category, "Git materialization timed out")
+                raise AtomicInfrastructureError(category, "Git operation timed out")
             ready = selector.select(remaining)
             if not ready:
-                raise AtomicInfrastructureError(category, "Git materialization timed out")
+                raise AtomicInfrastructureError(category, "Git operation timed out")
             for key, _events in ready:
                 stream = key.fileobj
                 output, limit = streams[stream]
@@ -389,21 +468,19 @@ def _run_git_bounded(
                     )
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise AtomicInfrastructureError(category, "Git materialization timed out")
+            raise AtomicInfrastructureError(category, "Git operation timed out")
         try:
             returncode = process.wait(timeout=remaining)
         except subprocess.TimeoutExpired as exc:
             raise AtomicInfrastructureError(
                 category,
-                "Git materialization timed out",
+                "Git operation timed out",
             ) from exc
-        if returncode != 0:
-            detail = stderr.decode("utf-8", errors="replace").strip()
-            raise AtomicInfrastructureError(
-                category,
-                f"git {arguments[0]} failed" + (f": {detail}" if detail else ""),
-            )
-        return bytes(stdout)
+        return _GitProcessResult(
+            returncode=returncode,
+            stdout=bytes(stdout),
+            stderr=bytes(stderr),
+        )
     except BaseException:
         if process.poll() is None:
             with suppress(OSError):
@@ -532,37 +609,336 @@ def _open_registry_root(root: Path) -> int:
         raise
 
 
-def _run_git(
+@contextmanager
+def _isolated_git_repository(
     repo: Path,
+    *,
+    category: str,
+) -> Iterator[_IsolatedGitRepository]:
+    work_tree = repo.resolve(strict=True)
+    source_git_dir = _resolve_git_directory(work_tree, category=category)
+    common_dir_file = source_git_dir / "commondir"
+    if common_dir_file.exists():
+        common_dir_value = (
+            _read_regular_file_bounded(
+                common_dir_file,
+                max_bytes=4096,
+                category=category,
+                label="Git commondir",
+            )
+            .decode("utf-8", errors="strict")
+            .strip()
+        )
+        if not common_dir_value:
+            raise AtomicInfrastructureError(category, "Git commondir is empty")
+        common_dir = (source_git_dir / common_dir_value).resolve(strict=True)
+    else:
+        common_dir = source_git_dir
+    if not common_dir.is_dir():
+        raise AtomicInfrastructureError(category, "Git common directory is not a directory")
+
+    source_config = _read_regular_file_bounded(
+        common_dir / "config",
+        max_bytes=_MAX_GIT_CONTROL_FILE_BYTES,
+        category=category,
+        label="Git config",
+    )
+    head = _read_regular_file_bounded(
+        source_git_dir / "HEAD",
+        max_bytes=4096,
+        category=category,
+        label="Git HEAD",
+    )
+    index = _read_regular_file_bounded(
+        source_git_dir / "index",
+        max_bytes=_MAX_GIT_INDEX_BYTES,
+        category=category,
+        label="Git index",
+    )
+    config = _build_isolated_git_config(source_config, category=category)
+
+    with _PrivateTemporaryDirectory(prefix="ale-git-view-") as temp_dir:
+        git_dir = Path(temp_dir) / "git"
+        git_dir.mkdir(mode=0o700)
+        (git_dir / "refs").mkdir(mode=0o700)
+        (git_dir / "info").mkdir(mode=0o700)
+        (git_dir / "config").write_text(config, encoding="utf-8")
+        (git_dir / "HEAD").write_bytes(head)
+        (git_dir / "index").write_bytes(index)
+
+        objects = (common_dir / "objects").resolve(strict=True)
+        if not objects.is_dir():
+            raise AtomicInfrastructureError(category, "Git object directory is not a directory")
+        os.symlink(objects, git_dir / "objects", target_is_directory=True)
+
+        head_namespace = _head_ref_namespace(head, category=category)
+        namespaces = {
+            "heads",
+            "tags",
+            "remotes",
+            "notes",
+            "bisect",
+            "rewritten",
+            "worktree",
+        }
+        if head_namespace is not None:
+            namespaces.add(head_namespace)
+        for namespace in sorted(namespaces):
+            source_namespace = source_git_dir / "refs" / namespace
+            if not source_namespace.exists():
+                source_namespace = common_dir / "refs" / namespace
+            if source_namespace.exists():
+                resolved_namespace = source_namespace.resolve(strict=True)
+                if not resolved_namespace.is_dir():
+                    raise AtomicInfrastructureError(
+                        category,
+                        f"Git ref namespace is not a directory: {namespace}",
+                    )
+                os.symlink(
+                    resolved_namespace,
+                    git_dir / "refs" / namespace,
+                    target_is_directory=True,
+                )
+
+        for name, max_bytes in (
+            ("packed-refs", _MAX_GIT_CONTROL_FILE_BYTES),
+            ("shallow", _MAX_GIT_CONTROL_FILE_BYTES),
+        ):
+            source = common_dir / name
+            if source.exists():
+                (git_dir / name).write_bytes(
+                    _read_regular_file_bounded(
+                        source,
+                        max_bytes=max_bytes,
+                        category=category,
+                        label=f"Git {name}",
+                    )
+                )
+
+        exclude = common_dir / "info" / "exclude"
+        if exclude.exists():
+            (git_dir / "info" / "exclude").write_bytes(
+                _read_regular_file_bounded(
+                    exclude,
+                    max_bytes=_MAX_GIT_CONTROL_FILE_BYTES,
+                    category=category,
+                    label="Git exclude file",
+                )
+            )
+
+        shared_indexes = list(source_git_dir.glob("sharedindex.*"))
+        if common_dir != source_git_dir:
+            shared_indexes.extend(common_dir.glob("sharedindex.*"))
+        if len(shared_indexes) > 16:
+            raise AtomicInfrastructureError(category, "Git split index has too many shared files")
+        for shared_index in shared_indexes:
+            destination = git_dir / shared_index.name
+            if destination.exists():
+                continue
+            destination.write_bytes(
+                _read_regular_file_bounded(
+                    shared_index,
+                    max_bytes=_MAX_GIT_INDEX_BYTES,
+                    category=category,
+                    label="Git shared index",
+                )
+            )
+
+        reftable = common_dir / "reftable"
+        if "refstorage = reftable" in config and reftable.exists():
+            resolved_reftable = reftable.resolve(strict=True)
+            if not resolved_reftable.is_dir():
+                raise AtomicInfrastructureError(category, "Git reftable is not a directory")
+            os.symlink(resolved_reftable, git_dir / "reftable", target_is_directory=True)
+
+        yield _IsolatedGitRepository(work_tree=work_tree, git_dir=git_dir)
+
+
+def _resolve_git_directory(work_tree: Path, *, category: str) -> Path:
+    dot_git = work_tree / ".git"
+    try:
+        dot_git_status = dot_git.lstat()
+    except OSError as exc:
+        raise AtomicInfrastructureError(category, f"cannot inspect Git directory: {exc}") from exc
+    if stat.S_ISDIR(dot_git_status.st_mode):
+        return dot_git.resolve(strict=True)
+    if not stat.S_ISREG(dot_git_status.st_mode):
+        raise AtomicInfrastructureError(category, "Git metadata pointer is not a regular file")
+    git_file = _read_regular_file_bounded(
+        dot_git,
+        max_bytes=4096,
+        category=category,
+        label="Git metadata pointer",
+    ).decode("utf-8", errors="strict")
+    prefix = "gitdir: "
+    if not git_file.startswith(prefix) or "\n" in git_file.strip():
+        raise AtomicInfrastructureError(category, "invalid Git metadata pointer")
+    target = git_file[len(prefix) :].strip()
+    if not target:
+        raise AtomicInfrastructureError(category, "Git metadata pointer is empty")
+    git_dir = (work_tree / target).resolve(strict=True)
+    if not git_dir.is_dir():
+        raise AtomicInfrastructureError(category, "Git metadata target is not a directory")
+    return git_dir
+
+
+def _read_regular_file_bounded(
+    path: Path,
+    *,
+    max_bytes: int,
+    category: str,
+    label: str,
+) -> bytes:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        file_status = os.fstat(descriptor)
+        if not stat.S_ISREG(file_status.st_mode):
+            raise AtomicInfrastructureError(category, f"{label} is not a regular file")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = None
+            payload = stream.read(max_bytes + 1)
+    except AtomicInfrastructureError:
+        raise
+    except OSError as exc:
+        raise AtomicInfrastructureError(category, f"cannot read {label}: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if len(payload) > max_bytes:
+        raise AtomicInfrastructureError(category, f"{label} exceeds its size limit")
+    return payload
+
+
+def _build_isolated_git_config(source: bytes, *, category: str) -> str:
+    try:
+        lines = source.decode("utf-8", errors="strict").splitlines()
+    except UnicodeDecodeError as exc:
+        raise AtomicInfrastructureError(category, "Git config is not UTF-8") from exc
+    section = ""
+    values: dict[tuple[str, str], str] = {}
+    allowed = {
+        ("core", "repositoryformatversion"),
+        ("core", "filemode"),
+        ("core", "ignorecase"),
+        ("core", "symlinks"),
+        ("core", "precomposeunicode"),
+        ("extensions", "objectformat"),
+        ("extensions", "compatobjectformat"),
+        ("extensions", "refstorage"),
+    }
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("#", ";")):
+            continue
+        if stripped.startswith("[") and "]" in stripped:
+            section = stripped[1 : stripped.index("]")].split(maxsplit=1)[0].lower()
+            continue
+        if "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        identity = (section, key.strip().lower())
+        if identity in allowed:
+            values[identity] = value.strip().strip('"')
+
+    repository_format = values.get(("core", "repositoryformatversion"), "0")
+    if repository_format not in {"0", "1"}:
+        raise AtomicInfrastructureError(category, "unsupported Git repository format")
+    object_format = values.get(("extensions", "objectformat"), "sha1").lower()
+    if object_format not in {"sha1", "sha256"}:
+        raise AtomicInfrastructureError(category, "unsupported Git object format")
+    ref_storage = values.get(("extensions", "refstorage"), "files").lower()
+    if ref_storage not in {"files", "reftable"}:
+        raise AtomicInfrastructureError(category, "unsupported Git ref storage")
+
+    config_lines = [
+        "[core]",
+        f"\trepositoryformatversion = {repository_format}",
+        "\tbare = false",
+    ]
+    for key, default in (
+        ("filemode", "true"),
+        ("ignorecase", "false"),
+        ("symlinks", "true"),
+        ("precomposeunicode", "false"),
+    ):
+        value = values.get(("core", key), default).lower()
+        if value not in {"true", "false", "yes", "no", "on", "off", "1", "0"}:
+            raise AtomicInfrastructureError(category, f"invalid passive Git config: core.{key}")
+        config_lines.append(f"\t{key} = {value}")
+    if repository_format == "1" or object_format != "sha1" or ref_storage != "files":
+        config_lines.append("[extensions]")
+        if object_format != "sha1":
+            config_lines.append(f"\tobjectformat = {object_format}")
+        compat_object_format = values.get(("extensions", "compatobjectformat"))
+        if compat_object_format is not None:
+            compat_object_format = compat_object_format.lower()
+            if compat_object_format not in {"sha1", "sha256"}:
+                raise AtomicInfrastructureError(category, "unsupported compatible object format")
+            config_lines.append(f"\tcompatobjectformat = {compat_object_format}")
+        if ref_storage != "files":
+            config_lines.append(f"\trefstorage = {ref_storage}")
+    return "\n".join(config_lines) + "\n"
+
+
+def _head_ref_namespace(head: bytes, *, category: str) -> str | None:
+    try:
+        value = head.decode("ascii", errors="strict").strip()
+    except UnicodeDecodeError as exc:
+        raise AtomicInfrastructureError(category, "Git HEAD is not ASCII") from exc
+    if not value.startswith("ref: "):
+        return None
+    ref = PurePosixPath(value.removeprefix("ref: "))
+    if (
+        len(ref.parts) < 3
+        or ref.parts[0] != "refs"
+        or any(part in {"", ".", ".."} for part in ref.parts)
+        or ref.parts[1] == "replace"
+    ):
+        raise AtomicInfrastructureError(category, "Git HEAD contains an unsafe ref")
+    return ref.parts[1]
+
+
+def _run_git(
+    repo: _IsolatedGitRepository,
     *arguments: str,
     category: str = "evaluator_registry",
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        ["git", "-C", str(repo), *arguments],
-        capture_output=True,
-        check=False,
-        text=True,
-        env=_git_environment(),
+    result = _run_git_process_bounded(
+        repo,
+        *arguments,
+        category=category,
+        max_stdout=_MAX_GIT_COMMAND_BYTES,
+        deadline=time.monotonic() + _GIT_OPERATION_TIMEOUT_SECONDS,
     )
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
+        detail = (
+            (result.stderr or result.stdout)
+            .decode(
+                "utf-8",
+                errors="replace",
+            )
+            .strip()
+        )
         raise AtomicInfrastructureError(
             category,
             f"git {' '.join(arguments)} failed: {detail[:500]}",
         )
-    return result
+    return subprocess.CompletedProcess(
+        args=list(arguments),
+        returncode=result.returncode,
+        stdout=result.stdout.decode("utf-8", errors="strict"),
+        stderr=result.stderr.decode("utf-8", errors="replace"),
+    )
 
 
 def _read_git_status(
-    repo: Path,
+    repo: _IsolatedGitRepository,
     *,
     category: str,
     include_ignored: bool,
 ) -> bytes:
     arguments = [
-        "git",
-        "-C",
-        str(repo),
         "status",
         "--porcelain=v1",
         "-z",
@@ -570,46 +946,39 @@ def _read_git_status(
     ]
     if include_ignored:
         arguments.append("--ignored=matching")
-    with tempfile.TemporaryFile() as stderr:
-        try:
-            process = subprocess.Popen(
-                arguments,
-                stdout=subprocess.PIPE,
-                stderr=stderr,
-                env=_git_environment(),
-            )
-        except OSError as exc:
-            raise AtomicInfrastructureError(
-                category,
-                f"cannot start git status: {exc}",
-            ) from exc
-        assert process.stdout is not None
-        try:
-            output = process.stdout.read(_MAX_GIT_STATUS_BYTES + 1)
-            if len(output) > _MAX_GIT_STATUS_BYTES:
-                process.kill()
-                process.wait()
-                raise AtomicInfrastructureError(
-                    category,
-                    "git status output exceeds the 1 MiB limit",
-                )
-            returncode = process.wait()
-        except BaseException:
-            if process.poll() is None:
-                process.kill()
-                process.wait()
-            raise
-        if returncode != 0:
-            stderr.seek(0)
-            detail = stderr.read(501).decode("utf-8", errors="replace").strip()
-            raise AtomicInfrastructureError(
-                category,
-                "git status failed" + (f": {detail[:500]}" if detail else ""),
-            )
-        return output
+    result = _run_git_process_bounded(
+        repo,
+        *arguments,
+        category=category,
+        max_stdout=_MAX_GIT_STATUS_BYTES,
+        deadline=time.monotonic() + _GIT_OPERATION_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise AtomicInfrastructureError(
+            category,
+            "git status failed" + (f": {detail[:500]}" if detail else ""),
+        )
+    return result.stdout
 
 
-def _git_environment() -> dict[str, str]:
-    environment = os.environ.copy()
-    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+def _git_environment(repo: _IsolatedGitRepository) -> dict[str, str]:
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment.update(
+        {
+            "GIT_DIR": str(repo.git_dir),
+            "GIT_WORK_TREE": str(repo.work_tree),
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_COUNT": "0",
+            "GIT_ATTR_GLOBAL": os.devnull,
+            "GIT_ATTR_SYSTEM": os.devnull,
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_NO_LAZY_FETCH": "1",
+        }
+    )
     return environment
