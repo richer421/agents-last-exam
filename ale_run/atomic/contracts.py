@@ -154,11 +154,11 @@ class HarborProvenance(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    reward: dict[str, Any]
-    details_path: Annotated[
-        str,
-        Field(pattern=r"^evidence/[A-Za-z0-9._/-]+$", min_length=1, max_length=1_000),
-    ]
+    reward: dict[str, Any] = Field(min_length=1)
+    reward_path: Literal["evidence/reward.json"]
+    reward_sha256: Sha256
+    details_path: Literal["evidence/reward-details.json"]
+    details_sha256: Sha256
 
 
 class SolveResult(BaseModel):

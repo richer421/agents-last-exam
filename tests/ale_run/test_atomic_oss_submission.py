@@ -24,6 +24,7 @@ from ale_run.atomic.contracts import (
 from ale_run.atomic.oss_submission import (
     _PUBLISH_SCRIPT,
     _download,
+    _evaluator_segment,
     publish_evaluation_result,
     publish_submission,
     stage_submission,
@@ -1018,12 +1019,20 @@ def _evaluation_result(
     *,
     score: float,
     outcome: str,
+    reward_bytes: bytes | None = None,
+    details_bytes: bytes = b"{}",
 ) -> EvaluationResult:
-    reward = {
-        "score": score,
-        "outcome": outcome,
-        "report": {"hard_gate_passed": outcome != "invalid_output"},
-    }
+    if reward_bytes is None:
+        reward_bytes = json.dumps(
+            {
+                "score": score,
+                "outcome": outcome,
+                "report": {"hard_gate_passed": outcome != "invalid_output"},
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    reward = json.loads(reward_bytes)
     return EvaluationResult(
         status="scored",
         submission_id=request.submission_id,
@@ -1038,9 +1047,27 @@ def _evaluation_result(
         rubric_hash="d" * 64,
         harbor=HarborProvenance(
             reward=reward,
+            reward_path="evidence/reward.json",
+            reward_sha256=hashlib.sha256(reward_bytes).hexdigest(),
             details_path="evidence/reward-details.json",
+            details_sha256=hashlib.sha256(details_bytes).hexdigest(),
         ),
     )
+
+
+def _local_evidence(
+    tmp_path: Path,
+    *,
+    reward_bytes: bytes,
+    details_bytes: bytes,
+) -> dict[str, Path]:
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    reward_path = evidence_dir / "reward.json"
+    details_path = evidence_dir / "reward-details.json"
+    reward_path.write_bytes(reward_bytes)
+    details_path.write_bytes(details_bytes)
+    return {"reward.json": reward_path, "reward-details.json": details_path}
 
 
 @pytest.mark.asyncio
@@ -1239,23 +1266,35 @@ async def test_stage_recomputes_digest_in_vm_and_rejects_mismatch(
 
 
 @pytest.mark.asyncio
-async def test_result_publish_is_canonical_and_idempotent(
+async def test_evidence_and_result_publish_exact_bytes_immutably_with_result_last(
     tmp_path: Path,
     fake_oss: tuple[Path, Path],
     evaluate_request: EvaluateRequest,
 ) -> None:
     store, log = fake_oss
-    sandbox = FakeSandbox(tmp_path / "vm")
-    result = _evaluation_result(evaluate_request, score=0.75, outcome="valid")
+    reward_bytes = b'{"reward":0.75,"score":0.75}'
+    details_bytes = b'{"criteria":{"quality":{"score":0.75}}}\n'
+    evidence = _local_evidence(
+        tmp_path,
+        reward_bytes=reward_bytes,
+        details_bytes=details_bytes,
+    )
+    result = _evaluation_result(
+        evaluate_request,
+        score=0.75,
+        outcome="valid",
+        reward_bytes=reward_bytes,
+        details_bytes=details_bytes,
+    )
     expected_url = (
         "oss://bucket/task-prefix/output/"
         f"{SUBMISSION_ID}/evaluations/evaluator%2Fmain/"
         f"{EVALUATOR_VERSION}/result.json"
     )
 
-    first_url = await publish_evaluation_result(sandbox, evaluate_request, result)
+    first_url = await publish_evaluation_result(evaluate_request, result, evidence)
     writes_before_retry = len([call for call in _calls(log) if call.get("direction") == "upload"])
-    second_url = await publish_evaluation_result(sandbox, evaluate_request, result)
+    second_url = await publish_evaluation_result(evaluate_request, result, evidence)
 
     assert first_url == second_url == expected_url
     assert _object_path(store, expected_url).read_bytes() == json.dumps(
@@ -1263,6 +1302,22 @@ async def test_result_publish_is_canonical_and_idempotent(
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+    prefix = expected_url.removesuffix("/result.json")
+    assert _object_path(store, f"{prefix}/evidence/reward.json").read_bytes() == reward_bytes
+    assert (
+        _object_path(store, f"{prefix}/evidence/reward-details.json").read_bytes() == details_bytes
+    )
+    uploads = [call["dst"] for call in _calls(log) if call.get("direction") == "upload"]
+    assert uploads[:3] == [
+        f"{prefix}/evidence/reward.json",
+        f"{prefix}/evidence/reward-details.json",
+        expected_url,
+    ]
+    assert all(
+        "--forbid-overwrite" in call["args"]
+        for call in _calls(log)
+        if call.get("direction") == "upload"
+    )
     assert (
         len([call for call in _calls(log) if call.get("direction") == "upload"])
         == writes_before_retry
@@ -1276,19 +1331,37 @@ async def test_result_publish_rejects_existing_different_bytes(
     evaluate_request: EvaluateRequest,
 ) -> None:
     store, _log = fake_oss
-    sandbox = FakeSandbox(tmp_path / "vm")
-    first = _evaluation_result(evaluate_request, score=0.75, outcome="valid")
-    await publish_evaluation_result(sandbox, evaluate_request, first)
+    first_reward = b'{"reward":0.75}'
+    first_evidence = _local_evidence(
+        tmp_path,
+        reward_bytes=first_reward,
+        details_bytes=b"{}",
+    )
+    first = _evaluation_result(
+        evaluate_request,
+        score=0.75,
+        outcome="valid",
+        reward_bytes=first_reward,
+    )
+    await publish_evaluation_result(evaluate_request, first, first_evidence)
+
+    second_dir = tmp_path / "second"
+    second_evidence = _local_evidence(
+        second_dir,
+        reward_bytes=first_reward,
+        details_bytes=b"{}",
+    )
 
     with pytest.raises(AtomicInfrastructureError) as caught:
         await publish_evaluation_result(
-            sandbox,
             evaluate_request,
             _evaluation_result(
                 evaluate_request,
                 score=0.0,
                 outcome="invalid_output",
+                reward_bytes=first_reward,
             ),
+            second_evidence,
         )
 
     assert caught.value.category == "idempotency_conflict"
@@ -1315,13 +1388,94 @@ async def test_result_publish_rejects_result_identity_mismatch_before_upload(
 
     with pytest.raises(AtomicInfrastructureError) as caught:
         await publish_evaluation_result(
-            FakeSandbox(tmp_path / "vm"),
             evaluate_request,
             result,
+            _local_evidence(
+                tmp_path,
+                reward_bytes=json.dumps(
+                    result.harbor.reward,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode(),
+                details_bytes=b"{}",
+            ),
         )
 
     assert caught.value.category == "submission_integrity"
     assert "evaluator_id" in caught.value.message
+    assert not [call for call in _calls(log) if call.get("direction") == "upload"]
+
+
+@pytest.mark.parametrize("conflict_name", ["reward.json", "reward-details.json"])
+@pytest.mark.asyncio
+async def test_evidence_publish_conflict_fails_closed_without_canonical_result(
+    conflict_name: str,
+    tmp_path: Path,
+    fake_oss: tuple[Path, Path],
+    evaluate_request: EvaluateRequest,
+) -> None:
+    store, _log = fake_oss
+    reward_bytes = b'{"score":0.75}'
+    details_bytes = b'{"quality":0.75}'
+    evidence = _local_evidence(
+        tmp_path,
+        reward_bytes=reward_bytes,
+        details_bytes=details_bytes,
+    )
+    result = _evaluation_result(
+        evaluate_request,
+        score=0.75,
+        outcome="valid",
+        reward_bytes=reward_bytes,
+        details_bytes=details_bytes,
+    )
+    prefix = (
+        f"{evaluate_request.submission_root}/output/{evaluate_request.submission_id}/"
+        f"evaluations/evaluator%2Fmain/{evaluate_request.evaluator_version}"
+    )
+    conflict_path = _object_path(store, f"{prefix}/evidence/{conflict_name}")
+    conflict_path.parent.mkdir(parents=True, exist_ok=True)
+    conflict_path.write_bytes(b"different evidence")
+    conflict_path.with_name(conflict_path.name + ".metadata.json").write_text(
+        json.dumps({"x-oss-meta-sha256": hashlib.sha256(b"different evidence").hexdigest()}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AtomicInfrastructureError) as caught:
+        await publish_evaluation_result(evaluate_request, result, evidence)
+
+    assert caught.value.category == "idempotency_conflict"
+    assert not _object_path(store, f"{prefix}/result.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_result_publication_rejects_staged_evidence_digest_mismatch_before_oss(
+    tmp_path: Path,
+    fake_oss: tuple[Path, Path],
+    evaluate_request: EvaluateRequest,
+) -> None:
+    _store, log = fake_oss
+    reward_bytes = b'{"score":0.75}'
+    evidence = _local_evidence(
+        tmp_path,
+        reward_bytes=reward_bytes,
+        details_bytes=b"{}",
+    )
+    evidence["reward.json"].write_bytes(b"changed after validation")
+
+    with pytest.raises(AtomicInfrastructureError, match="reward.json") as caught:
+        await publish_evaluation_result(
+            evaluate_request,
+            _evaluation_result(
+                evaluate_request,
+                score=0.75,
+                outcome="valid",
+                reward_bytes=reward_bytes,
+            ),
+            evidence,
+        )
+
+    assert caught.value.category == "submission_integrity"
     assert not [call for call in _calls(log) if call.get("direction") == "upload"]
 
 
@@ -1348,16 +1502,10 @@ async def test_windows_commands_encode_dynamic_root_path_and_evaluator_identity(
     )
     sandbox = FakeWindowsSandbox([1, 0, 1])
 
-    result_url = await publish_evaluation_result(
-        sandbox,
-        request,
-        _evaluation_result(request, score=1.0, outcome="valid"),
-    )
     await _download(sandbox, f"{unsafe_root}/%OBJECT%&|<>^", unsafe_path)
 
-    assert "%25EVALUATOR%25%26%7C%3C%3E%5E" in result_url
+    assert "%25EVALUATOR%25%26%7C%3C%3E%5E" in _evaluator_segment(request.evaluator_id)
     decoded = [_decode_powershell_command(command) for command in sandbox.commands]
-    assert any(result_url in script for script in decoded)
     assert any(unsafe_path.replace("'", "''") in script for script in decoded)
     assert all(
         dynamic not in command

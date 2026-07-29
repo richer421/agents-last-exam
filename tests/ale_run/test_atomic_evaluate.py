@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import subprocess
 from contextlib import asynccontextmanager, contextmanager
@@ -22,7 +23,7 @@ from ale_run.atomic.contracts import (
     SubmissionManifest,
 )
 from ale_run.atomic.runtime import AtomicRuntime
-from ale_run.base_interface import TaskDataSpec
+from ale_run.base_interface import RangeResult, TaskDataSpec
 from ale_run.executors.sandbox_evaluator import SandboxEvaluationResult
 from tests.ale_run.test_atomic_solve import _FakeProvider, _make_solve_request
 
@@ -100,6 +101,11 @@ def _scored_result(
         "outcome": "valid",
         "report": {"hard_gate_passed": outcome != "invalid_output"},
     }
+    reward_bytes = json.dumps(
+        raw_reward,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
     return EvaluationResult(
         status="scored",
         submission_id=request.submission_id,
@@ -114,7 +120,10 @@ def _scored_result(
         rubric_hash=_registry_record(request).rubric_hash,
         harbor=HarborProvenance(
             reward=raw_reward,
+            reward_path="evidence/reward.json",
+            reward_sha256=hashlib.sha256(reward_bytes).hexdigest(),
             details_path="evidence/reward-details.json",
+            details_sha256=hashlib.sha256(b"{}").hexdigest(),
         ),
     )
 
@@ -186,11 +195,268 @@ def _runtime(request: EvaluateRequest) -> SimpleNamespace:
     )
 
 
+class _EvidenceSandbox:
+    def __init__(self, files: dict[str, bytes | None]) -> None:
+        self.files = files
+        self.range_calls: list[tuple[str, int, int, float]] = []
+
+    async def download_range(
+        self,
+        remote_path: str,
+        *,
+        start: int,
+        max_chunk_bytes: int,
+        timeout: float,
+    ) -> RangeResult:
+        self.range_calls.append((remote_path, start, max_chunk_bytes, timeout))
+        content = self.files.get(remote_path)
+        if content is None:
+            return RangeResult(success=False, error="missing evidence")
+        return RangeResult(
+            success=True,
+            new_data=content[start : start + max_chunk_bytes],
+            new_size=len(content),
+        )
+
+    async def download_to_local(self, *_args: object, **_kwargs: object) -> bool:
+        raise AssertionError("Harbor evidence must use ranged download")
+
+    async def read_file(self, *_args: object, **_kwargs: object) -> bytes:
+        raise AssertionError("Harbor evidence must not use VM bounded-read/base64 paths")
+
+
+def _reward_bytes(score: float = 0.75, outcome: str = "valid") -> bytes:
+    return json.dumps(
+        {
+            "score": score,
+            "outcome": outcome,
+            "report": {"hard_gate_passed": outcome != "invalid_output"},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+
+
+@pytest.mark.asyncio
+async def test_stage_harbor_evidence_ranges_exact_files_and_returns_compact_provenance(
+    tmp_path: Path,
+) -> None:
+    request = _make_evaluate_request(tmp_path)
+    reward_bytes = _reward_bytes()
+    details_bytes = b'{"criteria":{"quality":{"score":0.75}}}'
+    sandbox = _EvidenceSandbox(
+        {
+            "/logs/verifier/reward.json": reward_bytes,
+            "/logs/verifier/reward-details.json": details_bytes,
+        }
+    )
+    evaluate_module = import_module("ale_run.atomic.evaluate")
+
+    provenance, evidence_paths = await evaluate_module._stage_harbor_evidence(
+        sandbox,
+        request,
+        {"score": 0.75, "outcome": "valid", "report": {"hard_gate_passed": True}},
+        "valid",
+        tmp_path / "private-evidence",
+    )
+
+    assert provenance == HarborProvenance(
+        reward=json.loads(reward_bytes),
+        reward_path="evidence/reward.json",
+        reward_sha256=hashlib.sha256(reward_bytes).hexdigest(),
+        details_path="evidence/reward-details.json",
+        details_sha256=hashlib.sha256(details_bytes).hexdigest(),
+    )
+    assert evidence_paths["reward.json"].read_bytes() == reward_bytes
+    assert evidence_paths["reward-details.json"].read_bytes() == details_bytes
+    assert [call[0] for call in sandbox.range_calls] == [
+        "/logs/verifier/reward.json",
+        "/logs/verifier/reward-details.json",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("remote_path", "content", "message"),
+    [
+        ("/logs/verifier/reward.json", None, "reward.json"),
+        ("/logs/verifier/reward-details.json", None, "reward-details.json"),
+        ("/logs/verifier/reward.json", b"not-json", "JSON object"),
+        ("/logs/verifier/reward.json", b"[]", "JSON object"),
+        ("/logs/verifier/reward.json", b"{}", "non-empty"),
+        ("/logs/verifier/reward-details.json", b"null", "JSON object"),
+        ("/logs/verifier/reward-details.json", b"{} trailing", "JSON object"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_stage_harbor_evidence_rejects_missing_or_malformed_objects(
+    remote_path: str,
+    content: bytes | None,
+    message: str,
+    tmp_path: Path,
+) -> None:
+    request = _make_evaluate_request(tmp_path)
+    files: dict[str, bytes | None] = {
+        "/logs/verifier/reward.json": _reward_bytes(),
+        "/logs/verifier/reward-details.json": b"{}",
+    }
+    files[remote_path] = content
+    evaluate_module = import_module("ale_run.atomic.evaluate")
+
+    with pytest.raises(AtomicInfrastructureError, match=message) as caught:
+        await evaluate_module._stage_harbor_evidence(
+            _EvidenceSandbox(files),
+            request,
+            {"score": 0.75, "outcome": "valid", "report": {"hard_gate_passed": True}},
+            "valid",
+            tmp_path / "private-evidence",
+        )
+
+    assert caught.value.category == "evaluator"
+
+
+@pytest.mark.parametrize(
+    "reward_update",
+    [
+        {"score": 0.5},
+        {"outcome": "invalid_output"},
+        {"report": {"hard_gate_passed": False}},
+        {"submission_id": "00000000-0000-0000-0000-000000000000"},
+        {"evaluator_id": "other-evaluator"},
+    ],
+)
+@pytest.mark.asyncio
+async def test_stage_harbor_evidence_rejects_protocol_or_identity_mismatch(
+    reward_update: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    request = _make_evaluate_request(tmp_path)
+    reward: dict[str, object] = {
+        "score": 0.75,
+        "outcome": "valid",
+        "report": {"hard_gate_passed": True},
+    }
+    reward.update(reward_update)
+    evaluate_module = import_module("ale_run.atomic.evaluate")
+
+    with pytest.raises(AtomicInfrastructureError, match="mismatch") as caught:
+        await evaluate_module._stage_harbor_evidence(
+            _EvidenceSandbox(
+                {
+                    "/logs/verifier/reward.json": json.dumps(reward).encode(),
+                    "/logs/verifier/reward-details.json": b"{}",
+                }
+            ),
+            request,
+            {"score": 0.75, "outcome": "valid", "report": {"hard_gate_passed": True}},
+            "valid",
+            tmp_path / "private-evidence",
+        )
+
+    assert caught.value.category == "evaluator"
+
+
+@pytest.mark.asyncio
+async def test_stage_harbor_evidence_accepts_inclusive_reward_and_combined_caps(
+    tmp_path: Path,
+) -> None:
+    request = _make_evaluate_request(tmp_path)
+    evaluate_module = import_module("ale_run.atomic.evaluate")
+    reward_prefix = b'{"score":0.75}'
+    reward_at_cap = reward_prefix + b" " * (
+        evaluate_module._MAX_REWARD_EVIDENCE_BYTES - len(reward_prefix)
+    )
+    first_provenance, _ = await evaluate_module._stage_harbor_evidence(
+        _EvidenceSandbox(
+            {
+                "/logs/verifier/reward.json": reward_at_cap,
+                "/logs/verifier/reward-details.json": b"{}",
+            }
+        ),
+        request,
+        {"score": 0.75},
+        "valid",
+        tmp_path / "reward-at-cap",
+    )
+
+    compact_reward = reward_prefix
+    details_at_total_cap = b"{}" + b" " * (
+        evaluate_module._MAX_HARBOR_EVIDENCE_BYTES - len(compact_reward) - 2
+    )
+    second_provenance, paths = await evaluate_module._stage_harbor_evidence(
+        _EvidenceSandbox(
+            {
+                "/logs/verifier/reward.json": compact_reward,
+                "/logs/verifier/reward-details.json": details_at_total_cap,
+            }
+        ),
+        request,
+        {"score": 0.75},
+        "valid",
+        tmp_path / "total-at-cap",
+    )
+
+    assert first_provenance.reward_sha256 == hashlib.sha256(reward_at_cap).hexdigest()
+    assert second_provenance.details_sha256 == hashlib.sha256(details_at_total_cap).hexdigest()
+    assert sum(path.stat().st_size for path in paths.values()) == 8 * 1024 * 1024
+
+
+@pytest.mark.parametrize("kind", ["reward", "details", "combined", "stream-overrun"])
+@pytest.mark.asyncio
+async def test_stage_harbor_evidence_rejects_size_overruns_before_publication(
+    kind: str,
+    tmp_path: Path,
+) -> None:
+    request = _make_evaluate_request(tmp_path)
+    evaluate_module = import_module("ale_run.atomic.evaluate")
+    reward = _reward_bytes()
+    details = b"{}"
+    if kind == "reward":
+        reward += b" " * (evaluate_module._MAX_REWARD_EVIDENCE_BYTES + 1 - len(reward))
+    elif kind == "details":
+        details += b" " * (evaluate_module._MAX_DETAILS_EVIDENCE_BYTES + 1 - len(details))
+    elif kind == "combined":
+        details += b" " * (
+            evaluate_module._MAX_HARBOR_EVIDENCE_BYTES + 1 - len(reward) - len(details)
+        )
+
+    sandbox = _EvidenceSandbox(
+        {
+            "/logs/verifier/reward.json": reward,
+            "/logs/verifier/reward-details.json": details,
+        }
+    )
+    if kind == "stream-overrun":
+
+        async def overrun(
+            remote_path: str,
+            *,
+            start: int,
+            max_chunk_bytes: int,
+            timeout: float,
+        ) -> RangeResult:
+            del remote_path, start, max_chunk_bytes, timeout
+            return RangeResult(success=True, new_data=b"too much", new_size=10**9)
+
+        sandbox.download_range = overrun  # type: ignore[method-assign]
+
+    with pytest.raises(AtomicInfrastructureError) as caught:
+        await evaluate_module._stage_harbor_evidence(
+            sandbox,
+            request,
+            {"score": 0.75, "outcome": "valid", "report": {"hard_gate_passed": True}},
+            "valid",
+            tmp_path / "private-evidence",
+        )
+
+    assert caught.value.category == "evaluator"
+
+
 def _patch_happy_path(
     monkeypatch: pytest.MonkeyPatch,
     request: EvaluateRequest,
     *,
     sandbox_result: dict[str, object] | None = None,
+    evidence_reward: dict[str, object] | None = None,
 ) -> tuple[object, list[str], list[tuple[str, object]]]:
     evaluate_module = import_module("ale_run.atomic.evaluate")
     events: list[str] = []
@@ -265,9 +531,30 @@ def _patch_happy_path(
             log="bounded evaluator log",
         )
 
-    async def publish(_sandbox, actual_request, result):
+    async def stage_evidence(_sandbox, actual_request, raw_result, outcome, staging_dir):
+        events.append("stage evidence")
+        assert actual_request is request
+        reward = evidence_reward or raw_result
+        reward_bytes = json.dumps(reward, sort_keys=True, separators=(",", ":")).encode()
+        reward_path = staging_dir / "reward.json"
+        details_path = staging_dir / "reward-details.json"
+        reward_path.write_bytes(reward_bytes)
+        details_path.write_bytes(b"{}")
+        return (
+            HarborProvenance(
+                reward=reward,
+                reward_path="evidence/reward.json",
+                reward_sha256=hashlib.sha256(reward_bytes).hexdigest(),
+                details_path="evidence/reward-details.json",
+                details_sha256=hashlib.sha256(b"{}").hexdigest(),
+            ),
+            {"reward.json": reward_path, "reward-details.json": details_path},
+        )
+
+    async def publish(actual_request, result, evidence_paths):
         events.append("publish result")
         assert actual_request is request
+        assert set(evidence_paths) == {"reward.json", "reward-details.json"}
         return "oss://canonical/result.json"
 
     async def record_diagnostic(actual_request, attempt_id, error):
@@ -300,6 +587,7 @@ def _patch_happy_path(
     monkeypatch.setattr(evaluate_module, "stage_submission", stage_submission)
     monkeypatch.setattr(evaluate_module, "SandboxExecutor", Executor)
     monkeypatch.setattr(evaluate_module, "evaluate_in_sandbox", run_evaluator)
+    monkeypatch.setattr(evaluate_module, "_stage_harbor_evidence", stage_evidence)
     monkeypatch.setattr(evaluate_module, "publish_evaluation_result", publish)
     monkeypatch.setattr(evaluate_module, "_record_attempt_diagnostic", record_diagnostic)
     monkeypatch.setattr(
@@ -333,6 +621,7 @@ async def test_evaluate_runs_precise_independent_order_and_returns_normal_score(
         "stage submission",
         "stage runtime",
         "run evaluator",
+        "stage evidence",
         "publish result",
         "cleanup",
     ]
@@ -507,10 +796,35 @@ async def test_evaluate_real_atomic_runtime_orders_input_and_independent_boundar
             log="",
         )
 
-    async def publish(_sandbox, actual_request, result):
+    async def stage_evidence(_sandbox, actual_request, raw_result, outcome, staging_dir):
+        events.append("stage evidence")
+        assert actual_request is request
+        assert outcome == "valid"
+        reward_bytes = json.dumps(
+            raw_result,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        reward_path = staging_dir / "reward.json"
+        details_path = staging_dir / "reward-details.json"
+        reward_path.write_bytes(reward_bytes)
+        details_path.write_bytes(b"{}")
+        return (
+            HarborProvenance(
+                reward=raw_result,
+                reward_path="evidence/reward.json",
+                reward_sha256=hashlib.sha256(reward_bytes).hexdigest(),
+                details_path="evidence/reward-details.json",
+                details_sha256=hashlib.sha256(b"{}").hexdigest(),
+            ),
+            {"reward.json": reward_path, "reward-details.json": details_path},
+        )
+
+    async def publish(actual_request, result, evidence_paths):
         events.append("publish result")
         assert actual_request is request
         assert result == _scored_result(request)
+        assert set(evidence_paths) == {"reward.json", "reward-details.json"}
         return "oss://canonical/result.json"
 
     monkeypatch.setattr(runtime_module, "load_experiment", lambda _path: runtime_spec)
@@ -536,6 +850,7 @@ async def test_evaluate_real_atomic_runtime_orders_input_and_independent_boundar
     monkeypatch.setattr(evaluate_module, "stage_submission", stage_submission)
     monkeypatch.setattr(evaluate_module, "SandboxExecutor", Executor)
     monkeypatch.setattr(evaluate_module, "evaluate_in_sandbox", run_evaluator)
+    monkeypatch.setattr(evaluate_module, "_stage_harbor_evidence", stage_evidence)
     monkeypatch.setattr(evaluate_module, "publish_evaluation_result", publish)
     monkeypatch.setattr(evaluate_module, "_evaluator_environment", dict)
 
@@ -551,6 +866,7 @@ async def test_evaluate_real_atomic_runtime_orders_input_and_independent_boundar
         "stage submission",
         "stage runtime",
         "run evaluator",
+        "stage evidence",
         "publish result",
         "cleanup",
     ]
@@ -868,6 +1184,58 @@ async def test_evaluator_error_result_is_not_converted_to_zero(
 
 
 @pytest.mark.asyncio
+async def test_evidence_failure_records_only_attempt_and_never_publishes_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _make_evaluate_request(tmp_path)
+    evaluate_module, events, diagnostics = _patch_happy_path(monkeypatch, request)
+
+    async def fail_evidence(*_args, **_kwargs):
+        events.append("stage evidence")
+        raise AtomicInfrastructureError("evaluator", "reward-details.json is malformed")
+
+    monkeypatch.setattr(evaluate_module, "_stage_harbor_evidence", fail_evidence)
+
+    result = await evaluate_module.evaluate(request)
+
+    _assert_infra_result(result, request)
+    assert "publish result" not in events
+    assert events[-1] == "cleanup"
+    assert len(diagnostics) == 1
+    assert diagnostics[0][1].category == "evaluator"
+
+
+@pytest.mark.asyncio
+async def test_result_envelope_omits_full_raw_evaluator_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _make_evaluate_request(tmp_path)
+    marker = "raw-private-payload-" + "x" * 50_000
+    reward = {"reward": 0.75}
+    evaluate_module, _events, diagnostics = _patch_happy_path(
+        monkeypatch,
+        request,
+        sandbox_result={
+            "score": 0.75,
+            "outcome": "valid",
+            "report": {"hard_gate_passed": True},
+            "raw_judge_payload": marker,
+        },
+        evidence_reward=reward,
+    )
+
+    result = await evaluate_module.evaluate(request)
+
+    assert result == _scored_result(request, reward=reward)
+    envelope = result.model_dump_json().encode()
+    assert marker.encode() not in envelope
+    assert len(envelope) <= 64 * 1024
+    assert diagnostics == []
+
+
+@pytest.mark.asyncio
 async def test_existing_valid_result_returns_without_vm_provisioning(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -977,6 +1345,7 @@ async def test_cleanup_failure_after_publish_preserves_durable_scored_result(
         "stage submission",
         "stage runtime",
         "run evaluator",
+        "stage evidence",
         "publish result",
         "cleanup",
         "cleanup diagnostic",

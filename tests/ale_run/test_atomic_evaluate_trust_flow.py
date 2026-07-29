@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -110,11 +111,34 @@ async def test_evaluate_gates_and_materializes_before_runtime_then_emits_v1_resu
         events.append("evaluator")
         return SandboxEvaluationResult(result=raw_reward, log="")
 
-    async def publish(_sandbox, actual_request, result):
+    reward_bytes = json.dumps(raw_reward, sort_keys=True, separators=(",", ":")).encode()
+
+    async def stage_evidence(_sandbox, actual_request, result, outcome, staging_dir):
+        assert actual_request is request
+        assert result is raw_reward
+        assert outcome == "valid"
+        events.append("evidence")
+        reward_path = staging_dir / "reward.json"
+        details_path = staging_dir / "reward-details.json"
+        reward_path.write_bytes(reward_bytes)
+        details_path.write_bytes(b"{}")
+        return (
+            HarborProvenance(
+                reward=raw_reward,
+                reward_path="evidence/reward.json",
+                reward_sha256=hashlib.sha256(reward_bytes).hexdigest(),
+                details_path="evidence/reward-details.json",
+                details_sha256=hashlib.sha256(b"{}").hexdigest(),
+            ),
+            {"reward.json": reward_path, "reward-details.json": details_path},
+        )
+
+    async def publish(actual_request, result, evidence_paths):
         assert actual_request is request
         events.append("publish")
         assert result.harbor is not None
         assert result.harbor.reward == raw_reward
+        assert set(evidence_paths) == {"reward.json", "reward-details.json"}
         return "oss://canonical/result.json"
 
     async def record_diagnostic(*_args, **_kwargs):
@@ -134,6 +158,7 @@ async def test_evaluate_gates_and_materializes_before_runtime_then_emits_v1_resu
     monkeypatch.setattr(evaluate_module, "stage_submission", stage_submission)
     monkeypatch.setattr(evaluate_module, "SandboxExecutor", Executor)
     monkeypatch.setattr(evaluate_module, "evaluate_in_sandbox", run_evaluator)
+    monkeypatch.setattr(evaluate_module, "_stage_harbor_evidence", stage_evidence)
     monkeypatch.setattr(evaluate_module, "publish_evaluation_result", publish)
     monkeypatch.setattr(
         evaluate_module,
@@ -163,7 +188,10 @@ async def test_evaluate_gates_and_materializes_before_runtime_then_emits_v1_resu
         rubric_hash=record_payload["rubric_hash"],
         harbor=HarborProvenance(
             reward=raw_reward,
+            reward_path="evidence/reward.json",
+            reward_sha256=hashlib.sha256(reward_bytes).hexdigest(),
             details_path="evidence/reward-details.json",
+            details_sha256=hashlib.sha256(b"{}").hexdigest(),
         ),
     )
     assert events == [
@@ -173,6 +201,7 @@ async def test_evaluate_gates_and_materializes_before_runtime_then_emits_v1_resu
         "submission",
         "stage runtime",
         "evaluator",
+        "evidence",
         "publish",
         "cleanup",
     ]
@@ -301,7 +330,10 @@ async def test_existing_canonical_result_must_match_full_trusted_identity(
         rubric_hash=record_payload["rubric_hash"],
         harbor=HarborProvenance(
             reward={"score": 0.75},
+            reward_path="evidence/reward.json",
+            reward_sha256=hashlib.sha256(b'{"score":0.75}').hexdigest(),
             details_path="evidence/reward-details.json",
+            details_sha256=hashlib.sha256(b"{}").hexdigest(),
         ),
     ).model_copy(update={field: value})
     raw = json.dumps(

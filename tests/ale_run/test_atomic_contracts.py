@@ -1,3 +1,4 @@
+import hashlib
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -216,7 +217,10 @@ def test_evaluation_result_enforces_score_and_infrastructure_failure_shape():
         "rubric_hash": "c" * 64,
         "harbor": HarborProvenance(
             reward={"score": 1.0},
+            reward_path="evidence/reward.json",
+            reward_sha256=hashlib.sha256(b'{"score":1.0}').hexdigest(),
             details_path="evidence/reward-details.json",
+            details_sha256=hashlib.sha256(b"{}").hexdigest(),
         ),
     }
     infra = {

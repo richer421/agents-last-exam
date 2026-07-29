@@ -1,3 +1,4 @@
+import hashlib
 import json
 from datetime import UTC, datetime
 from uuid import uuid4
@@ -92,7 +93,10 @@ def test_scored_result_requires_complete_identity_and_harbor_provenance() -> Non
         rubric_hash="c" * 64,
         harbor=HarborProvenance(
             reward={"rubric": 0.82},
+            reward_path="evidence/reward.json",
+            reward_sha256=hashlib.sha256(b'{"rubric":0.82}').hexdigest(),
             details_path="evidence/reward-details.json",
+            details_sha256=hashlib.sha256(b"{}").hexdigest(),
         ),
     )
 
@@ -114,8 +118,49 @@ def test_scored_result_requires_complete_identity_and_harbor_provenance() -> Non
             rubric_hash="c" * 64,
             harbor=HarborProvenance(
                 reward={"hard_gate": 0.0},
+                reward_path="evidence/reward.json",
+                reward_sha256=hashlib.sha256(b'{"hard_gate":0.0}').hexdigest(),
                 details_path="evidence/reward-details.json",
+                details_sha256=hashlib.sha256(b"{}").hexdigest(),
             ),
+        )
+
+
+def test_harbor_provenance_requires_canonical_evidence_paths_and_digests() -> None:
+    digest = hashlib.sha256(b"{}").hexdigest()
+    provenance = HarborProvenance(
+        reward={"reward": 0.82},
+        reward_path="evidence/reward.json",
+        reward_sha256=digest,
+        details_path="evidence/reward-details.json",
+        details_sha256=digest,
+    )
+
+    assert provenance.reward_path == "evidence/reward.json"
+    assert provenance.details_path == "evidence/reward-details.json"
+    with pytest.raises(ValidationError):
+        HarborProvenance(
+            reward={"reward": 0.82},
+            reward_path="evidence/other.json",
+            reward_sha256=digest,
+            details_path="evidence/reward-details.json",
+            details_sha256=digest,
+        )
+    with pytest.raises(ValidationError):
+        HarborProvenance(
+            reward={},
+            reward_path="evidence/reward.json",
+            reward_sha256=digest,
+            details_path="evidence/reward-details.json",
+            details_sha256=digest,
+        )
+    with pytest.raises(ValidationError):
+        HarborProvenance(
+            reward={"reward": 0.82},
+            reward_path="evidence/reward.json",
+            reward_sha256="not-a-digest",
+            details_path="evidence/reward-details.json",
+            details_sha256=digest,
         )
 
 

@@ -972,11 +972,11 @@ def _evaluator_segment(evaluator_id: str) -> str:
 
 
 async def publish_evaluation_result(
-    sandbox: SandboxHandle,
     request: EvaluateRequest,
     result: EvaluationResult,
+    evidence_paths: Mapping[str, Path],
 ) -> str:
-    """Publish canonical evaluator output without overwriting an occupied key."""
+    """Publish immutable Harbor evidence and commit canonical result.json last."""
     if result.status != "scored":
         raise AtomicInfrastructureError(
             "submission_integrity",
@@ -999,72 +999,161 @@ async def publish_evaluation_result(
             "submission_integrity",
             f"evaluation result identity mismatch: {', '.join(mismatches)}",
         )
-    await ossbucket.ensure_ossutil(sandbox)
     result_bytes = _canonical_json(result.model_dump(mode="json"))
     if len(result_bytes) > _MAX_RESULT_BYTES:
         raise AtomicInfrastructureError(
             "submission_integrity", "evaluation result exceeds the 64 KiB limit"
         )
+    if result.harbor is None:
+        raise AtomicInfrastructureError(
+            "submission_integrity", "scored result is missing Harbor provenance"
+        )
+    expected_evidence = {
+        "reward.json": result.harbor.reward_sha256,
+        "reward-details.json": result.harbor.details_sha256,
+    }
+    if set(evidence_paths) != set(expected_evidence):
+        raise AtomicInfrastructureError(
+            "submission_integrity", "evaluation evidence paths are incomplete"
+        )
+
+    evidence_rows: list[tuple[str, Path, int, str]] = []
+    for name, expected_sha256 in expected_evidence.items():
+        local_path = Path(evidence_paths[name])
+        if local_path.is_symlink() or not local_path.is_file():
+            raise AtomicInfrastructureError(
+                "submission_integrity", f"staged {name} is missing or unsafe"
+            )
+        size = local_path.stat().st_size
+        actual_sha256 = await asyncio.to_thread(_local_sha256, local_path)
+        if actual_sha256 != expected_sha256:
+            raise AtomicInfrastructureError(
+                "submission_integrity", f"staged {name} SHA-256 mismatch"
+            )
+        evidence_rows.append((name, local_path, size, actual_sha256))
+
+    reward_raw = evidence_rows[0][1].read_bytes()
+    try:
+        reward_value = json.loads(reward_raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AtomicInfrastructureError(
+            "submission_integrity", f"staged reward.json is invalid: {exc}"
+        ) from exc
+    if reward_value != result.harbor.reward:
+        raise AtomicInfrastructureError(
+            "submission_integrity",
+            "staged reward.json does not match Harbor provenance",
+        )
+
     result_url = (
         f"{_submission_prefix(request)}/evaluations/"
         f"{_evaluator_segment(request.evaluator_id)}/"
         f"{request.evaluator_version}/result.json"
     )
-    nonce = uuid4().hex
-    local_result = _sandbox_temp_path(
-        sandbox, f"ale-atomic-result-{request.submission_id}-{nonce}.json"
-    )
-    existing_result = _sandbox_temp_path(
-        sandbox, f"ale-atomic-existing-result-{request.submission_id}-{nonce}.json"
-    )
-    await sandbox.write_file(local_result, result_bytes)
+    evaluation_prefix = result_url.removesuffix("/result.json")
+    for name, local_path, size, digest in evidence_rows:
+        await _publish_immutable_host_object(
+            local_path,
+            f"{evaluation_prefix}/evidence/{name}",
+            size=size,
+            sha256=digest,
+        )
 
-    existing_download = await _download(sandbox, result_url, existing_result)
-    if existing_download.returncode == 0:
-        await _require_identical_result(sandbox, existing_result, result_bytes)
+    with tempfile.TemporaryDirectory(prefix="ale-evaluation-result-") as temp_dir:
+        local_result = Path(temp_dir) / "result.json"
+        local_result.write_bytes(result_bytes)
+        uploaded = await run_host_ossutil(
+            "cp",
+            str(local_result),
+            result_url,
+            "--forbid-overwrite",
+        )
+    if uploaded[0] == 0:
         return result_url
 
-    upload = _oss_call(
-        sandbox,
-        "cp "
-        f"{_quote_oss_argument(sandbox, local_result)} "
-        f"{_quote_oss_argument(sandbox, result_url)} --forbid-overwrite",
-    )
-    uploaded = await sandbox.run_command(upload, timeout=_COMMAND_TIMEOUT_SECONDS)
-    if uploaded.returncode == 0:
-        return result_url
-
-    raced_download = await _download(sandbox, result_url, existing_result)
-    if raced_download.returncode == 0:
-        await _require_identical_result(sandbox, existing_result, result_bytes)
-        return result_url
-    raise AtomicInfrastructureError(
-        "submission_storage",
-        f"result upload failed: {_command_diagnostic(uploaded)}",
-    )
-
-
-async def _require_identical_result(
-    sandbox: SandboxHandle,
-    existing_path: str,
-    expected: bytes,
-) -> None:
-    existing = await _read_remote_bounded(
-        sandbox,
-        existing_path,
+    existing = await read_host_oss_object(
+        result_url,
         limit=_MAX_RESULT_BYTES,
-        category="idempotency_conflict",
+        missing_ok=True,
+        integrity_category="idempotency_conflict",
     )
+    if existing is None:
+        raise AtomicInfrastructureError(
+            "submission_storage",
+            f"result upload failed: {host_command_diagnostic(uploaded)}",
+        )
     try:
         EvaluationResult.model_validate_json(existing)
     except ValidationError as exc:
         raise AtomicInfrastructureError(
             "idempotency_conflict", f"existing result.json is invalid: {exc}"
         ) from exc
-    if existing != expected:
+    if existing != result_bytes:
         raise AtomicInfrastructureError(
             "idempotency_conflict",
             "result.json already exists with different canonical bytes",
+        )
+    return result_url
+
+
+async def _publish_immutable_host_object(
+    local_path: Path,
+    url: str,
+    *,
+    size: int,
+    sha256: str,
+) -> None:
+    uploaded = await run_host_ossutil(
+        "cp",
+        str(local_path),
+        url,
+        "--forbid-overwrite",
+        "--meta",
+        f"x-oss-meta-sha256:{sha256}",
+    )
+    if uploaded[0] == 0:
+        stat_result = await run_host_ossutil("stat", url)
+        if stat_result[0] != 0:
+            raise AtomicInfrastructureError(
+                "submission_storage",
+                f"cannot verify published evidence {url}: {host_command_diagnostic(stat_result)}",
+            )
+        output = stat_result[1].decode("utf-8", errors="replace")
+        size_match = re.search(
+            r"(?im)^\s*(?:content[- ]?length|size)\s*[:=]\s*(\d+)\s*$",
+            output,
+        )
+        digest_match = re.search(
+            r"(?i)x-oss-meta-sha256\s*[:=]\s*([0-9a-f]{64})",
+            output,
+        )
+        if (
+            size_match is None
+            or digest_match is None
+            or int(size_match.group(1)) != size
+            or digest_match.group(1).lower() != sha256
+        ):
+            raise AtomicInfrastructureError(
+                "submission_storage",
+                f"published evidence verification mismatch: {url}",
+            )
+        return
+
+    existing = await read_host_oss_object(
+        url,
+        limit=size,
+        missing_ok=True,
+        integrity_category="idempotency_conflict",
+    )
+    if existing is None:
+        raise AtomicInfrastructureError(
+            "submission_storage",
+            f"evidence upload failed: {host_command_diagnostic(uploaded)}",
+        )
+    if len(existing) != size or hashlib.sha256(existing).hexdigest() != sha256:
+        raise AtomicInfrastructureError(
+            "idempotency_conflict",
+            f"evidence already exists with different bytes: {url}",
         )
 
 

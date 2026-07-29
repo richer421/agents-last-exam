@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -36,6 +37,7 @@ from .oss_submission import (
     _submission_prefix,
     _task_card_path,
     _validate_manifest_identity,
+    download_range_to_local,
     publish_evaluation_result,
     stage_submission,
 )
@@ -47,6 +49,10 @@ _MAX_HOST_OSS_OUTPUT_BYTES = 64 * 1024
 _MAX_MANIFEST_BYTES = 1024 * 1024
 _MAX_RESULT_BYTES = 64 * 1024
 _MAX_TASK_CARD_BYTES = 1024 * 1024
+_MAX_REWARD_EVIDENCE_BYTES = 32 * 1024
+_MAX_DETAILS_EVIDENCE_BYTES = 8 * 1024 * 1024
+_MAX_HARBOR_EVIDENCE_BYTES = 8 * 1024 * 1024
+_EVIDENCE_DOWNLOAD_TIMEOUT_S = 120
 _HOST_OSS_TIMEOUT_S = 300
 _CANONICAL_RESULT = object()
 _EVALUATOR_ENV_KEYS = frozenset(
@@ -131,61 +137,72 @@ async def evaluate(request: EvaluateRequest) -> EvaluationResult:
                             f"ALE runtime staging failed: {type(exc).__name__}: {exc}",
                         ) from exc
 
-                    try:
-                        evaluated = await evaluate_in_sandbox(
-                            sandbox=sandbox,
-                            ale_src_root=_ale_src_root_for(sandbox),
-                            task_path=runtime.task_dir,
-                            variant=request.variant_index,
-                            timeout_s=float(_EVAL_TIMEOUT_S),
-                            evaluator_env=_evaluator_environment(),
-                        )
-                        raw_result = evaluated.result
-                        if raw_result.get("error"):
+                    with tempfile.TemporaryDirectory(
+                        prefix="ale-evaluate-evidence-"
+                    ) as evidence_dir:
+                        try:
+                            evaluated = await evaluate_in_sandbox(
+                                sandbox=sandbox,
+                                ale_src_root=_ale_src_root_for(sandbox),
+                                task_path=runtime.task_dir,
+                                variant=request.variant_index,
+                                timeout_s=float(_EVAL_TIMEOUT_S),
+                                evaluator_env=_evaluator_environment(),
+                            )
+                            raw_result = evaluated.result
+                            if raw_result.get("error"):
+                                raise AtomicInfrastructureError(
+                                    "evaluator",
+                                    str(raw_result["error"]),
+                                )
+                            report = raw_result.get("report") or {}
+                            outcome = (
+                                "invalid_output"
+                                if report.get("hard_gate_passed") is False
+                                else str(raw_result.get("outcome") or "valid")
+                            )
+                            harbor, evidence_paths = await _stage_harbor_evidence(
+                                sandbox,
+                                request,
+                                raw_result,
+                                outcome,
+                                Path(evidence_dir),
+                            )
+                            result = EvaluationResult(
+                                **_evaluation_identity(request),
+                                status="scored",
+                                outcome=outcome,
+                                score=float(raw_result["score"]),
+                                rubric_hash=registry_record.rubric_hash,
+                                harbor=harbor,
+                            )
+                            _validate_scored_result_state(
+                                result,
+                                hard_gate_passed=report.get("hard_gate_passed"),
+                                category="evaluator",
+                            )
+                        except AtomicInfrastructureError:
+                            raise
+                        except Exception as exc:
                             raise AtomicInfrastructureError(
                                 "evaluator",
-                                str(raw_result["error"]),
-                            )
-                        report = raw_result.get("report") or {}
-                        outcome = (
-                            "invalid_output"
-                            if report.get("hard_gate_passed") is False
-                            else str(raw_result.get("outcome") or "valid")
-                        )
-                        result = EvaluationResult(
-                            **_evaluation_identity(request),
-                            status="scored",
-                            outcome=outcome,
-                            score=float(raw_result["score"]),
-                            rubric_hash=registry_record.rubric_hash,
-                            harbor=HarborProvenance(
-                                reward=raw_result,
-                                details_path="evidence/reward-details.json",
-                            ),
-                        )
-                        _validate_scored_result_state(
-                            result,
-                            hard_gate_passed=report.get("hard_gate_passed"),
-                            category="evaluator",
-                        )
-                    except AtomicInfrastructureError:
-                        raise
-                    except Exception as exc:
-                        raise AtomicInfrastructureError(
-                            "evaluator",
-                            f"{type(exc).__name__}: {exc}",
-                        ) from exc
+                                f"{type(exc).__name__}: {exc}",
+                            ) from exc
 
-                    try:
-                        await publish_evaluation_result(sandbox, request, result)
-                    except AtomicInfrastructureError:
-                        raise
-                    except Exception as exc:
-                        raise AtomicInfrastructureError(
-                            "submission_storage",
-                            f"result publication failed: {type(exc).__name__}: {exc}",
-                        ) from exc
-                    committed_result = result
+                        try:
+                            await publish_evaluation_result(
+                                request,
+                                result,
+                                evidence_paths,
+                            )
+                        except AtomicInfrastructureError:
+                            raise
+                        except Exception as exc:
+                            raise AtomicInfrastructureError(
+                                "submission_storage",
+                                f"result publication failed: {type(exc).__name__}: {exc}",
+                            ) from exc
+                        committed_result = result
         except Exception as exc:
             if committed_result is None:
                 raise
@@ -293,6 +310,171 @@ def _validate_scored_result_state(
             category,
             "illegal scored result state: invalid_output requires an exact "
             "0.0 score and evaluator hard-gate failure",
+        )
+
+
+async def _stage_harbor_evidence(
+    sandbox: Any,
+    request: EvaluateRequest,
+    raw_result: dict[str, Any],
+    outcome: str,
+    staging_dir: Path,
+) -> tuple[HarborProvenance, dict[str, Path]]:
+    staging_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    reward_path = staging_dir / "reward.json"
+    details_path = staging_dir / "reward-details.json"
+    try:
+        await download_range_to_local(
+            sandbox,
+            "/logs/verifier/reward.json",
+            reward_path,
+            max_bytes=_MAX_REWARD_EVIDENCE_BYTES,
+            timeout=_EVIDENCE_DOWNLOAD_TIMEOUT_S,
+        )
+    except Exception as exc:
+        raise AtomicInfrastructureError(
+            "evaluator",
+            f"reward.json download failed: {type(exc).__name__}: {exc}",
+        ) from exc
+    reward_size = reward_path.stat().st_size
+    details_limit = min(
+        _MAX_DETAILS_EVIDENCE_BYTES,
+        _MAX_HARBOR_EVIDENCE_BYTES - reward_size,
+    )
+    try:
+        await download_range_to_local(
+            sandbox,
+            "/logs/verifier/reward-details.json",
+            details_path,
+            max_bytes=details_limit,
+            timeout=_EVIDENCE_DOWNLOAD_TIMEOUT_S,
+        )
+    except Exception as exc:
+        raise AtomicInfrastructureError(
+            "evaluator",
+            f"reward-details.json download failed: {type(exc).__name__}: {exc}",
+        ) from exc
+
+    reward_bytes = reward_path.read_bytes()
+    details_bytes = details_path.read_bytes()
+    if len(reward_bytes) > _MAX_REWARD_EVIDENCE_BYTES:
+        raise AtomicInfrastructureError("evaluator", "reward.json exceeds its 32 KiB limit")
+    if len(details_bytes) > _MAX_DETAILS_EVIDENCE_BYTES:
+        raise AtomicInfrastructureError("evaluator", "reward-details.json exceeds its 8 MiB limit")
+    if len(reward_bytes) + len(details_bytes) > _MAX_HARBOR_EVIDENCE_BYTES:
+        raise AtomicInfrastructureError(
+            "evaluator", "Harbor evidence exceeds its combined 8 MiB limit"
+        )
+
+    reward = _parse_evidence_object(reward_bytes, name="reward.json")
+    details = _parse_evidence_object(details_bytes, name="reward-details.json")
+    if not reward:
+        raise AtomicInfrastructureError(
+            "evaluator", "reward.json must contain a non-empty JSON object"
+        )
+    _validate_evidence_identity(reward, request, name="reward.json")
+    _validate_evidence_identity(details, request, name="reward-details.json")
+    _validate_reward_protocol(reward, raw_result, outcome)
+
+    reward_sha256 = hashlib.sha256(reward_bytes).hexdigest()
+    details_sha256 = hashlib.sha256(details_bytes).hexdigest()
+    if reward_path.stat().st_size != len(reward_bytes):
+        raise AtomicInfrastructureError("evaluator", "reward.json size changed after staging")
+    if details_path.stat().st_size != len(details_bytes):
+        raise AtomicInfrastructureError(
+            "evaluator", "reward-details.json size changed after staging"
+        )
+    if hashlib.sha256(reward_path.read_bytes()).hexdigest() != reward_sha256:
+        raise AtomicInfrastructureError("evaluator", "reward.json changed after staging")
+    if hashlib.sha256(details_path.read_bytes()).hexdigest() != details_sha256:
+        raise AtomicInfrastructureError("evaluator", "reward-details.json changed after staging")
+
+    return (
+        HarborProvenance(
+            reward=reward,
+            reward_path="evidence/reward.json",
+            reward_sha256=reward_sha256,
+            details_path="evidence/reward-details.json",
+            details_sha256=details_sha256,
+        ),
+        {"reward.json": reward_path, "reward-details.json": details_path},
+    )
+
+
+def _parse_evidence_object(raw: bytes, *, name: str) -> dict[str, Any]:
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AtomicInfrastructureError(
+            "evaluator", f"{name} must be one complete JSON object: {exc}"
+        ) from exc
+    if not isinstance(value, dict):
+        raise AtomicInfrastructureError("evaluator", f"{name} must be a JSON object")
+    return value
+
+
+def _validate_evidence_identity(
+    evidence: dict[str, Any],
+    request: EvaluateRequest,
+    *,
+    name: str,
+) -> None:
+    expected = {
+        "submission_id": str(request.submission_id),
+        "task_path": request.task_path,
+        "variant_index": request.variant_index,
+        "task_commit": request.task_commit,
+        "image_id": request.image_id,
+        "evaluator_id": request.evaluator_id,
+        "evaluator_version": request.evaluator_version,
+    }
+    mismatches = [
+        field
+        for field, expected_value in expected.items()
+        if field in evidence and evidence[field] != expected_value
+    ]
+    if mismatches:
+        raise AtomicInfrastructureError(
+            "evaluator", f"{name} identity mismatch: {', '.join(mismatches)}"
+        )
+
+
+def _validate_reward_protocol(
+    reward: dict[str, Any],
+    raw_result: dict[str, Any],
+    outcome: str,
+) -> None:
+    if "score" in reward:
+        score = reward["score"]
+        if isinstance(score, bool) or not isinstance(score, (int, float)):
+            raise AtomicInfrastructureError("evaluator", "reward.json score must be a number")
+        if float(score) != float(raw_result["score"]):
+            raise AtomicInfrastructureError(
+                "evaluator", "reward.json score mismatch with evaluator result"
+            )
+    if "outcome" in reward and reward["outcome"] != outcome:
+        raise AtomicInfrastructureError(
+            "evaluator", "reward.json outcome mismatch with evaluator result"
+        )
+
+    raw_report = raw_result.get("report")
+    expected_hard_gate = (
+        raw_report.get("hard_gate_passed") if isinstance(raw_report, dict) else None
+    )
+    evidence_hard_gates: list[object] = []
+    if "hard_gate_passed" in reward:
+        evidence_hard_gates.append(reward["hard_gate_passed"])
+    if "report" in reward:
+        reward_report = reward["report"]
+        if not isinstance(reward_report, dict):
+            raise AtomicInfrastructureError("evaluator", "reward.json report must be a JSON object")
+        if "hard_gate_passed" in reward_report:
+            evidence_hard_gates.append(reward_report["hard_gate_passed"])
+    if expected_hard_gate is not None and any(
+        value is not expected_hard_gate for value in evidence_hard_gates
+    ):
+        raise AtomicInfrastructureError(
+            "evaluator", "reward.json hard-gate mismatch with evaluator result"
         )
 
 
