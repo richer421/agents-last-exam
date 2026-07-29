@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 import sys
 from types import ModuleType
+from uuid import UUID
 
 import pytest
 
+from ale_run import cli
+from ale_run.atomic.contracts import AtomicInfrastructureError, EvaluationResult, SolveResult
 from ale_run.cli import main
 
 
@@ -15,6 +18,8 @@ class _BlockedModule(ModuleType):
 
 
 class _Request:
+    submission_id = UUID("00000000-0000-0000-0000-000000000001")
+
     @classmethod
     def model_validate_json(cls, raw: str) -> _Request:
         if raw == "malformed":
@@ -35,6 +40,7 @@ def _install_atomic_modules(
     *,
     command: str,
     status: str,
+    error: Exception | None = None,
 ) -> list[_Request]:
     for name in (
         "ale_run.atomic",
@@ -48,19 +54,15 @@ def _install_atomic_modules(
 
     async def operation(request: _Request) -> _Result:
         calls.append(request)
+        if error is not None:
+            raise error
         return _Result(status)
 
     contracts = ModuleType("ale_run.atomic.contracts")
-    for name in (
-        "ArtifactEntry",
-        "AtomicInfrastructureError",
-        "EvaluateRequest",
-        "EvaluationResult",
-        "SolveRequest",
-        "SolveResult",
-        "SubmissionManifest",
-    ):
-        setattr(contracts, name, _Request)
+    contracts.SolveRequest = _Request
+    contracts.EvaluateRequest = _Request
+    contracts.SolveResult = SolveResult
+    contracts.EvaluationResult = EvaluationResult
     implementation = ModuleType(f"ale_run.atomic.{command}")
     setattr(implementation, command, operation)
 
@@ -115,3 +117,67 @@ def test_atomic_command_rejects_malformed_request(
     output = capsys.readouterr()
     assert output.out == ""
     assert output.err
+
+
+@pytest.mark.parametrize(
+    ("command", "error", "expected"),
+    [
+        (
+            "solve",
+            AtomicInfrastructureError("runtime", "sandbox unavailable"),
+            {"status": "failed"},
+        ),
+        ("solve", ValueError("invalid runtime input"), {"status": "failed"}),
+        ("solve", RuntimeError("x" * 2_000), {"status": "failed"}),
+        ("evaluate", RuntimeError("operation exploded"), {"status": "infra_failed"}),
+    ],
+)
+def test_atomic_command_converts_operation_exception_to_result_json(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    error: Exception,
+    expected: dict[str, str],
+) -> None:
+    calls = _install_atomic_modules(
+        monkeypatch,
+        command=command,
+        status="submitted",
+        error=error,
+    )
+    request_path = tmp_path / "request.json"
+    request_path.write_text("{}", encoding="utf-8")
+
+    assert main([command, str(request_path)]) == 1
+    assert len(calls) == 1
+    output = capsys.readouterr()
+    result = json.loads(output.out)
+    assert expected.items() <= result.items()
+    assert output.out.count("\n") == 1
+    assert "Traceback" not in output.err
+    assert len(output.err) <= 1_100
+    if command == "solve":
+        assert result["submission_id"] == str(_Request.submission_id)
+        assert 0 < len(result["error"]) <= 1_000
+
+
+def test_existing_run_and_list_commands_keep_their_handlers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    async def run_handler(_args) -> int:
+        calls.append("run")
+        return 7
+
+    def list_handler(_args) -> int:
+        calls.append("list")
+        return 8
+
+    monkeypatch.setattr(cli, "_cmd_run", run_handler)
+    monkeypatch.setattr(cli, "_cmd_list", list_handler)
+
+    assert main(["run", "experiment.yaml"]) == 7
+    assert main(["list"]) == 8
+    assert calls == ["run", "list"]

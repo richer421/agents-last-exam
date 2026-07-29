@@ -80,15 +80,33 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "list":
         return _cmd_list(args)
     if args.cmd == "solve":
-        from .atomic.contracts import SolveRequest
+        from .atomic.contracts import SolveRequest, SolveResult
         from .atomic.solve import solve
 
-        return asyncio.run(_run_atomic(SolveRequest, solve, args.request_path))
+        return asyncio.run(
+            _run_atomic(
+                SolveRequest,
+                solve,
+                args.request_path,
+                lambda request, error: SolveResult(
+                    status="failed",
+                    submission_id=request.submission_id,
+                    error=error,
+                ),
+            )
+        )
     if args.cmd == "evaluate":
-        from .atomic.contracts import EvaluateRequest
+        from .atomic.contracts import EvaluateRequest, EvaluationResult
         from .atomic.evaluate import evaluate
 
-        return asyncio.run(_run_atomic(EvaluateRequest, evaluate, args.request_path))
+        return asyncio.run(
+            _run_atomic(
+                EvaluateRequest,
+                evaluate,
+                args.request_path,
+                lambda _request, _error: EvaluationResult(status="infra_failed"),
+            )
+        )
     return 1
 
 
@@ -143,14 +161,19 @@ def _cmd_list(args: argparse.Namespace) -> int:
 # =============================================================================
 
 
-async def _run_atomic(request_type, operation, request_path: Path) -> int:
+async def _run_atomic(request_type, operation, request_path: Path, error_result) -> int:
     try:
         request = request_type.model_validate_json(request_path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         print(f"invalid atomic request: {exc}", file=sys.stderr)
         return 2
 
-    result = await operation(request)
+    try:
+        result = await operation(request)
+    except Exception as exc:  # noqa: BLE001 - CLI boundary converts operation failures to results.
+        error = (str(exc).strip() or exc.__class__.__name__)[:1_000]
+        print(f"atomic operation failed: {error}", file=sys.stderr)
+        result = error_result(request, error)
     print(result.model_dump_json())
     return 0 if result.status in {"submitted", "scored"} else 1
 
