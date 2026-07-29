@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,6 +42,7 @@ _MAX_MANIFEST_BYTES = 1024 * 1024
 _MAX_RESULT_BYTES = 64 * 1024
 _MAX_TASK_CARD_BYTES = 1024 * 1024
 _HOST_OSS_TIMEOUT_S = 300
+_CANONICAL_RESULT = object()
 _EVALUATOR_ENV_KEYS = frozenset(
     {
         "CHROMA_SOFT_EVAL_MODEL",
@@ -76,88 +78,116 @@ async def evaluate(request: EvaluateRequest) -> EvaluationResult:
         if existing is not None:
             return existing
 
-        async with AtomicRuntime.open(request=request, run_setup=False) as runtime:
-            await _stage_reference_strict(runtime, request)
+        committed_result: EvaluationResult | None = None
+        try:
+            async with AtomicRuntime.open(request=request, run_setup=False) as runtime:
+                await _stage_reference_strict(runtime, request)
 
-            try:
-                staged_manifest = await stage_submission(
-                    runtime.env.sandbox,
-                    runtime.task_data,
-                    request,
-                )
-            except AtomicInfrastructureError:
-                raise
-            except Exception as exc:
-                raise AtomicInfrastructureError(
-                    "submission_integrity",
-                    f"submission staging failed: {type(exc).__name__}: {exc}",
-                ) from exc
-            if staged_manifest != expected_manifest:
-                raise AtomicInfrastructureError(
-                    "submission_integrity",
-                    "submission manifest changed between control-plane preflight and VM staging",
-                )
+                try:
+                    staged_manifest = await stage_submission(
+                        runtime.env.sandbox,
+                        runtime.task_data,
+                        request,
+                    )
+                except AtomicInfrastructureError:
+                    raise
+                except Exception as exc:
+                    raise AtomicInfrastructureError(
+                        "submission_integrity",
+                        f"submission staging failed: {type(exc).__name__}: {exc}",
+                    ) from exc
+                if staged_manifest != expected_manifest:
+                    raise AtomicInfrastructureError(
+                        "submission_integrity",
+                        "submission manifest changed between control-plane preflight and VM staging",
+                    )
 
-            sandbox = runtime.env.sandbox
-            sep = "/" if sandbox.is_linux else "\\"
-            executor = SandboxExecutor(
-                config=None,
-                work_dir=(f"{sandbox.work_dir_base.rstrip(sep)}{sep}evaluate{sep}{attempt_id}"),
-                sandbox=sandbox,
-                env={},
-            )
-            try:
-                await executor.stage_runtime()
-            except Exception as exc:
-                raise AtomicInfrastructureError(
-                    "transport",
-                    f"ALE runtime staging failed: {type(exc).__name__}: {exc}",
-                ) from exc
-
-            try:
-                evaluated = await evaluate_in_sandbox(
+                sandbox = runtime.env.sandbox
+                sep = "/" if sandbox.is_linux else "\\"
+                executor = SandboxExecutor(
+                    config=None,
+                    work_dir=(f"{sandbox.work_dir_base.rstrip(sep)}{sep}evaluate{sep}{attempt_id}"),
                     sandbox=sandbox,
-                    ale_src_root=_ale_src_root_for(sandbox),
-                    task_path=runtime.task_dir,
-                    variant=request.variant_index,
-                    timeout_s=float(_EVAL_TIMEOUT_S),
-                    evaluator_env=_evaluator_environment(),
+                    env={},
                 )
-                raw_result = evaluated.result
-                if raw_result.get("error"):
+                try:
+                    await executor.stage_runtime()
+                except Exception as exc:
+                    raise AtomicInfrastructureError(
+                        "transport",
+                        f"ALE runtime staging failed: {type(exc).__name__}: {exc}",
+                    ) from exc
+
+                try:
+                    evaluated = await evaluate_in_sandbox(
+                        sandbox=sandbox,
+                        ale_src_root=_ale_src_root_for(sandbox),
+                        task_path=runtime.task_dir,
+                        variant=request.variant_index,
+                        timeout_s=float(_EVAL_TIMEOUT_S),
+                        evaluator_env=_evaluator_environment(),
+                    )
+                    raw_result = evaluated.result
+                    if raw_result.get("error"):
+                        raise AtomicInfrastructureError(
+                            "evaluator",
+                            str(raw_result["error"]),
+                        )
+                    report = raw_result.get("report") or {}
+                    outcome = (
+                        "invalid_output"
+                        if report.get("hard_gate_passed") is False
+                        else str(raw_result.get("outcome") or "valid")
+                    )
+                    result = EvaluationResult(
+                        status="scored",
+                        outcome=outcome,
+                        score=float(raw_result["score"]),
+                    )
+                    _validate_scored_result_state(
+                        result,
+                        hard_gate_passed=report.get("hard_gate_passed"),
+                        category="evaluator",
+                    )
+                except AtomicInfrastructureError:
+                    raise
+                except Exception as exc:
                     raise AtomicInfrastructureError(
                         "evaluator",
-                        str(raw_result["error"]),
-                    )
-                report = raw_result.get("report") or {}
-                outcome = (
-                    "invalid_output"
-                    if report.get("hard_gate_passed") is False
-                    else str(raw_result.get("outcome") or "valid")
-                )
-                result = EvaluationResult(
-                    status="scored",
-                    outcome=outcome,
-                    score=float(raw_result["score"]),
-                )
-            except AtomicInfrastructureError:
-                raise
-            except Exception as exc:
-                raise AtomicInfrastructureError(
-                    "evaluator",
-                    f"{type(exc).__name__}: {exc}",
-                ) from exc
+                        f"{type(exc).__name__}: {exc}",
+                    ) from exc
 
-            try:
-                await publish_evaluation_result(sandbox, request, result)
-            except AtomicInfrastructureError:
+                try:
+                    await publish_evaluation_result(sandbox, request, result)
+                except AtomicInfrastructureError:
+                    raise
+                except Exception as exc:
+                    raise AtomicInfrastructureError(
+                        "submission_storage",
+                        f"result publication failed: {type(exc).__name__}: {exc}",
+                    ) from exc
+                committed_result = result
+        except Exception as exc:
+            if committed_result is None:
                 raise
-            except Exception as exc:
-                raise AtomicInfrastructureError(
-                    "submission_storage",
-                    f"result publication failed: {type(exc).__name__}: {exc}",
-                ) from exc
-        return result
+            cleanup_failure = AtomicInfrastructureError(
+                "cleanup",
+                f"runtime cleanup failed after result commit: {type(exc).__name__}: {exc}",
+            )
+            try:
+                await _record_cleanup_diagnostic(
+                    request,
+                    attempt_id,
+                    cleanup_failure,
+                )
+            except Exception:
+                logger.exception(
+                    "failed to publish atomic evaluate cleanup diagnostic attempt=%s",
+                    attempt_id,
+                )
+            return committed_result
+        assert committed_result is not None
+        return committed_result
     except Exception as exc:  # noqa: BLE001
         failure = (
             exc
@@ -209,6 +239,26 @@ def _validate_submission_manifest(
         )
 
 
+def _validate_scored_result_state(
+    result: EvaluationResult,
+    *,
+    hard_gate_passed: object = _CANONICAL_RESULT,
+    category: str,
+) -> None:
+    invalid_output = result.outcome == "invalid_output"
+    hard_gate_failed = hard_gate_passed is False
+    if invalid_output:
+        valid = result.score == 0.0 and (hard_gate_passed is _CANONICAL_RESULT or hard_gate_failed)
+    else:
+        valid = hard_gate_passed is _CANONICAL_RESULT or not hard_gate_failed
+    if not valid:
+        raise AtomicInfrastructureError(
+            category,
+            "illegal scored result state: invalid_output requires an exact "
+            "0.0 score and evaluator hard-gate failure",
+        )
+
+
 async def _stage_reference_strict(runtime: Any, request: EvaluateRequest) -> None:
     reference_files = _declared_reference_files(request)
     task_data = runtime.task_data
@@ -228,12 +278,11 @@ async def _stage_reference_strict(runtime: Any, request: EvaluateRequest) -> Non
             task_data,
             source=source,
         )
-    except AtomicInfrastructureError:
-        raise
     except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"[:2000]
         raise AtomicInfrastructureError(
             "reference",
-            f"reference staging failed: {type(exc).__name__}: {exc}",
+            f"reference staging failed: {detail}",
         ) from exc
     if not isinstance(report, dict):
         raise AtomicInfrastructureError(
@@ -329,6 +378,7 @@ async def _read_existing_evaluation_result(
             "idempotency_conflict",
             "canonical result.json contains a non-scored result",
         )
+    _validate_scored_result_state(result, category="idempotency_conflict")
     if raw != _canonical_json(result.model_dump(mode="json")):
         raise AtomicInfrastructureError(
             "idempotency_conflict",
@@ -342,6 +392,40 @@ async def _record_attempt_diagnostic(
     attempt_id: str,
     error: AtomicInfrastructureError,
 ) -> None:
+    await _record_diagnostic(
+        request,
+        attempt_id,
+        error,
+        object_name=f"{attempt_id}.json",
+        phase="evaluate",
+        status="infra_failed",
+    )
+
+
+async def _record_cleanup_diagnostic(
+    request: EvaluateRequest,
+    attempt_id: str,
+    error: AtomicInfrastructureError,
+) -> None:
+    await _record_diagnostic(
+        request,
+        attempt_id,
+        error,
+        object_name=f"{attempt_id}/cleanup.json",
+        phase="cleanup",
+        status="scored_cleanup_failed",
+    )
+
+
+async def _record_diagnostic(
+    request: EvaluateRequest,
+    attempt_id: str,
+    error: AtomicInfrastructureError,
+    *,
+    object_name: str,
+    phase: str,
+    status: str,
+) -> None:
     payload = _canonical_json(
         {
             "attempt_id": attempt_id,
@@ -350,8 +434,9 @@ async def _record_attempt_diagnostic(
             "error": error.message[:4000],
             "evaluator_id": request.evaluator_id,
             "evaluator_version": request.evaluator_version,
+            "phase": phase,
             "schema_version": 1,
-            "status": "infra_failed",
+            "status": status,
             "submission_id": str(request.submission_id),
         }
     )
@@ -366,7 +451,7 @@ async def _record_attempt_diagnostic(
         result = await _run_host_ossutil(
             "cp",
             str(path),
-            f"{_evaluation_prefix(request)}/evidence/attempts/{attempt_id}.json",
+            f"{_evaluation_prefix(request)}/evidence/attempts/{object_name}",
             "-f",
         )
     if result[0] != 0:
@@ -382,18 +467,42 @@ async def _read_oss_object(
     limit: int,
     missing_ok: bool,
 ) -> bytes | None:
+    stat_result = await _run_host_ossutil("stat", url)
+    if stat_result[0] != 0:
+        diagnostic = _host_command_diagnostic(stat_result)
+        if _is_missing_object(diagnostic):
+            if missing_ok:
+                return None
+            raise AtomicInfrastructureError(
+                "submission_integrity",
+                f"required OSS object is missing: {url}",
+            )
+        raise AtomicInfrastructureError(
+            "submission_storage",
+            f"cannot stat OSS object {url}: {diagnostic}",
+        )
+    stat_output = stat_result[1].decode("utf-8", errors="replace")
+    size_match = re.search(
+        r"(?im)^\s*(?:content[- ]?length|size)\s*[:=]\s*(\d+)\s*$",
+        stat_output,
+    )
+    if size_match is None:
+        raise AtomicInfrastructureError(
+            "submission_storage",
+            f"OSS stat omitted a trustworthy content length: {url}",
+        )
+    expected_size = int(size_match.group(1))
+    if expected_size > limit:
+        raise AtomicInfrastructureError(
+            "submission_integrity",
+            f"OSS object exceeds {limit} bytes: {url}",
+        )
+
     with tempfile.TemporaryDirectory(prefix="ale-evaluate-read-") as temp_dir:
         path = Path(temp_dir) / "object.json"
         result = await _run_host_ossutil("cp", url, str(path), "-f")
         if result[0] != 0:
             diagnostic = _host_command_diagnostic(result)
-            if _is_missing_object(diagnostic):
-                if missing_ok:
-                    return None
-                raise AtomicInfrastructureError(
-                    "submission_integrity",
-                    f"required OSS object is missing: {url}",
-                )
             raise AtomicInfrastructureError(
                 "submission_storage",
                 f"cannot read OSS object {url}: {diagnostic}",
@@ -404,6 +513,11 @@ async def _read_oss_object(
                 raise AtomicInfrastructureError(
                     "submission_integrity",
                     f"OSS object exceeds {limit} bytes: {url}",
+                )
+            if size != expected_size:
+                raise AtomicInfrastructureError(
+                    "submission_integrity",
+                    f"OSS object size changed after stat: {url}",
                 )
             return path.read_bytes()
         except AtomicInfrastructureError:
