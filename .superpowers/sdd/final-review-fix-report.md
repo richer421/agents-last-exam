@@ -337,3 +337,75 @@ Check complete, no warnings found.
 - `ale_run/base_interface/sandbox.py` retains unrelated full-file legacy Ruff
   and format debt. The Task 3 contract-only change passes the documented scoped
   check, and all other round-2 Python files pass strict Ruff and format checks.
+
+## Broad Final Review
+
+The full ALE range from `ed79e5b` and anno-runner range from `81da2f4` received
+independent broad review followed by repeated fix and closure-review cycles.
+The final closure reviewer reported no remaining Critical or Important finding.
+
+### Additional Findings Closed
+
+- Replaced attribute-sensitive, post-write-bounded `git archive` materialization
+  with exact bounded Git object traversal under one deadline.
+- Isolated every atomic Git child from repository, global, system, and inherited
+  executable Git configuration. Registry and checkout validation now use a
+  private bounded Git metadata view, and `git status` is output/deadline bounded.
+- Bounded private split-index discovery during iteration rather than after
+  materializing an unbounded entry list.
+- Rejected non-finite and nonnumeric runner durations before request creation or
+  process spawn.
+- Retained the leader identity without reaping while inspecting and terminating
+  its original process group, then guaranteed exactly-once bounded reap.
+- Preserved timeout, cancellation, and nonzero-exit errors while attaching
+  bounded cleanup/reap failures; successful cleanup failures now fail closed.
+- Replaced blocking text drainers with cancellation-aware nonblocking readers so
+  detached writers cannot leave output threads behind or permit false success.
+
+ALE commits: `8a9db17`, `ebf280b`, `03367a8`.
+
+anno-runner commits: `cc4aefd`, `baf8cc0`, `1e15cfd`.
+
+### Final Closure Evidence
+
+```text
+ALE atomic:
+361 passed in 28.27s
+
+ALE legacy:
+37 passed in 2.24s
+
+ALE round-2 changed-file Ruff:
+18 files, all checks passed
+
+ALE round-2 changed-file format:
+18 files already formatted
+
+ALE legacy sandbox scoped Ruff:
+all checks passed
+
+anno-runner:
+61 passed in 7.25s
+
+anno-runner changed-file Ruff:
+all checks passed
+
+anno-runner changed-file format:
+2 files already formatted
+
+Dockerfile static check:
+Check complete, no warnings found.
+```
+
+The final reviewer also ran focused closure tests (`32` ALE registry tests and
+`48` anno-runner lifecycle tests) plus split UTF-8, invalid terminal UTF-8, and
+drainer-termination probes. No Critical or Important regression remained.
+
+### Final Integration State
+
+- ALE branch `codex/atomic-solve-evaluate` is 15 commits behind and 38 commits
+  ahead of `origin/main`; merge-base `5af2f6d`.
+- anno branch `codex/atomic-ale-sdk` is 3 commits behind and 8 commits ahead of
+  `origin/develop`; merge-base `81da2f4`.
+- Neither base branch was merged or rebased during finalization.
+- No paid VM, live OSS E2E, or other paid/live cloud operation was run.
