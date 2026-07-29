@@ -9,6 +9,7 @@ from ale_run.atomic.contracts import (
     SolveResult,
     SubmissionManifest,
 )
+from ale_run.atomic.evaluate import evaluate
 from ale_run.atomic.solve import solve
 
 __all__ = [
@@ -19,5 +20,6 @@ __all__ = [
     "SolveRequest",
     "SolveResult",
     "SubmissionManifest",
+    "evaluate",
     "solve",
 ]
