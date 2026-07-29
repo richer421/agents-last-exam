@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import shlex
 import stat
 import tempfile
@@ -35,6 +36,18 @@ _MAX_STAGED_FILE_BYTES = 512 * 1024 * 1024
 _MAX_STAGED_SOURCE_BYTES = 1024 * 1024 * 1024
 _MAX_STAGED_ARCHIVE_BYTES = 512 * 1024 * 1024
 _STAGING_CLEANUP_TIMEOUT_SECONDS = 35
+_OSS_LIST_PAGE_SIZE = 16
+_MAX_OSS_LIST_OUTPUT_BYTES = 64 * 1024
+
+_OSS_LIST_HEADER_RE = re.compile(
+    r"^LastModifiedTime\s+Size\(B\)\s+StorageClass\s+ETAG\s+ObjectName\s*$"
+)
+_OSS_LIST_ROW_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4} \S+\s+"
+    r"(?P<size>\d+)\s+\S+\s+\S+\s+(?P<url>oss://.*)$"
+)
+_OSS_LIST_SUMMARY_RE = re.compile(r"^Object Number is: (?P<count>\d+)$")
+_OSS_LIST_ELAPSED_RE = re.compile(r"^\s*\d+(?:\.\d+)?\(s\) elapsed\s*$")
 
 
 @dataclass(frozen=True)
@@ -48,6 +61,14 @@ class PreparedReference:
     archive_path: Path | None
     archive_sha256: str | None
     manifest: ReferenceManifest
+
+
+@dataclass(frozen=True)
+class _OssObject:
+    url: str
+    key: str
+    relative_path: PurePosixPath
+    size_bytes: int
 
 
 def sanitize_solve_environment(environment: EnvironmentSpec) -> EnvironmentSpec:
@@ -87,15 +108,42 @@ async def prepare_atomic_input(
             f"{source.rstrip('/')}/{task_data.domain_name}/"
             f"{task_data.task_name}/{task_data.variant_name}"
         )
-        await _download_prefix(
+        input_objects = await _list_prefix_objects(
             f"{prefix}/input/",
-            payload / "input",
             required=True,
         )
-        await _download_prefix(
+        software_objects = await _list_prefix_objects(
             f"{prefix}/software/",
-            payload / "software",
             required=False,
+        )
+        objects = [*input_objects, *software_objects]
+        if len(objects) > _MAX_STAGED_FILES:
+            raise AtomicInfrastructureError(
+                "input",
+                "OSS task data exceeds the file-count limit",
+            )
+        total = 0
+        for item in objects:
+            if item.size_bytes > _MAX_STAGED_FILE_BYTES:
+                raise AtomicInfrastructureError(
+                    "input",
+                    f"OSS input file exceeds 512 MiB: {item.relative_path}",
+                )
+            total += item.size_bytes
+            if total > _MAX_STAGED_SOURCE_BYTES:
+                raise AtomicInfrastructureError(
+                    "input",
+                    "OSS task data exceeds the total-size limit",
+                )
+        actual_total = await _download_prefix(
+            input_objects,
+            payload / "input",
+            actual_total=0,
+        )
+        await _download_prefix(
+            software_objects,
+            payload / "software",
+            actual_total=actual_total,
         )
         _audit_staged_tree(payload, declared_input_paths)
         archive = root / "input.zip"
@@ -182,8 +230,6 @@ async def prepare_atomic_reference(
                     f"reference object is missing: {normalized}",
                 )
             stat_output = stat_result[1].decode("utf-8", errors="replace")
-            import re
-
             size_match = re.search(
                 r"(?im)^\s*(?:content[- ]?length|size)\s*[:=]\s*(\d+)\s*$",
                 stat_output,
@@ -496,51 +542,263 @@ async def stage_atomic_reference(
         )
 
 
-async def _download_prefix(
+async def _list_prefix_objects(
     source: str,
-    destination: Path,
     *,
     required: bool,
-) -> None:
-    listed = await run_host_ossutil(
-        "ls",
-        "--payer",
-        "requester",
-        source,
-        "--limited-num",
-        "1",
-    )
-    if listed[0] != 0:
-        if required:
+) -> list[_OssObject]:
+    if not source.startswith("oss://") or not source.endswith("/"):
+        raise AtomicInfrastructureError("input", f"invalid OSS prefix: {source}")
+    bucket_and_prefix = source.removeprefix("oss://")
+    bucket, separator, prefix_key = bucket_and_prefix.partition("/")
+    if not bucket or not separator or not prefix_key:
+        raise AtomicInfrastructureError("input", f"invalid OSS prefix: {source}")
+
+    objects: list[_OssObject] = []
+    seen_keys: set[str] = set()
+    marker: str | None = None
+    while True:
+        arguments = [
+            "ls",
+            "--payer",
+            "requester",
+            source,
+            "--limited-num",
+            str(_OSS_LIST_PAGE_SIZE),
+        ]
+        if marker is not None:
+            arguments.extend(("--marker", marker))
+        listed = await run_host_ossutil(*arguments)
+        if listed[0] != 0:
             raise AtomicInfrastructureError(
                 "input",
-                f"cannot list required OSS prefix: {host_command_diagnostic(listed)}",
+                f"cannot list OSS prefix {source}: {host_command_diagnostic(listed)}",
             )
-        return
-    listing = listed[1].decode("utf-8", errors="replace")
-    empty = "Object Number is: 0" in listing or not (
-        "oss://" in listing or "Object Number is:" in listing
-    )
-    if empty:
-        if required:
+        if (
+            len(listed[1]) > _MAX_OSS_LIST_OUTPUT_BYTES
+            or len(listed[2]) > _MAX_OSS_LIST_OUTPUT_BYTES
+        ):
             raise AtomicInfrastructureError(
                 "input",
-                "required OSS input prefix is empty",
+                f"OSS metadata listing output exceeded 64 KiB: {source}",
             )
-        return
-    destination.mkdir(parents=True, mode=0o700)
-    synced = await run_host_ossutil(
-        "sync",
-        "--payer",
-        "requester",
-        source,
-        str(destination),
-    )
-    if synced[0] != 0:
+        if listed[2]:
+            raise AtomicInfrastructureError(
+                "input",
+                f"OSS metadata listing reported an error for {source}: "
+                f"{host_command_diagnostic(listed)}",
+            )
+        try:
+            lines = listed[1].decode("utf-8", errors="strict").splitlines()
+        except UnicodeDecodeError as exc:
+            raise AtomicInfrastructureError(
+                "input",
+                f"OSS metadata listing is not UTF-8: {source}",
+            ) from exc
+        while lines and not lines[-1]:
+            lines.pop()
+        if lines and _OSS_LIST_ELAPSED_RE.fullmatch(lines[-1]):
+            lines.pop()
+        if lines == ["Object Number is: 0"]:
+            row_lines: list[str] = []
+            page_count = 0
+        elif not lines or _OSS_LIST_HEADER_RE.fullmatch(lines[0]) is None:
+            raise AtomicInfrastructureError(
+                "input",
+                f"malformed OSS metadata listing header: {source}",
+            )
+        elif len(lines) < 2:
+            raise AtomicInfrastructureError(
+                "input",
+                f"malformed OSS metadata listing summary: {source}",
+            )
+        else:
+            summary = _OSS_LIST_SUMMARY_RE.fullmatch(lines[-1])
+            if summary is None:
+                raise AtomicInfrastructureError(
+                    "input",
+                    f"malformed OSS metadata listing summary: {source}",
+                )
+            row_lines = lines[1:-1]
+            page_count = int(summary.group("count"))
+        if page_count != len(row_lines) or page_count > _OSS_LIST_PAGE_SIZE:
+            raise AtomicInfrastructureError(
+                "input",
+                f"ambiguous OSS metadata listing count: {source}",
+            )
+
+        page: list[_OssObject] = []
+        previous_key = marker
+        for line in row_lines:
+            match = _OSS_LIST_ROW_RE.fullmatch(line)
+            if match is None:
+                raise AtomicInfrastructureError(
+                    "input",
+                    f"malformed OSS metadata row: {source}",
+                )
+            url = match.group("url")
+            if not url.startswith(source):
+                raise AtomicInfrastructureError(
+                    "input",
+                    f"OSS metadata object is outside the requested prefix: {url}",
+                )
+            relative = url[len(source) :]
+            path = PurePosixPath(relative)
+            key = f"{prefix_key}{relative}"
+            if (
+                not relative
+                or relative.endswith("/")
+                or path.is_absolute()
+                or any(part in {"", ".", ".."} for part in path.parts)
+                or path.as_posix() != relative
+                or "\\" in relative
+                or any(ord(character) < 32 or ord(character) == 127 for character in relative)
+            ):
+                raise AtomicInfrastructureError(
+                    "input",
+                    f"unsafe or noncanonical OSS object key: {url}",
+                )
+            if key in seen_keys:
+                raise AtomicInfrastructureError(
+                    "input",
+                    f"duplicate OSS object key: {url}",
+                )
+            if previous_key is not None and key <= previous_key:
+                raise AtomicInfrastructureError(
+                    "input",
+                    f"OSS metadata listing marker did not advance: {url}",
+                )
+            item = _OssObject(
+                url=url,
+                key=key,
+                relative_path=path,
+                size_bytes=int(match.group("size")),
+            )
+            page.append(item)
+            seen_keys.add(key)
+            previous_key = key
+        objects.extend(page)
+        if len(objects) > _MAX_STAGED_FILES:
+            raise AtomicInfrastructureError(
+                "input",
+                "OSS task data exceeds the file-count limit",
+            )
+        if page_count < _OSS_LIST_PAGE_SIZE:
+            break
+        if not page:
+            raise AtomicInfrastructureError(
+                "input",
+                f"OSS metadata listing marker did not advance: {source}",
+            )
+        marker = page[-1].key
+
+    if required and not objects:
         raise AtomicInfrastructureError(
             "input",
-            f"host OSS staging failed: {host_command_diagnostic(synced)}",
+            "required OSS input prefix is empty",
         )
+    return objects
+
+
+async def _download_prefix(
+    objects: list[_OssObject],
+    destination: Path,
+    *,
+    actual_total: int,
+) -> int:
+    if not objects:
+        return actual_total
+    try:
+        destination.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    destination_metadata = destination.lstat()
+    if stat.S_ISLNK(destination_metadata.st_mode) or not stat.S_ISDIR(destination_metadata.st_mode):
+        raise AtomicInfrastructureError("input", "unsafe host OSS staging root")
+    destination_root = destination.resolve(strict=True)
+
+    for item in objects:
+        target = destination.joinpath(*item.relative_path.parts)
+        current = destination
+        for part in item.relative_path.parts[:-1]:
+            current /= part
+            try:
+                current.mkdir(mode=0o700)
+            except FileExistsError:
+                metadata = current.lstat()
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                    raise AtomicInfrastructureError(
+                        "input",
+                        f"unsafe host OSS staging parent: {item.relative_path}",
+                    )
+        if not target.parent.resolve(strict=True).is_relative_to(destination_root):
+            raise AtomicInfrastructureError(
+                "input",
+                f"host OSS staging path escaped its private root: {item.relative_path}",
+            )
+        if os.path.lexists(target):
+            raise AtomicInfrastructureError(
+                "input",
+                f"duplicate local OSS staging target: {item.relative_path}",
+            )
+        downloaded = await run_host_ossutil(
+            "cp",
+            "--payer",
+            "requester",
+            item.url,
+            str(target),
+            "-f",
+        )
+        if downloaded[0] != 0:
+            raise AtomicInfrastructureError(
+                "input",
+                f"host OSS object download failed: {host_command_diagnostic(downloaded)}",
+            )
+        current = destination
+        for part in item.relative_path.parts[:-1]:
+            current /= part
+            try:
+                parent_metadata = current.lstat()
+            except OSError as exc:
+                raise AtomicInfrastructureError(
+                    "input",
+                    f"unsafe host OSS staging parent: {item.relative_path}",
+                ) from exc
+            if stat.S_ISLNK(parent_metadata.st_mode) or not stat.S_ISDIR(parent_metadata.st_mode):
+                raise AtomicInfrastructureError(
+                    "input",
+                    f"unsafe host OSS staging parent: {item.relative_path}",
+                )
+        if not target.parent.resolve(strict=True).is_relative_to(destination_root):
+            raise AtomicInfrastructureError(
+                "input",
+                f"unsafe host OSS staging parent: {item.relative_path}",
+            )
+        try:
+            local = target.lstat()
+        except OSError as exc:
+            raise AtomicInfrastructureError(
+                "input",
+                f"host OSS download did not create a regular file: {item.relative_path}",
+            ) from exc
+        if stat.S_ISLNK(local.st_mode) or not stat.S_ISREG(local.st_mode):
+            raise AtomicInfrastructureError(
+                "input",
+                f"host OSS download did not create a regular file: {item.relative_path}",
+            )
+        actual_total += local.st_size
+        if actual_total > _MAX_STAGED_SOURCE_BYTES:
+            raise AtomicInfrastructureError(
+                "input",
+                "downloaded OSS task data exceeds the total-size limit",
+            )
+        if local.st_size != item.size_bytes:
+            raise AtomicInfrastructureError(
+                "input",
+                f"OSS object size changed during download: {item.relative_path}",
+            )
+        os.chmod(target, 0o600, follow_symlinks=False)
+    return actual_total
 
 
 def _audit_staged_tree(
