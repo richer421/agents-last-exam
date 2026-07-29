@@ -73,7 +73,7 @@ def test_requests_require_versioned_immutable_aliyun_identity(tmp_path):
 
 
 def test_submission_manifest_records_solve_provenance_and_artifacts_without_evaluator():
-    artifact = ArtifactEntry(path="output/final.png", digest="a" * 64)
+    artifact = ArtifactEntry(path="output/final.png", size_bytes=1024, sha256="a" * 64)
     manifest = SubmissionManifest(
         submission_id=uuid4(),
         task_path="visual_media/demo",
@@ -95,6 +95,17 @@ def test_submission_manifest_records_solve_provenance_and_artifacts_without_eval
         SubmissionManifest(**(manifest.model_dump() | {"artifacts": ()}))
 
 
+def test_artifact_entry_requires_a_sha256_and_non_negative_size():
+    assert ArtifactEntry(path="output/final.png", size_bytes=0, sha256="a" * 64).size_bytes == 0
+
+    with pytest.raises(ValidationError):
+        ArtifactEntry(path="output/final.png", size_bytes=1, sha256="")
+    with pytest.raises(ValidationError):
+        ArtifactEntry(path="output/final.png", size_bytes=1, sha256="g" * 64)
+    with pytest.raises(ValidationError):
+        ArtifactEntry(path="output/final.png", size_bytes=-1, sha256="a" * 64)
+
+
 def test_evaluation_result_enforces_score_and_infrastructure_failure_shape():
     result = EvaluationResult(status="scored", outcome="valid", score=1.0)
 
@@ -105,6 +116,10 @@ def test_evaluation_result_enforces_score_and_infrastructure_failure_shape():
         EvaluationResult(status="infra_failed", outcome="valid", score=None)
     with pytest.raises(ValidationError):
         EvaluationResult(status="infra_failed", outcome=None, score=0.0)
+    with pytest.raises(ValidationError):
+        EvaluationResult(status="scored", outcome=None, score=0.0)
+    with pytest.raises(ValidationError):
+        EvaluationResult(status="scored", outcome="valid", score=None)
 
 
 def test_solve_result_and_infrastructure_error_are_versioned_contracts():

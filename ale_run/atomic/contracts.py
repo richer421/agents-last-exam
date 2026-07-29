@@ -11,6 +11,7 @@ CommitSha = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
 AliyunImageId = Annotated[str, Field(pattern=r"^m-[A-Za-z0-9-]+$")]
 OssRoot = Annotated[str, Field(pattern=r"^oss://")]
 Score = Annotated[float, Field(ge=0, le=1)]
+Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 
 
 class SolveRequest(BaseModel):
@@ -48,7 +49,8 @@ class ArtifactEntry(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     path: str
-    digest: str
+    size_bytes: int = Field(ge=0, strict=True)
+    sha256: Sha256
 
 
 class SubmissionManifest(BaseModel):
@@ -85,9 +87,11 @@ class EvaluationResult(BaseModel):
     score: Score | None = None
 
     @model_validator(mode="after")
-    def require_empty_evaluation_fields_for_infrastructure_failures(self) -> "EvaluationResult":
+    def require_consistent_evaluation_fields(self) -> "EvaluationResult":
         if self.status == "infra_failed" and (self.outcome is not None or self.score is not None):
             raise ValueError("infra_failed results must not include outcome or score")
+        if self.status == "scored" and (self.outcome is None or self.score is None):
+            raise ValueError("scored results must include outcome and score")
         return self
 
 
