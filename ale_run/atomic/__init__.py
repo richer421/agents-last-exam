@@ -9,6 +9,7 @@ from ale_run.atomic.contracts import (
     SolveResult,
     SubmissionManifest,
 )
+from ale_run.atomic.solve import solve
 
 __all__ = [
     "ArtifactEntry",
@@ -18,4 +19,5 @@ __all__ = [
     "SolveRequest",
     "SolveResult",
     "SubmissionManifest",
+    "solve",
 ]

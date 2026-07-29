@@ -122,12 +122,67 @@ def test_evaluation_result_enforces_score_and_infrastructure_failure_shape():
         EvaluationResult(status="scored", outcome="valid", score=None)
 
 
-def test_solve_result_is_a_versioned_contract():
+def test_solve_result_requires_a_manifest_for_submitted_status():
     submission_id = uuid4()
-    result = SolveResult(submission_id=submission_id)
+    manifest = SubmissionManifest(
+        submission_id=submission_id,
+        task_path="visual_media/demo",
+        variant_index=0,
+        task_commit="a" * 40,
+        image_id="m-image-123",
+        ale_run_id="run-123",
+        agent_id="codex",
+        model_id="gpt-5",
+        config_digest="b" * 64,
+        started_at=datetime(2026, 7, 29, tzinfo=UTC),
+        completed_at=datetime(2026, 7, 29, 0, 1, tzinfo=UTC),
+        artifacts=(ArtifactEntry(path="output/final.png", size_bytes=1, sha256="a" * 64),),
+    )
+    result = SolveResult(status="submitted", submission_id=submission_id, manifest=manifest)
 
     assert result.schema_version == 1
     assert result.submission_id == submission_id
+    assert result.manifest is manifest
+    assert result.error is None
+    with pytest.raises(ValidationError):
+        SolveResult(status="submitted", submission_id=submission_id)
+    with pytest.raises(ValidationError):
+        SolveResult(
+            status="submitted",
+            submission_id=submission_id,
+            manifest=manifest,
+            error="unexpected error",
+        )
+
+
+def test_solve_result_requires_an_error_for_failed_status():
+    submission_id = uuid4()
+    result = SolveResult(status="failed", submission_id=submission_id, error="agent timeout")
+
+    assert result.manifest is None
+    assert result.error == "agent timeout"
+    with pytest.raises(ValidationError):
+        SolveResult(status="failed", submission_id=submission_id)
+    with pytest.raises(ValidationError):
+        SolveResult(
+            status="failed",
+            submission_id=submission_id,
+            manifest=SubmissionManifest(
+                submission_id=submission_id,
+                task_path="visual_media/demo",
+                variant_index=0,
+                task_commit="a" * 40,
+                image_id="m-image-123",
+                ale_run_id="run-123",
+                agent_id="codex",
+                model_id="gpt-5",
+                config_digest="b" * 64,
+                started_at=datetime(2026, 7, 29, tzinfo=UTC),
+                completed_at=datetime(2026, 7, 29, 0, 1, tzinfo=UTC),
+                artifacts=(ArtifactEntry(path="output/final.png", size_bytes=1, sha256="a" * 64),),
+            ),
+            error="agent timeout",
+        )
 
 
 def test_infrastructure_error_is_catchable_and_preserves_category_and_message():

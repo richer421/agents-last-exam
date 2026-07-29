@@ -75,7 +75,18 @@ class SolveResult(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     schema_version: Literal[1] = 1
+    status: Literal["submitted", "failed"]
     submission_id: UUID
+    manifest: SubmissionManifest | None = None
+    error: str | None = None
+
+    @model_validator(mode="after")
+    def require_consistent_solve_fields(self) -> "SolveResult":
+        if self.status == "submitted" and (self.manifest is None or self.error is not None):
+            raise ValueError("submitted results require a manifest and no error")
+        if self.status == "failed" and (self.manifest is not None or not self.error):
+            raise ValueError("failed results require an error and no manifest")
+        return self
 
 
 class EvaluationResult(BaseModel):

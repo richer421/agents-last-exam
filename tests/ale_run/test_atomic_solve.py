@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import subprocess
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from importlib import import_module
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
-from ale_run.atomic.contracts import SolveRequest
+from ale_run.atomic.contracts import ArtifactEntry, SolveRequest, SubmissionManifest
 from ale_run.atomic.runtime import AtomicRuntime
+from ale_run.base_interface import AgentRunResult, TaskDataSpec
+from ale_run.orchestration.experiment_spec import AgentSpec
 
 
 class _FakeProvider:
@@ -96,3 +102,219 @@ async def test_open_acquires_one_vm_and_releases_it_when_the_body_raises(
 
     assert len(provider.acquire_calls) == 1
     assert provider.release_calls == ["delete"]
+
+
+@dataclass
+class _TestAgentConfig:
+    model: str = "test-model"
+    name: str = "test-agent"
+
+
+class _TestDeployer:
+    default_executor = "local"
+    supported_executors = frozenset({"local"})
+
+
+def _submission_manifest(request: SolveRequest) -> SubmissionManifest:
+    return SubmissionManifest(
+        submission_id=request.submission_id,
+        task_path=request.task_path,
+        variant_index=request.variant_index,
+        task_commit=request.task_commit,
+        image_id=request.image_id,
+        ale_run_id="solve-run",
+        agent_id=request.agent_id,
+        model_id="test-model",
+        config_digest="a" * 64,
+        started_at=datetime(2026, 7, 29, tzinfo=UTC),
+        completed_at=datetime(2026, 7, 29, 0, 1, tzinfo=UTC),
+        artifacts=(ArtifactEntry(path="answer.txt", size_bytes=1, sha256="b" * 64),),
+    )
+
+
+def _runtime_for_solve(request: SolveRequest, agents: list[AgentSpec]) -> SimpleNamespace:
+    return SimpleNamespace(
+        runtime_spec=SimpleNamespace(agents=agents),
+        env=SimpleNamespace(sandbox=SimpleNamespace()),
+        task_meta={"description": "Solve the isolated task and write answer.txt."},
+        task_data=TaskDataSpec(),
+        task_driver=SimpleNamespace(
+            evaluate=lambda: (_ for _ in ()).throw(AssertionError("evaluate called"))
+        ),
+    )
+
+
+def _patch_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime: SimpleNamespace,
+    events: list[str],
+    solve_module: object,
+) -> None:
+    @asynccontextmanager
+    async def open_runtime(*, request: SolveRequest):
+        events.extend(["open runtime", "task setup"])
+        try:
+            yield runtime
+        finally:
+            events.append("cleanup")
+
+    monkeypatch.setattr(solve_module.AtomicRuntime, "open", staticmethod(open_runtime))
+
+
+@pytest.mark.asyncio
+async def test_solve_runs_one_selected_agent_then_publishes_without_exposing_submission_identity(
+    solve_request: SolveRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    solve_module = import_module("ale_run.atomic.solve")
+
+    events: list[str] = []
+    selected = AgentSpec(id=solve_request.agent_id, class_="test", config={})
+    runtime = _runtime_for_solve(solve_request, [selected, AgentSpec(id="other", class_="test")])
+    _patch_runtime(monkeypatch, runtime, events, solve_module)
+    config = _TestAgentConfig()
+
+    class Executor:
+        work_dir = "/ordinary/agent-output"
+
+        async def run_deployer(self, *, deployer_cls, prompt, timeout_s):
+            events.append("run deployer")
+            assert deployer_cls is _TestDeployer
+            assert prompt == runtime.task_meta["description"]
+            assert str(solve_request.submission_id) not in prompt
+            assert self.work_dir == "/ordinary/agent-output"
+            assert timeout_s == 18_000.0
+            return AgentRunResult(status="completed")
+
+    def build_executor(**kwargs):
+        assert kwargs["agent_name"] == config.name
+        assert str(solve_request.submission_id) not in str(kwargs["host_artifacts_dir"])
+        return Executor()
+
+    async def publish(sandbox, task_data, request, *, provenance):
+        events.append("publish submission")
+        assert sandbox is runtime.env.sandbox
+        assert task_data is runtime.task_data
+        assert request is solve_request
+        assert set(provenance) == {
+            "ale_run_id",
+            "model_id",
+            "config_digest",
+            "started_at",
+            "completed_at",
+        }
+        return _submission_manifest(request)
+
+    monkeypatch.setattr(
+        solve_module, "resolve_agent", lambda spec: (_TestDeployer, _TestAgentConfig)
+    )
+    monkeypatch.setattr(solve_module, "build_config", lambda *_args: config)
+    monkeypatch.setattr(solve_module, "_build_executor", build_executor)
+    monkeypatch.setattr(solve_module, "publish_submission", publish)
+
+    result = await solve_module.solve(solve_request)
+
+    assert events == ["open runtime", "task setup", "run deployer", "publish submission", "cleanup"]
+    assert result.status == "submitted"
+    assert result.submission_id == solve_request.submission_id
+    assert result.manifest == _submission_manifest(solve_request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["failed", "timeout"])
+async def test_solve_does_not_publish_unsuccessful_agent_runs(
+    solve_request: SolveRequest,
+    status: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    solve_module = import_module("ale_run.atomic.solve")
+
+    events: list[str] = []
+    runtime = _runtime_for_solve(
+        solve_request,
+        [AgentSpec(id=solve_request.agent_id, class_="test", config={})],
+    )
+    _patch_runtime(monkeypatch, runtime, events, solve_module)
+
+    class Executor:
+        async def run_deployer(self, **_kwargs):
+            events.append("run deployer")
+            return AgentRunResult(status=status, error=f"{status} run")
+
+    monkeypatch.setattr(
+        solve_module, "resolve_agent", lambda spec: (_TestDeployer, _TestAgentConfig)
+    )
+    monkeypatch.setattr(solve_module, "build_config", lambda *_args: _TestAgentConfig())
+    monkeypatch.setattr(solve_module, "_build_executor", lambda **_kwargs: Executor())
+    monkeypatch.setattr(
+        solve_module,
+        "publish_submission",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("publish called")),
+    )
+
+    result = await solve_module.solve(solve_request)
+
+    assert events == ["open runtime", "task setup", "run deployer", "cleanup"]
+    assert result.status == "failed"
+    assert result.submission_id == solve_request.submission_id
+    assert result.manifest is None
+    assert result.error == f"{status} run"
+
+
+@pytest.mark.asyncio
+async def test_solve_propagates_submission_publication_failures_after_cleanup(
+    solve_request: SolveRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    solve_module = import_module("ale_run.atomic.solve")
+
+    events: list[str] = []
+    runtime = _runtime_for_solve(
+        solve_request,
+        [AgentSpec(id=solve_request.agent_id, class_="test", config={})],
+    )
+    _patch_runtime(monkeypatch, runtime, events, solve_module)
+
+    class Executor:
+        async def run_deployer(self, **_kwargs):
+            events.append("run deployer")
+            return AgentRunResult(status="completed")
+
+    async def publish(*_args, **_kwargs):
+        events.append("publish submission")
+        raise RuntimeError("immutable publish failed")
+
+    monkeypatch.setattr(
+        solve_module, "resolve_agent", lambda spec: (_TestDeployer, _TestAgentConfig)
+    )
+    monkeypatch.setattr(solve_module, "build_config", lambda *_args: _TestAgentConfig())
+    monkeypatch.setattr(solve_module, "_build_executor", lambda **_kwargs: Executor())
+    monkeypatch.setattr(solve_module, "publish_submission", publish)
+
+    with pytest.raises(RuntimeError, match="immutable publish failed"):
+        await solve_module.solve(solve_request)
+
+    assert events == ["open runtime", "task setup", "run deployer", "publish submission", "cleanup"]
+
+
+@pytest.mark.asyncio
+async def test_solve_requires_exactly_one_matching_agent(
+    solve_request: SolveRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    solve_module = import_module("ale_run.atomic.solve")
+
+    events: list[str] = []
+    runtime = _runtime_for_solve(
+        solve_request,
+        [
+            AgentSpec(id=solve_request.agent_id, class_="test"),
+            AgentSpec(id=solve_request.agent_id, class_="other-test"),
+        ],
+    )
+    _patch_runtime(monkeypatch, runtime, events, solve_module)
+
+    with pytest.raises(ValueError, match="exactly one"):
+        await solve_module.solve(solve_request)
+
+    assert events == ["open runtime", "task setup", "cleanup"]
