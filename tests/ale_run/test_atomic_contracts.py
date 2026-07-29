@@ -122,12 +122,20 @@ def test_evaluation_result_enforces_score_and_infrastructure_failure_shape():
         EvaluationResult(status="scored", outcome="valid", score=None)
 
 
-def test_solve_result_and_infrastructure_error_are_versioned_contracts():
+def test_solve_result_is_a_versioned_contract():
     submission_id = uuid4()
     result = SolveResult(submission_id=submission_id)
-    error = AtomicInfrastructureError(message="storage unavailable")
 
     assert result.schema_version == 1
     assert result.submission_id == submission_id
-    assert error.schema_version == 1
+
+
+def test_infrastructure_error_is_catchable_and_preserves_category_and_message():
+    error = AtomicInfrastructureError("storage", "storage unavailable")
+
+    assert error.category == "storage"
     assert error.message == "storage unavailable"
+    assert str(error) == "storage: storage unavailable"
+    with pytest.raises(AtomicInfrastructureError) as caught:
+        raise error
+    assert caught.value is error

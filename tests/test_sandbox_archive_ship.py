@@ -9,8 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from ale_run.executors.sandbox import (
-    SandboxExecutor,
     _ALE_ARCHIVE_EXTRACT,
+    SandboxExecutor,
     _build_ale_archive,
 )
 
@@ -83,7 +83,7 @@ def test_ship_uploads_one_archive_instead_of_each_source_file(
         env={},
     )
 
-    asyncio.run(executor._ship_ale_subtree("/home/user/.ale-src"))
+    asyncio.run(executor.stage_runtime("/home/user/.ale-src"))
 
     assert len(sandbox.writes) == 1
     assert sandbox.writes[0][0].endswith(".tar.gz")
@@ -115,7 +115,7 @@ def test_digest_hit_skips_archive_upload(tmp_path: Path, monkeypatch) -> None:
         env={},
     )
 
-    asyncio.run(executor._ship_ale_subtree("/home/user/.ale-src"))
+    asyncio.run(executor.stage_runtime("/home/user/.ale-src"))
 
     assert sandbox.writes == []
     assert len(sandbox.commands) == 1
@@ -137,7 +137,7 @@ def test_archive_upload_retries_transient_failure(tmp_path: Path, monkeypatch) -
         env={},
     )
 
-    asyncio.run(executor._ship_ale_subtree("/home/user/.ale-src"))
+    asyncio.run(executor.stage_runtime("/home/user/.ale-src"))
 
     assert sandbox.upload_attempts == 2
     assert len(sandbox.writes) == 1

@@ -95,8 +95,10 @@ class EvaluationResult(BaseModel):
         return self
 
 
-class AtomicInfrastructureError(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+class AtomicInfrastructureError(RuntimeError):
+    """Infrastructure failure that prevents an atomic capability from running."""
 
-    schema_version: Literal[1] = 1
-    message: str
+    def __init__(self, category: str, message: str) -> None:
+        self.category = category
+        self.message = message
+        super().__init__(f"{category}: {message}")

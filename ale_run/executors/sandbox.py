@@ -262,8 +262,8 @@ class SandboxExecutor(BaseExecutor):
 
         # 1. Ship the ale_run/ archive to the sandbox (digest-skip on repeats)
         try:
-            await self._ship_ale_subtree(ale_src_root)
-        except Exception as e:                                      # noqa: BLE001
+            await self.stage_runtime()
+        except Exception as e:
             logger.exception("ship_ale_subtree failed")
             return AgentRunResult(
                 status="failed",
@@ -494,9 +494,11 @@ class SandboxExecutor(BaseExecutor):
         """Run task evaluation in the sandbox and return only score metadata."""
         from .sandbox_evaluator import evaluate_in_sandbox
 
+        ale_src_root = _ale_src_root_for(self.sandbox)
+        await self.stage_runtime()
         evaluated = await evaluate_in_sandbox(
             sandbox=self.sandbox,
-            ale_src_root=_ale_src_root_for(self.sandbox),
+            ale_src_root=ale_src_root,
             task_path=task_path,
             variant=variant,
             timeout_s=timeout_s,
@@ -637,13 +639,15 @@ class SandboxExecutor(BaseExecutor):
     # internals
     # ------------------------------------------------------------------
 
-    async def _ship_ale_subtree(self, ale_src_root: str) -> None:
+    async def stage_runtime(self, ale_src_root: str | None = None) -> None:
         """Upload one cached ``ale_run`` archive and extract it atomically.
 
         A digest marker skips repeated deployment to a retained sandbox. The
         archive excludes vendored upstream trees and ``node_modules`` because
         deployers fetch or rebuild those independently.
         """
+        if ale_src_root is None:
+            ale_src_root = _ale_src_root_for(self.sandbox)
         started = time.monotonic()
         archive = _build_ale_archive(_host_ale_root())
         sandbox = self.sandbox

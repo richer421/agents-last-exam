@@ -1,21 +1,21 @@
 from __future__ import annotations
 
+import io
 import json
 import tarfile
-import io
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from ale_run.executors._sandbox_eval_entry import _start_remote_session, _worker_argv
+from ale_run.executors.sandbox import SandboxExecutor, _evaluator_env
 from ale_run.executors.sandbox_evaluator import (
     SandboxEvaluationError,
     SandboxEvaluationResult,
     _build_task_archive,
     evaluate_in_sandbox,
 )
-from ale_run.executors._sandbox_eval_entry import _start_remote_session, _worker_argv
-from ale_run.executors.sandbox import _evaluator_env
 from ale_run.orchestration.lifecycle import _evaluate_task
 
 
@@ -45,9 +45,7 @@ class _FakeSandbox:
     async def run_command(self, command: str, timeout: float | None = None):
         self.commands.append((command, timeout))
         if "Start-Process" in command:
-            return SimpleNamespace(
-                returncode=0, stdout="__ALE_EVAL_PID__=4242\n", stderr=""
-            )
+            return SimpleNamespace(returncode=0, stdout="__ALE_EVAL_PID__=4242\n", stderr="")
         if "Get-Item" in command and ".Length" in command:
             return SimpleNamespace(returncode=0, stdout="128\n", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -69,9 +67,7 @@ class _DroppedLaunchAckSandbox(_FakeSandbox):
         if "Start-Process" in command:
             return SimpleNamespace(returncode=-1, stdout="", stderr="transport error")
         if "__ALE_EVAL_PID__" in command:
-            return SimpleNamespace(
-                returncode=0, stdout="__ALE_EVAL_PID__=4242\n", stderr=""
-            )
+            return SimpleNamespace(returncode=0, stdout="__ALE_EVAL_PID__=4242\n", stderr="")
         if "Get-Item" in command and ".Length" in command:
             return SimpleNamespace(returncode=0, stdout="128\n", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -119,9 +115,7 @@ def test_task_archive_rejects_disguised_media_in_explicit_package_data(
     repo = tmp_path / "task-repo"
     (repo / "tasks" / "demo").mkdir(parents=True)
     (repo / "tasks" / "demo" / "main.py").write_text("VALUE = 1\n")
-    (repo / "tasks" / "demo" / "labels.csv").write_bytes(
-        b"\x89PNG\r\n\x1a\n" + b"not-really-csv"
-    )
+    (repo / "tasks" / "demo" / "labels.csv").write_bytes(b"\x89PNG\r\n\x1a\n" + b"not-really-csv")
     (repo / "pyproject.toml").write_text(
         "[project]\nname='demo'\nversion='0'\n"
         "[tool.ale.evaluator_archive]\ninclude=['tasks/demo/*.csv']\n"
@@ -148,8 +142,7 @@ def test_task_archive_rejects_recursive_extra_globs(tmp_path: Path) -> None:
     repo = tmp_path / "task-repo"
     repo.mkdir()
     (repo / "pyproject.toml").write_text(
-        "[project]\nname='demo'\nversion='0'\n"
-        "[tool.ale.evaluator_archive]\ninclude=['tasks/**']\n"
+        "[project]\nname='demo'\nversion='0'\n[tool.ale.evaluator_archive]\ninclude=['tasks/**']\n"
     )
 
     with pytest.raises(ValueError, match="unsafe evaluator archive include pattern"):
@@ -388,3 +381,38 @@ async def test_lifecycle_uses_near_data_evaluator_for_sandbox_executor(
 
     assert result == {"score": 0.9}
     assert executor.called == (task_path, 2, 45)
+
+
+@pytest.mark.asyncio
+async def test_sandbox_executor_stages_runtime_before_remote_evaluation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sandbox = _FakeSandbox()
+    executor = SandboxExecutor(
+        config=SimpleNamespace(),
+        work_dir=r"C:\\work",
+        sandbox=sandbox,
+        env={},
+    )
+    calls: list[str] = []
+
+    async def stage_runtime() -> None:
+        calls.append("stage")
+
+    async def fake_evaluate(**kwargs):
+        calls.append("evaluate")
+        assert kwargs["ale_src_root"] == r"C:\Users\User\.ale-src"
+        return SandboxEvaluationResult(result={"score": 0.5}, log="")
+
+    monkeypatch.setattr(executor, "stage_runtime", stage_runtime)
+    monkeypatch.setattr("ale_run.executors.sandbox_evaluator.evaluate_in_sandbox", fake_evaluate)
+
+    result = await executor.evaluate_task(
+        task_path=tmp_path / "tasks" / "demo",
+        variant=0,
+        timeout_s=60,
+    )
+
+    assert calls == ["stage", "evaluate"]
+    assert result == {"score": 0.5, "_ale_evaluator_log": ""}
