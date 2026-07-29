@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -103,10 +104,10 @@ async def solve(request: SolveRequest) -> SolveResult:
 
 def _request_for_checkout(request: SolveRequest, checkout: Path) -> SolveRequest:
     updates: dict[str, Path] = {"task_repo": checkout}
+    repository_path = Path(os.path.abspath(request.task_repo))
+    runtime_spec_path = Path(os.path.abspath(request.runtime_spec_path))
     try:
-        runtime_spec_relative = request.runtime_spec_path.resolve().relative_to(
-            request.task_repo.resolve()
-        )
+        runtime_spec_relative = runtime_spec_path.relative_to(repository_path)
     except ValueError:
         pass
     else:

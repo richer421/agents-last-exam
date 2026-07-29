@@ -15,6 +15,7 @@ from ale_run.atomic.contracts import AtomicInfrastructureError, EvaluateRequest
 from ale_run.atomic.evaluator_registry import (
     materialize_evaluator_checkout,
     validate_evaluator_registry,
+    validate_git_checkout,
 )
 
 
@@ -198,6 +199,51 @@ def test_evaluator_code_is_materialized_from_exact_commit_not_local_main(tmp_pat
             encoding="utf-8"
         ) == "VERSION = 1\n"
         assert not (checkout / ".git").exists()
+
+
+def test_evaluator_materialization_ignores_git_replacement_objects(tmp_path: Path) -> None:
+    request, _record, _registry_root = _registry_request(tmp_path)
+    replacement = subprocess.check_output(
+        ["git", "-C", str(request.task_repo), "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(request.task_repo),
+            "replace",
+            request.evaluator_version,
+            replacement,
+        ],
+        check=True,
+    )
+
+    with materialize_evaluator_checkout(request) as checkout:
+        assert (checkout / "tasks" / "toy" / "evaluator.py").read_text(
+            encoding="utf-8"
+        ) == "VERSION = 1\n"
+
+
+def test_git_cleanliness_gate_fails_closed_on_excessive_status_output(tmp_path: Path) -> None:
+    request, _record, _registry_root = _registry_request(tmp_path)
+    head = subprocess.check_output(
+        ["git", "-C", str(request.task_repo), "rev-parse", "HEAD"],
+        text=True,
+    ).strip()
+    for index in range(5_200):
+        name = f"entry-{index:05d}-{'x' * 200}"
+        (request.task_repo / name).touch()
+
+    with pytest.raises(AtomicInfrastructureError) as caught:
+        validate_git_checkout(
+            request.task_repo,
+            head,
+            category="task_checkout",
+        )
+
+    assert caught.value.category == "task_checkout"
+    assert "status output exceeds" in caught.value.message
 
 
 @pytest.mark.parametrize("invalid_root", ["relative", "missing", "file", "symlink"])

@@ -16,6 +16,44 @@ from ale_run.atomic.contracts import (
 )
 
 
+@pytest.mark.parametrize("request_type", [SolveRequest, EvaluateRequest])
+@pytest.mark.parametrize(
+    "task_path",
+    [
+        "",
+        "/absolute/task",
+        "../task",
+        "domain/../task",
+        "domain//task",
+        "domain/./task",
+        r"domain\task",
+    ],
+)
+def test_atomic_requests_reject_unsafe_task_paths_at_envelope(
+    tmp_path,
+    request_type,
+    task_path,
+):
+    payload = {
+        "submission_id": uuid4(),
+        "runtime_spec_path": tmp_path / "exp.yaml",
+        "task_repo": tmp_path,
+        "task_path": task_path,
+        "variant_index": 0,
+        "task_commit": "a" * 40,
+        "image_id": "m-image-123",
+        "submission_root": "oss://bucket",
+    }
+    if request_type is SolveRequest:
+        payload["agent_id"] = "codex"
+    else:
+        payload["evaluator_id"] = "rubric"
+        payload["evaluator_version"] = "b" * 40
+
+    with pytest.raises(ValidationError):
+        request_type(**payload)
+
+
 def test_solve_request_rejects_mutable_or_short_identity(tmp_path):
     with pytest.raises(ValidationError):
         SolveRequest(

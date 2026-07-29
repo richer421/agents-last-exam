@@ -1,12 +1,40 @@
 """Immutable versioned data contracts for solve and evaluate capabilities."""
 
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    model_serializer,
+    model_validator,
+)
 
+
+def _validate_task_path(value: str) -> str:
+    path = PurePosixPath(value)
+    if (
+        not value
+        or "\x00" in value
+        or "\\" in value
+        or path.is_absolute()
+        or PureWindowsPath(value).is_absolute()
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or path.as_posix() != value
+    ):
+        raise ValueError("task_path must be a canonical relative POSIX path")
+    return value
+
+
+TaskPath = Annotated[
+    str,
+    Field(min_length=1, max_length=1_000),
+    AfterValidator(_validate_task_path),
+]
 CommitSha = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
 AliyunImageId = Annotated[str, Field(pattern=r"^m-[A-Za-z0-9-]+$")]
 OssRoot = Annotated[str, Field(pattern=r"^oss://")]
@@ -26,7 +54,7 @@ class SolveRequest(BaseModel):
     submission_id: UUID
     runtime_spec_path: Path
     task_repo: Path
-    task_path: str
+    task_path: TaskPath
     variant_index: int = Field(ge=0)
     agent_id: str
     task_commit: CommitSha
@@ -41,7 +69,7 @@ class EvaluateRequest(BaseModel):
     submission_id: UUID
     runtime_spec_path: Path
     task_repo: Path
-    task_path: str
+    task_path: TaskPath
     variant_index: int = Field(ge=0)
     task_commit: CommitSha
     image_id: AliyunImageId

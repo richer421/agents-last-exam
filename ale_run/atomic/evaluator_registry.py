@@ -26,6 +26,7 @@ _MAX_GIT_ARCHIVE_BYTES = 64 * 1024 * 1024
 _MAX_GIT_CHECKOUT_BYTES = 32 * 1024 * 1024
 _MAX_GIT_FILE_BYTES = 8 * 1024 * 1024
 _MAX_GIT_FILES = 4096
+_MAX_GIT_STATUS_BYTES = 1024 * 1024
 
 
 def validate_evaluator_registry(
@@ -62,13 +63,7 @@ def validate_evaluator_registry(
             f"evaluator registry identity mismatch: {', '.join(mismatches)}",
         )
 
-    status = _run_git(
-        request.task_repo,
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-    )
-    if status.stdout:
+    if _read_git_status(request.task_repo, category="evaluator_registry"):
         raise AtomicInfrastructureError(
             "evaluator_registry",
             "task repository has tracked or untracked changes",
@@ -92,6 +87,7 @@ def validate_evaluator_registry(
         capture_output=True,
         check=False,
         text=True,
+        env=_git_environment(),
     )
     if ancestry.returncode != 0:
         detail = (ancestry.stderr or ancestry.stdout).strip()
@@ -130,14 +126,7 @@ def validate_git_checkout(
     category: str,
 ) -> None:
     """Require a clean repository whose HEAD is the requested commit."""
-    status = _run_git(
-        repo,
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-        category=category,
-    )
-    if status.stdout:
+    if _read_git_status(repo, category=category):
         raise AtomicInfrastructureError(
             category,
             "task repository has tracked or untracked changes",
@@ -160,6 +149,18 @@ def materialize_git_checkout(
 ) -> Iterator[Path]:
     """Yield a bounded, link-free checkout containing exact Git commit bytes."""
     with tempfile.TemporaryDirectory(prefix=prefix) as temp_dir:
+        resolved_commit = _run_git(
+            repo,
+            "rev-parse",
+            "--verify",
+            f"{commit}^{{commit}}",
+            category=category,
+        ).stdout.strip()
+        if resolved_commit != commit:
+            raise AtomicInfrastructureError(
+                category,
+                f"Git commit mismatch: expected {commit}, got {resolved_commit!r}",
+            )
         root = Path(temp_dir)
         archive = root / "checkout.tar"
         checkout = root / "checkout"
@@ -172,11 +173,12 @@ def materialize_git_checkout(
                 "--format=tar",
                 "-o",
                 str(archive),
-                commit,
+                resolved_commit,
             ],
             capture_output=True,
             check=False,
             text=True,
+            env=_git_environment(),
         )
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip()
@@ -360,6 +362,7 @@ def _run_git(
         capture_output=True,
         check=False,
         text=True,
+        env=_git_environment(),
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
@@ -368,3 +371,58 @@ def _run_git(
             f"git {' '.join(arguments)} failed: {detail[:500]}",
         )
     return result
+
+
+def _read_git_status(repo: Path, *, category: str) -> bytes:
+    with tempfile.TemporaryFile() as stderr:
+        try:
+            process = subprocess.Popen(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--untracked-files=all",
+                    "--ignored=matching",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=stderr,
+                env=_git_environment(),
+            )
+        except OSError as exc:
+            raise AtomicInfrastructureError(
+                category,
+                f"cannot start git status: {exc}",
+            ) from exc
+        assert process.stdout is not None
+        try:
+            output = process.stdout.read(_MAX_GIT_STATUS_BYTES + 1)
+            if len(output) > _MAX_GIT_STATUS_BYTES:
+                process.kill()
+                process.wait()
+                raise AtomicInfrastructureError(
+                    category,
+                    "git status output exceeds the 1 MiB limit",
+                )
+            returncode = process.wait()
+        except BaseException:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            raise
+        if returncode != 0:
+            stderr.seek(0)
+            detail = stderr.read(501).decode("utf-8", errors="replace").strip()
+            raise AtomicInfrastructureError(
+                category,
+                "git status failed" + (f": {detail[:500]}" if detail else ""),
+            )
+        return output
+
+
+def _git_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+    return environment

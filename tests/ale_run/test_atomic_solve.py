@@ -223,7 +223,7 @@ def _patch_runtime(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["tracked", "untracked"])
+@pytest.mark.parametrize("change", ["tracked", "untracked", "ignored"])
 async def test_solve_rejects_repository_changes_before_runtime_provider_entry(
     solve_request: SolveRequest,
     change: str,
@@ -236,9 +236,16 @@ async def test_solve_rejects_repository_changes_before_runtime_provider_entry(
         changed_path = solve_request.task_repo / "tasks" / "toy" / "main.py"
         with changed_path.open("a", encoding="utf-8") as stream:
             stream.write("MUTABLE = True\n")
-    else:
+    elif change == "untracked":
         changed_path = solve_request.task_repo / "tasks" / "toy" / "untracked.py"
         changed_path.write_text("MUTABLE = True\n", encoding="utf-8")
+    else:
+        exclude = solve_request.task_repo / ".git" / "info" / "exclude"
+        with exclude.open("a", encoding="utf-8") as stream:
+            stream.write("ignored-state/\n")
+        ignored_dir = solve_request.task_repo / "ignored-state"
+        ignored_dir.mkdir()
+        (ignored_dir / "mutable.txt").write_text("MUTABLE\n", encoding="utf-8")
 
     class ProviderSentinel(_FakeProvider):
         async def acquire(self, spec: object) -> SimpleNamespace:
@@ -283,6 +290,42 @@ async def test_solve_rejects_repository_changes_before_runtime_provider_entry(
 
     assert caught.value.category == "task_checkout"
     assert "tracked or untracked changes" in caught.value.message
+
+
+@pytest.mark.asyncio
+async def test_solve_rejects_ignored_in_repo_runtime_spec_symlink_before_load(
+    solve_request: SolveRequest,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outside_runtime = tmp_path / "mutable-runtime.yaml"
+    outside_runtime.write_text("agents: []\n", encoding="utf-8")
+    runtime_spec = solve_request.task_repo / "runtime.yaml"
+    runtime_spec.symlink_to(outside_runtime)
+    exclude = solve_request.task_repo / ".git" / "info" / "exclude"
+    with exclude.open("a", encoding="utf-8") as stream:
+        stream.write("runtime.yaml\n")
+    request = solve_request.model_copy(update={"runtime_spec_path": runtime_spec})
+    solve_module = import_module("ale_run.atomic.solve")
+
+    async def no_existing_manifest(_request):
+        return None
+
+    monkeypatch.setattr(
+        solve_module,
+        "read_existing_submission_manifest",
+        no_existing_manifest,
+    )
+    monkeypatch.setattr(
+        solve_module,
+        "load_experiment",
+        lambda _path: (_ for _ in ()).throw(AssertionError("mutable runtime spec loaded")),
+    )
+
+    with pytest.raises(AtomicInfrastructureError) as caught:
+        await solve_module.solve(request)
+
+    assert caught.value.category == "task_checkout"
 
 
 @pytest.mark.asyncio
