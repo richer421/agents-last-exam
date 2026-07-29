@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
+import math
 import mimetypes
 import os
 import re
@@ -12,6 +14,7 @@ import shlex
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from time import monotonic as _monotonic
 from typing import Any
 from urllib.parse import quote
 from uuid import uuid4
@@ -373,7 +376,15 @@ async def download_range_to_local(
     """Stream one size-bounded sandbox file into a private host file."""
     if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0:
         raise ValueError("max_bytes must be a non-negative integer")
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
+        raise ValueError("timeout must be a positive finite number")
 
+    deadline = _monotonic() + timeout
     destination = Path(local_path)
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -392,12 +403,30 @@ async def download_range_to_local(
                 requested = min(_DOWNLOAD_CHUNK_BYTES, remaining)
                 if requested == 0:
                     requested = 1
-                result = await sandbox.download_range(
-                    remote_path,
-                    start=offset,
-                    max_chunk_bytes=requested,
-                    timeout=timeout,
-                )
+                remaining_timeout = deadline - _monotonic()
+                if remaining_timeout <= 0:
+                    raise AtomicInfrastructureError(
+                        "submission_integrity",
+                        f"range download deadline exhausted at offset {offset}",
+                    )
+                try:
+                    async with asyncio.timeout(remaining_timeout):
+                        result = await sandbox.download_range(
+                            remote_path,
+                            start=offset,
+                            max_chunk_bytes=requested,
+                            timeout=remaining_timeout,
+                        )
+                except TimeoutError as exc:
+                    raise AtomicInfrastructureError(
+                        "submission_integrity",
+                        f"range download deadline exhausted at offset {offset}",
+                    ) from exc
+                if _monotonic() >= deadline:
+                    raise AtomicInfrastructureError(
+                        "submission_integrity",
+                        f"range download deadline exhausted at offset {offset}",
+                    )
                 if not isinstance(result, RangeResult):
                     raise TypeError(f"range response has invalid shape at offset {offset}")
                 if result.success is not True:
@@ -422,12 +451,16 @@ async def download_range_to_local(
                 chunk = result.new_data
                 if not isinstance(chunk, bytes):
                     raise TypeError(f"range download returned non-bytes data at offset {offset}")
-                if len(chunk) > requested or offset + len(chunk) > max_bytes:
+                if len(chunk) > requested:
+                    raise RuntimeError(
+                        f"range download exceeded requested range at offset {offset}"
+                    )
+                if offset + len(chunk) > max_bytes:
                     raise RuntimeError(
                         f"range download exceeds the {max_bytes}-byte download limit"
                     )
                 if offset + len(chunk) > expected_size:
-                    raise RuntimeError(f"range download returned a bad offset at {offset}")
+                    raise RuntimeError(f"range download exceeds reported total at offset {offset}")
                 if expected_size == 0:
                     if chunk:
                         raise RuntimeError("range download exceeds the 0-byte download limit")

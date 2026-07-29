@@ -11,7 +11,7 @@ from uuid import uuid4
 
 import pytest
 
-from ale_run.atomic.contracts import SolveRequest
+from ale_run.atomic.contracts import AtomicInfrastructureError, SolveRequest
 from ale_run.atomic.oss_submission import download_range_to_local, publish_submission
 from ale_run.base_interface import RangeResult, TaskDataSpec
 
@@ -146,6 +146,132 @@ async def test_download_range_to_local_accepts_file_smaller_than_bound(
 
 
 @pytest.mark.asyncio
+async def test_download_range_to_local_enforces_whole_operation_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "artifact.bin"
+    sandbox = _RangeSandbox(
+        [RangeResult(success=True, new_data=b"x", new_size=10) for _ in range(10)]
+    )
+    clock = iter([100.0, 100.0, 100.5, 101.0, 101.5, 102.0])
+    monkeypatch.setattr(
+        "ale_run.atomic.oss_submission._monotonic",
+        lambda: next(clock),
+        raising=False,
+    )
+    monkeypatch.setattr("ale_run.atomic.oss_submission._DOWNLOAD_CHUNK_BYTES", 4)
+
+    with pytest.raises(AtomicInfrastructureError, match="deadline") as caught:
+        await download_range_to_local(
+            sandbox,
+            "/remote/artifact.bin",
+            destination,
+            max_bytes=10,
+            timeout=2,
+        )
+
+    assert caught.value.category == "submission_integrity"
+    assert [call[3] for call in sandbox.calls] == [2, 1]
+    assert not destination.exists()
+
+
+@pytest.mark.asyncio
+async def test_download_range_to_local_enforces_deadline_during_range_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "artifact.bin"
+    sandbox = _RangeSandbox([RangeResult(success=True, new_data=b"a", new_size=2)])
+    original_download_range = sandbox.download_range
+    blocked = asyncio.Event()
+
+    async def first_then_block(
+        remote_path: str,
+        *,
+        start: int,
+        max_chunk_bytes: int,
+        timeout: float = 60,
+    ) -> RangeResult:
+        if start == 0:
+            return await original_download_range(
+                remote_path,
+                start=start,
+                max_chunk_bytes=max_chunk_bytes,
+                timeout=timeout,
+            )
+        sandbox.calls.append((remote_path, start, max_chunk_bytes, timeout))
+        await blocked.wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(sandbox, "download_range", first_then_block)
+    monkeypatch.setattr("ale_run.atomic.oss_submission._DOWNLOAD_CHUNK_BYTES", 1)
+
+    with pytest.raises(AtomicInfrastructureError, match="deadline"):
+        await asyncio.wait_for(
+            download_range_to_local(
+                sandbox,
+                "/remote/artifact.bin",
+                destination,
+                max_bytes=2,
+                timeout=0.02,
+            ),
+            timeout=0.2,
+        )
+
+    assert len(sandbox.calls) == 2
+    assert not destination.exists()
+
+
+@pytest.mark.asyncio
+async def test_download_range_to_local_rejects_final_chunk_returned_after_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "artifact.bin"
+    sandbox = _RangeSandbox([RangeResult(success=True, new_data=b"a", new_size=1)])
+    clock = iter([100.0, 100.0, 103.0])
+    monkeypatch.setattr(
+        "ale_run.atomic.oss_submission._monotonic",
+        lambda: next(clock),
+    )
+
+    with pytest.raises(AtomicInfrastructureError, match="deadline"):
+        await download_range_to_local(
+            sandbox,
+            "/remote/artifact.bin",
+            destination,
+            max_bytes=1,
+            timeout=2,
+        )
+
+    assert len(sandbox.calls) == 1
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan"), True])
+@pytest.mark.asyncio
+async def test_download_range_to_local_rejects_nonpositive_or_nonfinite_timeout(
+    timeout: float,
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "artifact.bin"
+    sandbox = _RangeSandbox([RangeResult(success=True, new_data=b"", new_size=0)])
+
+    with pytest.raises(ValueError, match="timeout"):
+        await download_range_to_local(
+            sandbox,
+            "/remote/artifact.bin",
+            destination,
+            max_bytes=0,
+            timeout=timeout,
+        )
+
+    assert sandbox.calls == []
+    assert not destination.exists()
+
+
+@pytest.mark.asyncio
 async def test_download_range_to_local_rejects_stream_overrun(
     tmp_path: Path,
 ) -> None:
@@ -158,6 +284,48 @@ async def test_download_range_to_local_rejects_stream_overrun(
             "/remote/artifact.bin",
             destination,
             max_bytes=4,
+            timeout=17,
+        )
+
+    assert not destination.exists()
+
+
+@pytest.mark.asyncio
+async def test_download_range_to_local_rejects_chunk_larger_than_requested(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "artifact.bin"
+    sandbox = _RangeSandbox([RangeResult(success=True, new_data=b"abcde", new_size=5)])
+    monkeypatch.setattr("ale_run.atomic.oss_submission._DOWNLOAD_CHUNK_BYTES", 4)
+
+    with pytest.raises(RuntimeError, match="requested range"):
+        await download_range_to_local(
+            sandbox,
+            "/remote/artifact.bin",
+            destination,
+            max_bytes=10,
+            timeout=17,
+        )
+
+    assert not destination.exists()
+
+
+@pytest.mark.asyncio
+async def test_download_range_to_local_rejects_bytes_beyond_reported_total(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "artifact.bin"
+    sandbox = _RangeSandbox([RangeResult(success=True, new_data=b"abcd", new_size=3)])
+    monkeypatch.setattr("ale_run.atomic.oss_submission._DOWNLOAD_CHUNK_BYTES", 4)
+
+    with pytest.raises(RuntimeError, match="reported total"):
+        await download_range_to_local(
+            sandbox,
+            "/remote/artifact.bin",
+            destination,
+            max_bytes=10,
             timeout=17,
         )
 
@@ -186,6 +354,157 @@ async def test_download_range_to_local_rejects_truncated_stream(
         )
 
     assert not destination.exists()
+
+
+@pytest.mark.asyncio
+async def test_download_range_to_local_rejects_remote_size_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "artifact.bin"
+    sandbox = _RangeSandbox(
+        [
+            RangeResult(success=True, new_data=b"a", new_size=3),
+            RangeResult(success=True, new_data=b"b", new_size=2),
+        ]
+    )
+    monkeypatch.setattr("ale_run.atomic.oss_submission._DOWNLOAD_CHUNK_BYTES", 1)
+
+    with pytest.raises(RuntimeError, match="size changed"):
+        await download_range_to_local(
+            sandbox,
+            "/remote/artifact.bin",
+            destination,
+            max_bytes=3,
+            timeout=17,
+        )
+
+    assert not destination.exists()
+
+
+@pytest.mark.asyncio
+async def test_download_range_to_local_cleans_partial_file_on_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "artifact.bin"
+    sandbox = _RangeSandbox([RangeResult(success=True, new_data=b"a", new_size=2)])
+    monkeypatch.setattr("ale_run.atomic.oss_submission._DOWNLOAD_CHUNK_BYTES", 1)
+
+    async def cancel(*_args: object, **_kwargs: object) -> RangeResult:
+        if sandbox.calls:
+            raise asyncio.CancelledError
+        raise AssertionError("unreachable")
+
+    original_download_range = sandbox.download_range
+
+    async def first_then_cancel(
+        remote_path: str,
+        *,
+        start: int,
+        max_chunk_bytes: int,
+        timeout: float = 60,
+    ) -> RangeResult:
+        if start == 0:
+            return await original_download_range(
+                remote_path,
+                start=start,
+                max_chunk_bytes=max_chunk_bytes,
+                timeout=timeout,
+            )
+        return await cancel()
+
+    monkeypatch.setattr(sandbox, "download_range", first_then_cancel)
+
+    with pytest.raises(asyncio.CancelledError):
+        await download_range_to_local(
+            sandbox,
+            "/remote/artifact.bin",
+            destination,
+            max_bytes=2,
+            timeout=17,
+        )
+
+    assert not destination.exists()
+
+
+@pytest.mark.asyncio
+async def test_download_range_to_local_probes_zero_byte_bound_for_growth(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "artifact.bin"
+    sandbox = _RangeSandbox([RangeResult(success=True, new_data=b"x", new_size=1)])
+
+    with pytest.raises(RuntimeError, match="exceeds"):
+        await download_range_to_local(
+            sandbox,
+            "/remote/artifact.bin",
+            destination,
+            max_bytes=0,
+            timeout=17,
+        )
+
+    assert [call[1:3] for call in sandbox.calls] == [(0, 1)]
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("existing_kind", ["file", "symlink"])
+@pytest.mark.asyncio
+async def test_download_range_to_local_rejects_existing_destination(
+    existing_kind: str,
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "artifact.bin"
+    target = tmp_path / "target.bin"
+    if existing_kind == "file":
+        destination.write_bytes(b"keep")
+    else:
+        target.write_bytes(b"target")
+        destination.symlink_to(target)
+    sandbox = _RangeSandbox([RangeResult(success=True, new_data=b"replace", new_size=7)])
+
+    with pytest.raises(FileExistsError):
+        await download_range_to_local(
+            sandbox,
+            "/remote/artifact.bin",
+            destination,
+            max_bytes=7,
+            timeout=17,
+        )
+
+    assert sandbox.calls == []
+    if existing_kind == "file":
+        assert destination.read_bytes() == b"keep"
+    else:
+        assert destination.is_symlink()
+        assert target.read_bytes() == b"target"
+
+
+@pytest.mark.asyncio
+async def test_download_range_to_local_accepts_positive_short_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "artifact.bin"
+    sandbox = _RangeSandbox(
+        [
+            RangeResult(success=True, new_data=b"ab", new_size=5),
+            RangeResult(success=True, new_data=b"cd", new_size=5),
+            RangeResult(success=True, new_data=b"e", new_size=5),
+        ]
+    )
+    monkeypatch.setattr("ale_run.atomic.oss_submission._DOWNLOAD_CHUNK_BYTES", 4)
+
+    await download_range_to_local(
+        sandbox,
+        "/remote/artifact.bin",
+        destination,
+        max_bytes=5,
+        timeout=17,
+    )
+
+    assert destination.read_bytes() == b"abcde"
+    assert [call[1:3] for call in sandbox.calls] == [(0, 4), (2, 3), (4, 1)]
 
 
 @pytest.mark.asyncio
