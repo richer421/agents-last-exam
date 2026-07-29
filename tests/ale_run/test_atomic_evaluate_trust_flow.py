@@ -49,7 +49,8 @@ async def test_evaluate_gates_and_materializes_before_runtime_then_emits_v1_resu
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    request, record_payload = _registry_request(tmp_path)
+    request, record_payload, registry_root = _registry_request(tmp_path)
+    monkeypatch.setenv("ALE_EVALUATOR_REGISTRY_ROOT", str(registry_root))
     manifest = _manifest(request)
     evaluate_module = import_module("ale_run.atomic.evaluate")
     events: list[object] = []
@@ -182,8 +183,9 @@ async def test_evaluate_registry_failure_returns_bounded_infra_without_runtime(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    request, _record = _registry_request(tmp_path)
-    request = request.model_copy(update={"evaluator_registry_record_sha256": "f" * 64})
+    request, _record, registry_root = _registry_request(tmp_path)
+    next(registry_root.iterdir()).unlink()
+    monkeypatch.setenv("ALE_EVALUATOR_REGISTRY_ROOT", str(registry_root))
     evaluate_module = import_module("ale_run.atomic.evaluate")
 
     async def forbidden(*_args, **_kwargs):
@@ -215,10 +217,50 @@ async def test_evaluate_registry_failure_returns_bounded_infra_without_runtime(
     assert result.submission_id == request.submission_id
     assert result.error_category == "evaluator_registry"
     assert result.attempt_id == "attempt-registry-failure"
-    assert "SHA-256 mismatch" in result.error_detail
+    assert "cannot read evaluator registry record" in result.error_detail
     serialized = result.model_dump(mode="json")
     assert "outcome" not in serialized
     assert "score" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_evaluate_rejects_self_signed_record_outside_registry_root_before_runtime(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, _record, _outside_root = _registry_request(tmp_path)
+    configured_root = tmp_path / "configured-registry"
+    configured_root.mkdir()
+    monkeypatch.setenv("ALE_EVALUATOR_REGISTRY_ROOT", str(configured_root))
+    evaluate_module = import_module("ale_run.atomic.evaluate")
+    runtime_opened = False
+
+    @asynccontextmanager
+    async def forbidden_runtime(**_kwargs):
+        nonlocal runtime_opened
+        runtime_opened = True
+        raise AssertionError("runtime acquired for unauthorized evaluator")
+        yield
+
+    async def record_diagnostic(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        evaluate_module.AtomicRuntime,
+        "open",
+        staticmethod(forbidden_runtime),
+    )
+    monkeypatch.setattr(
+        evaluate_module,
+        "_record_attempt_diagnostic",
+        record_diagnostic,
+    )
+
+    result = await evaluate_module.evaluate(request)
+
+    assert result.status == "infra_failed"
+    assert result.error_category == "evaluator_registry"
+    assert runtime_opened is False
 
 
 @pytest.mark.asyncio
@@ -241,7 +283,8 @@ async def test_existing_canonical_result_must_match_full_trusted_identity(
     field: str,
     value: object,
 ) -> None:
-    request, record_payload = _registry_request(tmp_path)
+    request, record_payload, registry_root = _registry_request(tmp_path)
+    monkeypatch.setenv("ALE_EVALUATOR_REGISTRY_ROOT", str(registry_root))
     evaluate_module = import_module("ale_run.atomic.evaluate")
     record = evaluate_module.validate_evaluator_registry(request)
     valid = EvaluationResult(

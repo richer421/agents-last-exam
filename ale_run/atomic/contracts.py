@@ -48,8 +48,6 @@ class EvaluateRequest(BaseModel):
     submission_root: OssRoot
     evaluator_id: str
     evaluator_version: CommitSha
-    evaluator_registry_record_path: Path
-    evaluator_registry_record_sha256: Sha256
 
 
 class ArtifactEntry(BaseModel):

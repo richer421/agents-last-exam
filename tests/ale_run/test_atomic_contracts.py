@@ -43,11 +43,35 @@ def test_evaluate_request_has_no_agent_configuration(tmp_path):
         submission_root="oss://bucket",
         evaluator_id="rubric",
         evaluator_version="b" * 40,
-        evaluator_registry_record_path=tmp_path / "registry.json",
-        evaluator_registry_record_sha256="c" * 64,
     )
 
     assert "agent_id" not in type(request).model_fields
+
+
+def test_evaluate_request_has_no_request_selected_registry_authority(tmp_path):
+    payload = {
+        "submission_id": uuid4(),
+        "runtime_spec_path": tmp_path / "exp.yaml",
+        "task_repo": tmp_path,
+        "task_path": "visual_media/demo",
+        "variant_index": 0,
+        "task_commit": "a" * 40,
+        "image_id": "m-image-123",
+        "submission_root": "oss://bucket",
+        "evaluator_id": "rubric",
+        "evaluator_version": "b" * 40,
+    }
+
+    request = EvaluateRequest(**payload)
+
+    assert "evaluator_registry_record_path" not in type(request).model_fields
+    assert "evaluator_registry_record_sha256" not in type(request).model_fields
+    with pytest.raises(ValidationError):
+        EvaluateRequest(
+            **payload,
+            evaluator_registry_record_path=tmp_path / "self-signed.json",
+            evaluator_registry_record_sha256="c" * 64,
+        )
 
 
 def test_requests_require_versioned_immutable_aliyun_identity(tmp_path):

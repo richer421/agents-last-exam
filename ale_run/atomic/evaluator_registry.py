@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -27,26 +30,14 @@ _MAX_EVALUATOR_FILES = 4096
 
 def validate_evaluator_registry(
     request: EvaluateRequest,
+    registry_root: str | Path | None = None,
 ) -> EvaluatorRegistryRecord:
     """Fail closed unless the external ready record authorizes this checkout."""
-    record_path = _external_record_path(request)
-    try:
-        with record_path.open("rb") as stream:
-            raw = stream.read(_MAX_REGISTRY_RECORD_BYTES + 1)
-    except OSError as exc:
-        raise AtomicInfrastructureError(
-            "evaluator_registry",
-            f"cannot read evaluator registry record: {exc}",
-        ) from exc
+    raw = _read_registry_record(request, registry_root)
     if len(raw) > _MAX_REGISTRY_RECORD_BYTES:
         raise AtomicInfrastructureError(
             "evaluator_registry",
             "evaluator registry record exceeds the 1 MiB limit",
-        )
-    if hashlib.sha256(raw).hexdigest() != request.evaluator_registry_record_sha256:
-        raise AtomicInfrastructureError(
-            "evaluator_registry",
-            "evaluator registry record SHA-256 mismatch",
         )
     try:
         record = EvaluatorRegistryRecord.model_validate_json(raw)
@@ -199,34 +190,93 @@ def materialize_evaluator_checkout(
         yield checkout
 
 
-def _external_record_path(request: EvaluateRequest) -> Path:
+def _read_registry_record(
+    request: EvaluateRequest,
+    registry_root: str | Path | None,
+) -> bytes:
+    configured_root = (
+        registry_root
+        if registry_root is not None
+        else os.environ.get("ALE_EVALUATOR_REGISTRY_ROOT")
+    )
+    if configured_root is None or not str(configured_root):
+        raise AtomicInfrastructureError(
+            "evaluator_registry",
+            "ALE_EVALUATOR_REGISTRY_ROOT is not configured",
+        )
+    root = Path(configured_root)
+    if not root.is_absolute():
+        raise AtomicInfrastructureError(
+            "evaluator_registry",
+            "evaluator registry root must be absolute",
+        )
+
+    identity = {
+        field: getattr(request, field)
+        for field in (
+            "task_path",
+            "variant_index",
+            "task_commit",
+            "evaluator_id",
+            "evaluator_version",
+            "image_id",
+        )
+    }
+    encoded_identity = json.dumps(
+        identity,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    filename = f"{hashlib.sha256(encoded_identity).hexdigest()}.json"
+    record_path = root / filename
+    if record_path.parent != root:
+        raise AtomicInfrastructureError(
+            "evaluator_registry",
+            "evaluator registry record escapes the configured root",
+        )
+
+    root_fd: int | None = None
+    record_fd: int | None = None
     try:
-        repo = request.task_repo.resolve(strict=True)
-        raw = request.evaluator_registry_record_path
-        if raw.is_symlink():
+        root_status = root.lstat()
+        if stat.S_ISLNK(root_status.st_mode):
             raise AtomicInfrastructureError(
                 "evaluator_registry",
-                "evaluator registry record path must not be a symlink",
+                "evaluator registry root must not be a symlink",
             )
-        record = raw.resolve(strict=True)
+        if not stat.S_ISDIR(root_status.st_mode):
+            raise AtomicInfrastructureError(
+                "evaluator_registry",
+                "evaluator registry root is not a directory",
+            )
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        record_fd = os.open(
+            filename,
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=root_fd,
+        )
+        record_status = os.fstat(record_fd)
+        if not stat.S_ISREG(record_status.st_mode):
+            raise AtomicInfrastructureError(
+                "evaluator_registry",
+                "evaluator registry record is not a regular file",
+            )
+        with os.fdopen(record_fd, "rb") as stream:
+            record_fd = None
+            return stream.read(_MAX_REGISTRY_RECORD_BYTES + 1)
     except AtomicInfrastructureError:
         raise
     except OSError as exc:
         raise AtomicInfrastructureError(
             "evaluator_registry",
-            f"cannot resolve evaluator registry boundary: {exc}",
+            f"cannot read evaluator registry record: {exc}",
         ) from exc
-    if record == repo or record.is_relative_to(repo):
-        raise AtomicInfrastructureError(
-            "evaluator_registry",
-            "evaluator registry record must live outside the task checkout",
-        )
-    if not record.is_file():
-        raise AtomicInfrastructureError(
-            "evaluator_registry",
-            "evaluator registry record is not a regular file",
-        )
-    return record
+    finally:
+        if record_fd is not None:
+            os.close(record_fd)
+        if root_fd is not None:
+            os.close(root_fd)
 
 
 def _run_git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:

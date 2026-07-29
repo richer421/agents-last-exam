@@ -3,12 +3,17 @@ from __future__ import annotations
 import json
 import sys
 from types import ModuleType
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
 from ale_run import cli
-from ale_run.atomic.contracts import AtomicInfrastructureError, EvaluationResult, SolveResult
+from ale_run.atomic.contracts import (
+    AtomicInfrastructureError,
+    EvaluateRequest,
+    EvaluationResult,
+    SolveResult,
+)
 from ale_run.cli import main
 
 
@@ -123,6 +128,45 @@ def test_atomic_command_rejects_malformed_request(
     output = capsys.readouterr()
     assert output.out == ""
     assert output.err
+
+
+def test_evaluate_command_accepts_envelope_without_registry_authority(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[EvaluateRequest] = []
+
+    async def evaluate(request: EvaluateRequest) -> _Result:
+        calls.append(request)
+        return _Result("scored")
+
+    implementation = ModuleType("ale_run.atomic.evaluate")
+    implementation.evaluate = evaluate
+    monkeypatch.setitem(sys.modules, "ale_run.atomic.evaluate", implementation)
+    request_path = tmp_path / "evaluate.json"
+    request_path.write_text(
+        json.dumps(
+            {
+                "submission_id": str(uuid4()),
+                "runtime_spec_path": str(tmp_path / "runtime.yaml"),
+                "task_repo": str(tmp_path / "task-repo"),
+                "task_path": "toy",
+                "variant_index": 0,
+                "task_commit": "a" * 40,
+                "image_id": "m-image-123",
+                "submission_root": "oss://submissions",
+                "evaluator_id": "rubric",
+                "evaluator_version": "b" * 40,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["evaluate", str(request_path)]) == 0
+    assert len(calls) == 1
+    assert "evaluator_registry_record_path" not in calls[0].model_fields_set
+    assert capsys.readouterr().out == json.dumps({"status": "scored"}) + "\n"
 
 
 @pytest.mark.parametrize(

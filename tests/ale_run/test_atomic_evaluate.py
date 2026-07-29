@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import subprocess
 from contextlib import asynccontextmanager, contextmanager
@@ -30,8 +29,6 @@ from tests.ale_run.test_atomic_solve import _FakeProvider, _make_solve_request
 
 def _make_evaluate_request(tmp_path: Path) -> EvaluateRequest:
     solve_request = _make_solve_request(tmp_path)
-    record_path = tmp_path / "registry.json"
-    record_path.write_text("{}\n", encoding="utf-8")
     return EvaluateRequest(
         submission_id=solve_request.submission_id,
         runtime_spec_path=solve_request.runtime_spec_path,
@@ -43,8 +40,6 @@ def _make_evaluate_request(tmp_path: Path) -> EvaluateRequest:
         submission_root=solve_request.submission_root,
         evaluator_id="strict-evaluator",
         evaluator_version=solve_request.task_commit,
-        evaluator_registry_record_path=record_path,
-        evaluator_registry_record_sha256=hashlib.sha256(b"{}\n").hexdigest(),
     )
 
 

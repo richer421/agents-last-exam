@@ -271,8 +271,6 @@ async def test_evaluate_runtime_reference_prepare_failure_prevents_provider_acqu
         submission_root=solve_request.submission_root,
         evaluator_id="rubric",
         evaluator_version="b" * 40,
-        evaluator_registry_record_path=tmp_path / "registry.json",
-        evaluator_registry_record_sha256="c" * 64,
     )
     record = EvaluatorRegistryRecord(
         status="ready",

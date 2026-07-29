@@ -349,8 +349,6 @@ def evaluate_request(task_repo: Path, tmp_path: Path) -> EvaluateRequest:
         submission_root="oss://bucket/task-prefix",
         evaluator_id="evaluator/main",
         evaluator_version=EVALUATOR_VERSION,
-        evaluator_registry_record_path=tmp_path / "registry.json",
-        evaluator_registry_record_sha256="c" * 64,
     )
 
 
