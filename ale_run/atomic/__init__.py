@@ -9,8 +9,6 @@ from ale_run.atomic.contracts import (
     SolveResult,
     SubmissionManifest,
 )
-from ale_run.atomic.evaluate import evaluate
-from ale_run.atomic.solve import solve
 
 __all__ = [
     "ArtifactEntry",
@@ -23,3 +21,15 @@ __all__ = [
     "evaluate",
     "solve",
 ]
+
+
+def __getattr__(name: str):
+    if name == "evaluate":
+        from ale_run.atomic.evaluate import evaluate
+
+        return evaluate
+    if name == "solve":
+        from ale_run.atomic.solve import solve
+
+        return solve
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
