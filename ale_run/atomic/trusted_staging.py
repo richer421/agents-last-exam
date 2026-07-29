@@ -566,6 +566,7 @@ import hashlib
 import json
 import shutil
 import sys
+import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
 
@@ -573,8 +574,29 @@ def fail(message):
     print(json.dumps({"ok": False, "error": str(message)[:2000]}, separators=(",", ":")))
     raise SystemExit(2)
 
+def remove_path(path):
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+def validate_declared(root, declared_paths):
+    for raw in declared_paths:
+        path = PurePosixPath(raw)
+        candidate = root.joinpath(*path.parts)
+        current = root
+        for part in path.parts:
+            current = current / part
+            if current.is_symlink():
+                fail(f"declared input is or traverses a symlink: {raw}")
+        if not candidate.is_file():
+            fail(f"declared input is missing: {raw}")
+
+config_path = Path(sys.argv[1])
+archive = None
+staging_root = None
 try:
-    config = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    config = json.loads(config_path.read_text(encoding="utf-8"))
     base = Path(config["base"])
     archive_name = config.get("archive_path")
     if archive_name:
@@ -590,48 +612,74 @@ try:
             if len(infos) > config["max_files"]:
                 fail("trusted input archive exceeds file-count limit")
             total = 0
+            names = set()
             for info in infos:
                 path = PurePosixPath(info.filename)
                 if (
-                    path.is_absolute()
+                    not info.filename
+                    or path.is_absolute()
                     or any(part in {"", ".", ".."} for part in path.parts)
                     or info.is_dir()
+                    or len(path.parts) < 2
+                    or path.parts[0] not in {"input", "software"}
+                    or path.as_posix() != info.filename
+                    or "\\" in info.filename
                 ):
                     fail(f"unsafe trusted input archive member: {info.filename}")
+                if info.filename in names:
+                    fail(f"duplicate trusted input archive member: {info.filename}")
+                names.add(info.filename)
                 if info.file_size > config["max_file_bytes"]:
                     fail(f"trusted input member exceeds size limit: {info.filename}")
                 total += info.file_size
                 if total > config["max_source_bytes"]:
                     fail("trusted input archive exceeds total-size limit")
                 mode = info.external_attr >> 16
-                if mode and not (mode & 0o170000) == 0o100000:
+                if (mode & 0o170000) != 0o100000:
                     fail(f"trusted input archive member is not regular: {info.filename}")
-                target = (base / Path(*path.parts)).resolve()
-                root = base.resolve()
-                if target == root or root not in target.parents:
-                    fail(f"trusted input archive member escapes base: {info.filename}")
+                if info.flag_bits & 1:
+                    fail(f"trusted input archive member is encrypted: {info.filename}")
+            staging_root = Path(tempfile.mkdtemp(prefix=".ale-input-stage-", dir=base))
+            staging_root.chmod(0o700)
             for info in infos:
-                target = base.joinpath(*PurePosixPath(info.filename).parts)
+                target = staging_root.joinpath(*PurePosixPath(info.filename).parts)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with bundle.open(info) as source, target.open("wb") as destination:
                     shutil.copyfileobj(source, destination, 1024 * 1024)
-        archive.unlink(missing_ok=True)
-
-    for raw in config["declared_input_paths"]:
-        path = PurePosixPath(raw)
-        candidate = base.joinpath(*path.parts)
-        current = base
-        for part in path.parts:
-            current = current / part
-            if current.is_symlink():
-                fail(f"declared input is or traverses a symlink: {raw}")
-        if not candidate.is_file():
-            fail(f"declared input is missing: {raw}")
+        validate_declared(staging_root, config["declared_input_paths"])
+        backup_root = staging_root / ".previous"
+        backup_root.mkdir(mode=0o700)
+        try:
+            for name in ("input", "software"):
+                live = base / name
+                if live.is_symlink() or live.exists():
+                    live.replace(backup_root / name)
+            for name in ("input", "software"):
+                staged = staging_root / name
+                if staged.exists():
+                    staged.replace(base / name)
+        except Exception:
+            for name in ("input", "software"):
+                remove_path(base / name)
+            for name in ("input", "software"):
+                previous = backup_root / name
+                if previous.is_symlink() or previous.exists():
+                    previous.replace(base / name)
+            raise
+    else:
+        validate_declared(base, config["declared_input_paths"])
     print(json.dumps({"ok": True}, separators=(",", ":")))
 except SystemExit:
     raise
 except Exception as exc:
     fail(exc)
+finally:
+    if staging_root is not None:
+        shutil.rmtree(staging_root, ignore_errors=True)
+    if archive is not None:
+        archive.unlink(missing_ok=True)
+    config_path.unlink(missing_ok=True)
+    Path(__file__).unlink(missing_ok=True)
 """.strip()
 
 

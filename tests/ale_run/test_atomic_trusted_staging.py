@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import shutil
+import stat
 import subprocess
 import sys
+import zipfile
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,6 +22,7 @@ from ale_run.atomic.contracts import (
 )
 from ale_run.atomic.runtime import AtomicRuntime
 from ale_run.atomic.trusted_staging import (
+    PreparedInput,
     prepare_atomic_input,
     sanitize_solve_environment,
     stage_atomic_input,
@@ -78,6 +82,46 @@ def _task_data() -> TaskDataSpec:
         task_name="toy",
         variant_name="base",
     )
+
+
+def _write_input_archive(
+    root: Path,
+    members: dict[str, bytes],
+    *,
+    corrupt_member: str | None = None,
+    remove_type_metadata: bool = False,
+) -> PreparedInput:
+    archive = root / f"input-{uuid4().hex}.zip"
+    with zipfile.ZipFile(archive, mode="w", compression=zipfile.ZIP_STORED) as bundle:
+        for name, content in members.items():
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_STORED
+            info.external_attr = (stat.S_IFREG | 0o600) << 16
+            bundle.writestr(info, content)
+    if corrupt_member is not None:
+        with zipfile.ZipFile(archive) as bundle:
+            info = bundle.getinfo(corrupt_member)
+            data_offset = info.header_offset + 30 + len(info.filename.encode()) + len(info.extra)
+        contents = bytearray(archive.read_bytes())
+        contents[data_offset] ^= 0xFF
+        archive.write_bytes(contents)
+    if remove_type_metadata:
+        contents = bytearray(archive.read_bytes())
+        central_header = contents.index(b"PK\x01\x02")
+        contents[central_header + 38 : central_header + 42] = b"\0\0\0\0"
+        archive.write_bytes(contents)
+    return PreparedInput(
+        archive_path=archive,
+        archive_sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),
+    )
+
+
+def _input_base(sandbox: _LocalSandbox) -> Path:
+    return Path(sandbox.task_data_root) / "demo" / "toy" / "base"
+
+
+def _assert_no_input_staging_artifacts(base: Path) -> None:
+    assert list(base.glob(".ale-input-*")) == []
 
 
 def test_solve_environment_removes_storage_identity_without_mutating_legacy_config() -> None:
@@ -417,6 +461,179 @@ async def test_oss_input_is_downloaded_by_host_and_vm_never_receives_oss_identit
     assert "ossutil" not in vm_commands
     assert "100.100.100.200" not in vm_commands
     assert "private-bucket" not in vm_commands
+
+
+@pytest.mark.asyncio
+async def test_remote_input_cleanly_replaces_both_live_roots(tmp_path: Path) -> None:
+    sandbox = _LocalSandbox(tmp_path / "vm")
+    base = _input_base(sandbox)
+    (base / "input").mkdir(parents=True)
+    (base / "software").mkdir()
+    (base / "reference").mkdir()
+    (base / "output").mkdir()
+    (base / "input" / "required.txt").write_text("old required", encoding="utf-8")
+    (base / "input" / "stale.txt").write_text("stale input", encoding="utf-8")
+    (base / "software" / "stale.sh").write_text("stale software", encoding="utf-8")
+    (base / "reference" / "answer.txt").write_text("answer", encoding="utf-8")
+    (base / "output" / "result.txt").write_text("result", encoding="utf-8")
+    (base / "control.json").write_text("control", encoding="utf-8")
+    prepared = _write_input_archive(
+        tmp_path,
+        {
+            "input/required.txt": b"new required",
+            "input/new.txt": b"new input",
+            "software/tool.sh": b"new software",
+        },
+    )
+
+    await stage_atomic_input(
+        sandbox,
+        _task_data(),
+        source="oss://private-bucket/tasks",
+        declared_input_paths=("input/required.txt",),
+        prepared=prepared,
+    )
+
+    assert (base / "input" / "required.txt").read_bytes() == b"new required"
+    assert (base / "input" / "new.txt").read_bytes() == b"new input"
+    assert not (base / "input" / "stale.txt").exists()
+    assert (base / "software" / "tool.sh").read_bytes() == b"new software"
+    assert not (base / "software" / "stale.sh").exists()
+    assert (base / "reference" / "answer.txt").read_text(encoding="utf-8") == "answer"
+    assert (base / "output" / "result.txt").read_text(encoding="utf-8") == "result"
+    assert (base / "control.json").read_text(encoding="utf-8") == "control"
+    _assert_no_input_staging_artifacts(base)
+
+
+@pytest.mark.asyncio
+async def test_remote_input_removes_stale_software_when_archive_omits_it(
+    tmp_path: Path,
+) -> None:
+    sandbox = _LocalSandbox(tmp_path / "vm")
+    base = _input_base(sandbox)
+    (base / "software").mkdir(parents=True)
+    (base / "software" / "old-tool.sh").write_text("old", encoding="utf-8")
+    prepared = _write_input_archive(tmp_path, {"input/required.txt": b"trusted"})
+
+    await stage_atomic_input(
+        sandbox,
+        _task_data(),
+        source="oss://private-bucket/tasks",
+        declared_input_paths=("input/required.txt",),
+        prepared=prepared,
+    )
+
+    assert not (base / "software").exists()
+    assert (base / "input" / "required.txt").read_bytes() == b"trusted"
+    _assert_no_input_staging_artifacts(base)
+
+
+@pytest.mark.asyncio
+async def test_remote_input_validates_declared_paths_only_in_staged_tree(
+    tmp_path: Path,
+) -> None:
+    sandbox = _LocalSandbox(tmp_path / "vm")
+    base = _input_base(sandbox)
+    (base / "input").mkdir(parents=True)
+    (base / "input" / "required.txt").write_text("old required", encoding="utf-8")
+    prepared = _write_input_archive(tmp_path, {"input/other.txt": b"other"})
+
+    with pytest.raises(AtomicInfrastructureError, match="declared input is missing"):
+        await stage_atomic_input(
+            sandbox,
+            _task_data(),
+            source="oss://private-bucket/tasks",
+            declared_input_paths=("input/required.txt",),
+            prepared=prepared,
+        )
+
+    assert (base / "input" / "required.txt").read_text(encoding="utf-8") == "old required"
+    assert not (base / "input" / "other.txt").exists()
+    _assert_no_input_staging_artifacts(base)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("members", "corrupt_member", "remove_type_metadata"),
+    [
+        ({"../escape.txt": b"unsafe"}, None, False),
+        ({"input/required.txt": b"corrupt me"}, "input/required.txt", False),
+        ({"input/required.txt": b"untyped"}, None, True),
+    ],
+    ids=["unsafe-member", "extraction-crc-error", "unknown-member-type"],
+)
+async def test_remote_input_validation_or_extraction_failure_preserves_live_roots(
+    tmp_path: Path,
+    members: dict[str, bytes],
+    corrupt_member: str | None,
+    remove_type_metadata: bool,
+) -> None:
+    sandbox = _LocalSandbox(tmp_path / "vm")
+    base = _input_base(sandbox)
+    (base / "input").mkdir(parents=True)
+    (base / "software").mkdir()
+    (base / "input" / "required.txt").write_text("old input", encoding="utf-8")
+    (base / "software" / "tool.sh").write_text("old software", encoding="utf-8")
+    prepared = _write_input_archive(
+        tmp_path,
+        members,
+        corrupt_member=corrupt_member,
+        remove_type_metadata=remove_type_metadata,
+    )
+
+    with pytest.raises(AtomicInfrastructureError):
+        await stage_atomic_input(
+            sandbox,
+            _task_data(),
+            source="oss://private-bucket/tasks",
+            declared_input_paths=("input/required.txt",),
+            prepared=prepared,
+        )
+
+    assert (base / "input" / "required.txt").read_text(encoding="utf-8") == "old input"
+    assert (base / "software" / "tool.sh").read_text(encoding="utf-8") == "old software"
+    assert not (tmp_path / "escape.txt").exists()
+    _assert_no_input_staging_artifacts(base)
+
+
+@pytest.mark.asyncio
+async def test_remote_input_replaces_symlink_destinations_without_following_them(
+    tmp_path: Path,
+) -> None:
+    sandbox = _LocalSandbox(tmp_path / "vm")
+    base = _input_base(sandbox)
+    base.mkdir(parents=True)
+    external_input = tmp_path / "external-input"
+    external_software = tmp_path / "external-software"
+    external_input.mkdir()
+    external_software.mkdir()
+    (external_input / "old.txt").write_text("external input", encoding="utf-8")
+    (external_software / "old.sh").write_text("external software", encoding="utf-8")
+    (base / "input").symlink_to(external_input, target_is_directory=True)
+    (base / "software").symlink_to(external_software, target_is_directory=True)
+    prepared = _write_input_archive(
+        tmp_path,
+        {
+            "input/required.txt": b"new input",
+            "software/tool.sh": b"new software",
+        },
+    )
+
+    await stage_atomic_input(
+        sandbox,
+        _task_data(),
+        source="oss://private-bucket/tasks",
+        declared_input_paths=("input/required.txt",),
+        prepared=prepared,
+    )
+
+    assert not (base / "input").is_symlink()
+    assert not (base / "software").is_symlink()
+    assert (base / "input" / "required.txt").read_bytes() == b"new input"
+    assert (base / "software" / "tool.sh").read_bytes() == b"new software"
+    assert (external_input / "old.txt").read_text(encoding="utf-8") == "external input"
+    assert (external_software / "old.sh").read_text(encoding="utf-8") == "external software"
+    _assert_no_input_staging_artifacts(base)
 
 
 @pytest.mark.asyncio
