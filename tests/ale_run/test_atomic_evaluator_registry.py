@@ -128,6 +128,20 @@ def test_registry_gate_validates_ready_record_and_exact_main_ancestry(tmp_path: 
     assert record.ready_at == datetime(2026, 7, 29, tzinfo=UTC)
 
 
+def test_registry_gate_preserves_ignored_entry_semantics(tmp_path: Path) -> None:
+    request, _record_payload, registry_root = _registry_request(tmp_path)
+    exclude = request.task_repo / ".git" / "info" / "exclude"
+    with exclude.open("a", encoding="utf-8") as stream:
+        stream.write("cache/\n")
+    cache = request.task_repo / "cache"
+    cache.mkdir()
+    (cache / "build.bin").write_bytes(b"ignored evaluator cache")
+
+    record = validate_evaluator_registry(request, registry_root)
+
+    assert record.status == "ready"
+
+
 @pytest.mark.parametrize(
     "failure",
     [

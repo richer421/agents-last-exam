@@ -19,6 +19,7 @@ def _validate_task_path(value: str) -> str:
     path = PurePosixPath(value)
     if (
         not value
+        or value == "."
         or "\x00" in value
         or "\\" in value
         or path.is_absolute()

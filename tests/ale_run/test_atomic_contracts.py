@@ -21,6 +21,7 @@ from ale_run.atomic.contracts import (
     "task_path",
     [
         "",
+        ".",
         "/absolute/task",
         "../task",
         "domain/../task",

@@ -63,7 +63,11 @@ def validate_evaluator_registry(
             f"evaluator registry identity mismatch: {', '.join(mismatches)}",
         )
 
-    if _read_git_status(request.task_repo, category="evaluator_registry"):
+    if _read_git_status(
+        request.task_repo,
+        category="evaluator_registry",
+        include_ignored=False,
+    ):
         raise AtomicInfrastructureError(
             "evaluator_registry",
             "task repository has tracked or untracked changes",
@@ -126,7 +130,7 @@ def validate_git_checkout(
     category: str,
 ) -> None:
     """Require a clean repository whose HEAD is the requested commit."""
-    if _read_git_status(repo, category=category):
+    if _read_git_status(repo, category=category, include_ignored=True):
         raise AtomicInfrastructureError(
             category,
             "task repository has tracked or untracked changes",
@@ -373,20 +377,27 @@ def _run_git(
     return result
 
 
-def _read_git_status(repo: Path, *, category: str) -> bytes:
+def _read_git_status(
+    repo: Path,
+    *,
+    category: str,
+    include_ignored: bool,
+) -> bytes:
+    arguments = [
+        "git",
+        "-C",
+        str(repo),
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+    ]
+    if include_ignored:
+        arguments.append("--ignored=matching")
     with tempfile.TemporaryFile() as stderr:
         try:
             process = subprocess.Popen(
-                [
-                    "git",
-                    "-C",
-                    str(repo),
-                    "status",
-                    "--porcelain=v1",
-                    "-z",
-                    "--untracked-files=all",
-                    "--ignored=matching",
-                ],
+                arguments,
                 stdout=subprocess.PIPE,
                 stderr=stderr,
                 env=_git_environment(),
