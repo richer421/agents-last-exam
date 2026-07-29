@@ -3,14 +3,19 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
+import signal
 import subprocess
 import threading
+import time
+from contextlib import nullcontext, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
+from ale_run.atomic import evaluator_registry
 from ale_run.atomic.contracts import AtomicInfrastructureError, EvaluateRequest
 from ale_run.atomic.evaluator_registry import (
     materialize_evaluator_checkout,
@@ -237,6 +242,146 @@ def test_evaluator_materialization_ignores_git_replacement_objects(tmp_path: Pat
         assert (checkout / "tasks" / "toy" / "evaluator.py").read_text(
             encoding="utf-8"
         ) == "VERSION = 1\n"
+
+
+@pytest.mark.parametrize(
+    ("attribute", "committed_content"),
+    [
+        ("export-ignore", "must remain present\n"),
+        ("export-subst", "commit=$Format:%H$\n"),
+    ],
+)
+def test_evaluator_materialization_ignores_mutable_git_attributes(
+    tmp_path: Path,
+    attribute: str,
+    committed_content: str,
+) -> None:
+    request, _record, _registry_root = _registry_request(tmp_path)
+    task_file = request.task_repo / "tasks" / "toy" / "task.txt"
+    task_file.write_text(committed_content, encoding="utf-8")
+    evaluator_version = _commit(request.task_repo, "add attribute target")
+    request = request.model_copy(update={"evaluator_version": evaluator_version})
+    (request.task_repo / ".git" / "info" / "attributes").write_text(
+        f"tasks/toy/task.txt {attribute}\n",
+        encoding="utf-8",
+    )
+
+    with materialize_evaluator_checkout(request) as checkout:
+        assert (checkout / "tasks" / "toy" / "task.txt").read_text(
+            encoding="utf-8"
+        ) == committed_content
+
+
+def test_oversized_git_blob_is_rejected_before_materialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, _record, _registry_root = _registry_request(tmp_path)
+    materialization_root = tmp_path / "materialization"
+    materialization_root.mkdir()
+    monkeypatch.setattr(evaluator_registry, "_MAX_GIT_FILE_BYTES", 1)
+    monkeypatch.setattr(
+        evaluator_registry.tempfile,
+        "TemporaryDirectory",
+        lambda **_kwargs: nullcontext(str(materialization_root)),
+    )
+
+    with (
+        pytest.raises(AtomicInfrastructureError, match="Git file exceeds"),
+        materialize_evaluator_checkout(request),
+    ):
+        pytest.fail("oversized evaluator checkout was yielded")
+
+    assert list(materialization_root.iterdir()) == []
+
+
+def test_evaluator_materialization_terminates_stalled_git_operation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request, _record, _registry_root = _registry_request(tmp_path)
+    real_git = shutil.which("git")
+    assert real_git is not None
+    wrapper_dir = tmp_path / "bin"
+    wrapper_dir.mkdir()
+    hang_pid_path = tmp_path / "hung-git.pid"
+    git_wrapper = wrapper_dir / "git"
+    git_wrapper.write_text(
+        f"""\
+#!/bin/sh
+for argument in "$@"; do
+    case "$argument" in
+        archive|ls-tree)
+            printf '%s' "$$" > "$ALE_TEST_HANG_PID"
+            exec sleep 60
+            ;;
+    esac
+done
+exec {real_git} "$@"
+""",
+        encoding="utf-8",
+    )
+    git_wrapper.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{wrapper_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("ALE_TEST_HANG_PID", str(hang_pid_path))
+    monkeypatch.setattr(
+        evaluator_registry,
+        "_GIT_MATERIALIZATION_TIMEOUT_SECONDS",
+        0.1,
+        raising=False,
+    )
+    errors: list[BaseException] = []
+
+    def materialize() -> None:
+        try:
+            with materialize_evaluator_checkout(request):
+                pytest.fail("stalled Git checkout was yielded")
+        except BaseException as exc:  # noqa: BLE001 - capture worker failure for assertion.
+            errors.append(exc)
+
+    worker = threading.Thread(target=materialize, daemon=True)
+    worker.start()
+    worker.join(timeout=1)
+    stalled = worker.is_alive()
+    if stalled:
+        deadline = time.monotonic() + 0.5
+        while not hang_pid_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if hang_pid_path.exists():
+            with suppress(ProcessLookupError):
+                os.kill(int(hang_pid_path.read_text(encoding="utf-8")), signal.SIGKILL)
+        worker.join(timeout=1)
+
+    assert not stalled, "Git materialization exceeded its operation deadline"
+    assert len(errors) == 1
+    assert isinstance(errors[0], AtomicInfrastructureError)
+    assert "timed out" in errors[0].message
+
+
+def test_evaluator_materialization_preserves_executable_mode(tmp_path: Path) -> None:
+    request, _record, _registry_root = _registry_request(tmp_path)
+    executable = request.task_repo / "tasks" / "toy" / "run.sh"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    evaluator_version = _commit(request.task_repo, "add executable")
+    request = request.model_copy(update={"evaluator_version": evaluator_version})
+
+    with materialize_evaluator_checkout(request) as checkout:
+        assert (checkout / "tasks" / "toy" / "run.sh").stat().st_mode & 0o777 == 0o755
+        assert (checkout / "tasks" / "toy" / "evaluator.py").stat().st_mode & 0o777 == 0o644
+
+
+def test_evaluator_materialization_rejects_tracked_symlink(tmp_path: Path) -> None:
+    request, _record, _registry_root = _registry_request(tmp_path)
+    (request.task_repo / "tasks" / "toy" / "linked.py").symlink_to("evaluator.py")
+    evaluator_version = _commit(request.task_repo, "add symlink")
+    request = request.model_copy(update={"evaluator_version": evaluator_version})
+
+    with (
+        pytest.raises(AtomicInfrastructureError, match="unsafe Git tree entry"),
+        materialize_evaluator_checkout(request),
+    ):
+        pytest.fail("link-bearing evaluator checkout was yielded")
 
 
 def test_git_cleanliness_gate_fails_closed_on_excessive_status_output(tmp_path: Path) -> None:
