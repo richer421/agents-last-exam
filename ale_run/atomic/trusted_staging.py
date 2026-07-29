@@ -283,8 +283,7 @@ async def stage_atomic_input(
     archive_sha256: str | None = None
     primary_error: BaseException | None = None
     run_attempted = False
-    verifier_payload_received = False
-    preserve_staging = False
+    terminal_success = False
     try:
         if prepared is not None:
             await sandbox.upload_local_file(str(prepared.archive_path), archive_path)
@@ -318,10 +317,13 @@ async def stage_atomic_input(
                 "input",
                 "VM input verifier returned invalid JSON",
             ) from exc
-        if isinstance(payload, dict):
-            verifier_payload_received = True
-            preserve_staging = payload.get("preserve_staging") is True
-        if result.returncode != 0 or not isinstance(payload, dict) or payload.get("ok") is not True:
+        terminal_success = (
+            result.returncode == 0
+            and isinstance(payload, dict)
+            and set(payload) == {"ok"}
+            and payload["ok"] is True
+        )
+        if not terminal_success:
             detail = payload.get("error") if isinstance(payload, dict) else None
             raise AtomicInfrastructureError(
                 "input",
@@ -339,13 +341,17 @@ async def stage_atomic_input(
             config_path,
             f"{config_path}.b64",
         ]
-        if not preserve_staging and (not run_attempted or verifier_payload_received):
+        if terminal_success:
             cleanup_paths.append(staging_path)
+        elif run_attempted and primary_error is not None:
+            primary_error.add_note(
+                f"VM input staging path preserved for operator recovery: {staging_path}"
+            )
         cleanup_errors = []
         for cleanup_path in cleanup_paths:
             try:
                 await asyncio.wait_for(
-                    sandbox.rm((cleanup_path,)),
+                    _checked_remove_staging_path(sandbox, cleanup_path),
                     timeout=_STAGING_CLEANUP_TIMEOUT_SECONDS,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -356,6 +362,45 @@ async def stage_atomic_input(
                 primary_error.add_note(detail[:2000])
             else:
                 raise AtomicInfrastructureError("input", detail[:2000])
+
+
+async def _checked_remove_staging_path(
+    sandbox: SandboxHandle,
+    path: str,
+) -> None:
+    if sandbox.is_linux:
+        target = shlex.quote(path)
+        command = (
+            "# ale-input-cleanup\n"
+            f"if [ -L {target} ] || [ -e {target} ]; then rm -rf -- {target}; fi\n"
+            f"if [ -L {target} ] || [ -e {target} ]; then "
+            "echo 'cleanup target remains' >&2; exit 1; fi"
+        )
+    else:
+        target = path.replace("'", "''")
+        command = (
+            'powershell -NoProfile -Command "'
+            "$ErrorActionPreference='Stop';"
+            "$aleInputCleanup='ale-input-cleanup';"
+            f"$p='{target}';"
+            "$item=Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue;"
+            "if($null -ne $item){"
+            "if($item.LinkType){"
+            "Remove-Item -LiteralPath $p -Force -ErrorAction Stop"
+            "}else{"
+            "Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction Stop"
+            "}"
+            "};"
+            "$remaining=Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue;"
+            "if($null -ne $remaining){Write-Error 'cleanup target remains';exit 1}"
+            '"'
+        )
+    result = await sandbox.run_command(command, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"checked cleanup failed rc={result.returncode}: "
+            f"{str(result.stderr or result.stdout or '')[:500]}"
+        )
 
 
 async def stage_atomic_reference(

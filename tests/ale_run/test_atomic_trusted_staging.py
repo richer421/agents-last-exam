@@ -44,7 +44,7 @@ class _LocalSandbox:
         self.python = sys.executable
         self.task_data_root = str(root / "task-data")
         self.commands: list[str] = []
-        self.rm_calls: list[tuple[str, ...]] = []
+        self.cleanup_commands: list[str] = []
 
     async def mkdir(self, path: str) -> None:
         Path(path).mkdir(parents=True, exist_ok=True)
@@ -60,16 +60,6 @@ class _LocalSandbox:
             destination.write_bytes(content)
         else:
             destination.write_text(content, encoding="utf-8")
-
-    async def rm(self, paths) -> None:
-        requested = tuple(paths)
-        self.rm_calls.append(requested)
-        for raw in requested:
-            path = Path(raw)
-            if path.is_symlink() or path.is_file():
-                path.unlink()
-            elif path.exists():
-                shutil.rmtree(path)
 
     async def run_command(
         self,
@@ -142,11 +132,11 @@ class _OrchestrationFailingSandbox(_LocalSandbox):
         root: Path,
         failure: str,
         *,
-        cleanup_fails: bool = False,
+        cleanup_outcome: str | None = None,
     ) -> None:
         super().__init__(root)
         self.failure = failure
-        self.cleanup_fails = cleanup_fails
+        self.cleanup_outcome = cleanup_outcome
 
     async def upload_local_file(self, local_path: str, remote_path: str) -> None:
         await super().upload_local_file(local_path, remote_path)
@@ -166,16 +156,75 @@ class _OrchestrationFailingSandbox(_LocalSandbox):
         *,
         timeout: float = 60,
     ) -> subprocess.CompletedProcess[str]:
+        if "ale-input-cleanup" in command:
+            self.cleanup_commands.append(command)
+            if self.cleanup_outcome == "nonzero":
+                return subprocess.CompletedProcess(
+                    command,
+                    returncode=17,
+                    stdout="",
+                    stderr="injected cleanup nonzero",
+                )
+            if self.cleanup_outcome == "transport":
+                raise OSError("injected cleanup transport failure")
+            return await super().run_command(command, timeout=timeout)
         if self.failure == "run":
             raise RuntimeError("injected run failure")
         return await super().run_command(command, timeout=timeout)
 
-    async def rm(self, paths) -> None:
-        requested = tuple(paths)
-        self.rm_calls.append(requested)
-        if self.cleanup_fails:
-            raise OSError(f"injected cleanup failure for {requested[0]}")
-        await super().rm(requested)
+
+class _VerifierPayloadSandbox(_LocalSandbox):
+    def __init__(
+        self,
+        root: Path,
+        *,
+        stdout: str = "",
+        returncode: int = 0,
+        run_error: Exception | None = None,
+        is_linux: bool = True,
+    ) -> None:
+        super().__init__(root)
+        self.stdout = stdout
+        self.returncode = returncode
+        self.run_error = run_error
+        self.is_linux = is_linux
+        self.config_path: Path | None = None
+        self.staging_path: Path | None = None
+
+    async def write_file(self, path: str, content: str | bytes) -> None:
+        await super().write_file(path, content)
+        if path.endswith(".json"):
+            self.config_path = Path(path)
+
+    async def run_command(
+        self,
+        command: str,
+        *,
+        timeout: float = 60,
+    ) -> subprocess.CompletedProcess[str]:
+        if "ale-input-cleanup" in command:
+            self.cleanup_commands.append(command)
+            return subprocess.CompletedProcess(
+                command,
+                returncode=0,
+                stdout="",
+                stderr="",
+            )
+        assert self.config_path is not None
+        self.staging_path = self.config_path.with_suffix(".stage")
+        (self.staging_path / ".previous" / "input").mkdir(parents=True)
+        (self.staging_path / ".previous" / "input" / "required.txt").write_text(
+            "rollback copy",
+            encoding="utf-8",
+        )
+        if self.run_error is not None:
+            raise self.run_error
+        return subprocess.CompletedProcess(
+            command,
+            returncode=self.returncode,
+            stdout=self.stdout,
+            stderr="",
+        )
 
 
 def _task_data() -> TaskDataSpec:
@@ -889,17 +938,19 @@ async def test_host_removes_staging_artifacts_after_orchestration_failure(
         )
 
     _assert_no_input_staging_artifacts(base)
-    assert sandbox.rm_calls
+    assert sandbox.cleanup_commands
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup_outcome", ["nonzero", "transport"])
 async def test_host_cleanup_errors_do_not_mask_orchestration_failure(
     tmp_path: Path,
+    cleanup_outcome: str,
 ) -> None:
     sandbox = _OrchestrationFailingSandbox(
         tmp_path / "vm",
         "run",
-        cleanup_fails=True,
+        cleanup_outcome=cleanup_outcome,
     )
     prepared = _write_input_archive(tmp_path, {"input/required.txt": b"trusted"})
 
@@ -913,7 +964,158 @@ async def test_host_cleanup_errors_do_not_mask_orchestration_failure(
         )
 
     assert any("staging cleanup failed" in note for note in caught.value.__notes__)
-    assert len(sandbox.rm_calls) >= 4
+    assert len(sandbox.cleanup_commands) >= 6
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup_outcome", ["nonzero", "transport"])
+async def test_host_cleanup_failure_fails_otherwise_successful_staging(
+    tmp_path: Path,
+    cleanup_outcome: str,
+) -> None:
+    sandbox = _OrchestrationFailingSandbox(
+        tmp_path / "vm",
+        "none",
+        cleanup_outcome=cleanup_outcome,
+    )
+    prepared = _write_input_archive(tmp_path, {"input/required.txt": b"trusted"})
+
+    with pytest.raises(AtomicInfrastructureError, match="staging cleanup failed"):
+        await stage_atomic_input(
+            sandbox,
+            _task_data(),
+            source="oss://private-bucket/tasks",
+            declared_input_paths=("input/required.txt",),
+            prepared=prepared,
+        )
+
+    assert len(sandbox.cleanup_commands) >= 7
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stdout", "returncode", "run_error"),
+    [
+        (
+            '{"ok":false,"error":"verifier failed","preserve_staging":false}',
+            2,
+            None,
+        ),
+        ('{"status":"done"}', 0, None),
+        ("not-json", 2, None),
+        ("", 0, RuntimeError("injected run after backup creation")),
+    ],
+    ids=["failed-payload", "arbitrary-dict", "invalid-json", "run-exception"],
+)
+async def test_untrusted_verifier_result_preserves_and_reports_staging_path(
+    tmp_path: Path,
+    stdout: str,
+    returncode: int,
+    run_error: Exception | None,
+) -> None:
+    sandbox = _VerifierPayloadSandbox(
+        tmp_path / "vm",
+        stdout=stdout,
+        returncode=returncode,
+        run_error=run_error,
+    )
+    prepared = _write_input_archive(tmp_path, {"input/required.txt": b"trusted"})
+
+    with pytest.raises((AtomicInfrastructureError, RuntimeError)) as caught:
+        await stage_atomic_input(
+            sandbox,
+            _task_data(),
+            source="oss://private-bucket/tasks",
+            declared_input_paths=("input/required.txt",),
+            prepared=prepared,
+        )
+
+    assert sandbox.staging_path is not None
+    assert sandbox.staging_path.is_dir()
+    cleanup_commands = "\n".join(sandbox.cleanup_commands)
+    assert str(sandbox.staging_path) not in cleanup_commands
+    diagnostic = "\n".join([str(caught.value), *getattr(caught.value, "__notes__", [])])
+    assert str(sandbox.staging_path) in diagnostic
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"ok": 1},
+        {"ok": True, "error": "conflicting success"},
+        {"ok": True, "preserve_staging": False},
+        {"ok": True, "preserve_staging": True},
+    ],
+)
+async def test_untrusted_payload_cannot_spoof_terminal_success(
+    tmp_path: Path,
+    payload: dict[str, object],
+) -> None:
+    sandbox = _VerifierPayloadSandbox(
+        tmp_path / "vm",
+        stdout=json.dumps(payload),
+    )
+    prepared = _write_input_archive(tmp_path, {"input/required.txt": b"trusted"})
+
+    with pytest.raises(AtomicInfrastructureError) as caught:
+        await stage_atomic_input(
+            sandbox,
+            _task_data(),
+            source="oss://private-bucket/tasks",
+            declared_input_paths=("input/required.txt",),
+            prepared=prepared,
+        )
+
+    assert sandbox.staging_path is not None
+    assert sandbox.staging_path.is_dir()
+    assert str(sandbox.staging_path) not in "\n".join(sandbox.cleanup_commands)
+    diagnostic = "\n".join([str(caught.value), *getattr(caught.value, "__notes__", [])])
+    assert str(sandbox.staging_path) in diagnostic
+
+
+@pytest.mark.asyncio
+async def test_exact_terminal_success_authorizes_host_staging_cleanup(
+    tmp_path: Path,
+) -> None:
+    sandbox = _VerifierPayloadSandbox(tmp_path / "vm", stdout='{"ok":true}')
+    prepared = _write_input_archive(tmp_path, {"input/required.txt": b"trusted"})
+
+    await stage_atomic_input(
+        sandbox,
+        _task_data(),
+        source="oss://private-bucket/tasks",
+        declared_input_paths=("input/required.txt",),
+        prepared=prepared,
+    )
+
+    assert sandbox.staging_path is not None
+    assert str(sandbox.staging_path) in "\n".join(sandbox.cleanup_commands)
+
+
+@pytest.mark.asyncio
+async def test_windows_checked_cleanup_is_link_aware(
+    tmp_path: Path,
+) -> None:
+    sandbox = _VerifierPayloadSandbox(
+        tmp_path / "vm",
+        stdout='{"ok":true}',
+        is_linux=False,
+    )
+    prepared = _write_input_archive(tmp_path, {"input/required.txt": b"trusted"})
+
+    await stage_atomic_input(
+        sandbox,
+        _task_data(),
+        source="oss://private-bucket/tasks",
+        declared_input_paths=("input/required.txt",),
+        prepared=prepared,
+    )
+
+    cleanup = "\n".join(sandbox.cleanup_commands)
+    assert "powershell" in cleanup.lower()
+    assert "LinkType" in cleanup
+    assert "Remove-Item" in cleanup
 
 
 def test_vm_config_parse_failure_removes_known_archive_and_control_files(
