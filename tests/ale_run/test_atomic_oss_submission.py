@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 from datetime import UTC, datetime
+from importlib import import_module
 from pathlib import Path
 from uuid import UUID
 
@@ -1048,8 +1049,10 @@ def _evaluation_result(
         harbor=HarborProvenance(
             reward=reward,
             reward_path="evidence/reward.json",
+            reward_size_bytes=len(reward_bytes),
             reward_sha256=hashlib.sha256(reward_bytes).hexdigest(),
             details_path="evidence/reward-details.json",
+            details_size_bytes=len(details_bytes),
             details_sha256=hashlib.sha256(details_bytes).hexdigest(),
         ),
     )
@@ -1293,6 +1296,7 @@ async def test_evidence_and_result_publish_exact_bytes_immutably_with_result_las
     )
 
     first_url = await publish_evaluation_result(evaluate_request, result, evidence)
+    calls_before_retry = _calls(log)
     writes_before_retry = len([call for call in _calls(log) if call.get("direction") == "upload"])
     second_url = await publish_evaluation_result(evaluate_request, result, evidence)
 
@@ -1322,6 +1326,105 @@ async def test_evidence_and_result_publish_exact_bytes_immutably_with_result_las
         len([call for call in _calls(log) if call.get("direction") == "upload"])
         == writes_before_retry
     )
+    verified_downloads = [
+        call["src"]
+        for call in calls_before_retry
+        if call.get("direction") == "download" and "/evidence/" in call["src"]
+    ]
+    assert verified_downloads == [
+        f"{prefix}/evidence/reward.json",
+        f"{prefix}/evidence/reward-details.json",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_successful_evidence_upload_rejects_wrong_remote_bytes_before_result(
+    tmp_path: Path,
+    fake_oss: tuple[Path, Path],
+    evaluate_request: EvaluateRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, _log = fake_oss
+    reward_bytes = b'{"score":0.75}'
+    details_bytes = b"{}"
+    evidence = _local_evidence(
+        tmp_path,
+        reward_bytes=reward_bytes,
+        details_bytes=details_bytes,
+    )
+    result = _evaluation_result(
+        evaluate_request,
+        score=0.75,
+        outcome="valid",
+        reward_bytes=reward_bytes,
+        details_bytes=details_bytes,
+    )
+    oss_module = import_module("ale_run.atomic.oss_submission")
+    real_run = oss_module.run_host_ossutil
+
+    async def corrupt_remote(*arguments: str):
+        uploaded = await real_run(*arguments)
+        if (
+            uploaded[0] == 0
+            and arguments[0] == "cp"
+            and arguments[2].endswith("/evidence/reward.json")
+        ):
+            destination = _object_path(store, arguments[2])
+            destination.write_bytes(b"x" * destination.stat().st_size)
+        return uploaded
+
+    monkeypatch.setattr(oss_module, "run_host_ossutil", corrupt_remote)
+
+    with pytest.raises(AtomicInfrastructureError, match="reward.json") as caught:
+        await publish_evaluation_result(evaluate_request, result, evidence)
+
+    assert caught.value.category == "submission_storage"
+    prefix = (
+        f"{evaluate_request.submission_root}/output/{evaluate_request.submission_id}/"
+        f"evaluations/evaluator%2Fmain/{evaluate_request.evaluator_version}"
+    )
+    assert not _object_path(store, f"{prefix}/result.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_evidence_source_mutation_after_prehash_is_detected_remotely(
+    tmp_path: Path,
+    fake_oss: tuple[Path, Path],
+    evaluate_request: EvaluateRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, _log = fake_oss
+    reward_bytes = b'{"score":0.75}'
+    evidence = _local_evidence(
+        tmp_path,
+        reward_bytes=reward_bytes,
+        details_bytes=b"{}",
+    )
+    result = _evaluation_result(
+        evaluate_request,
+        score=0.75,
+        outcome="valid",
+        reward_bytes=reward_bytes,
+    )
+    oss_module = import_module("ale_run.atomic.oss_submission")
+    real_run = oss_module.run_host_ossutil
+
+    async def mutate_source(*arguments: str):
+        if arguments[0] == "cp" and arguments[2].endswith("/evidence/reward.json"):
+            Path(arguments[1]).write_bytes(b"x" * len(reward_bytes))
+        return await real_run(*arguments)
+
+    monkeypatch.setattr(oss_module, "run_host_ossutil", mutate_source)
+
+    with pytest.raises(AtomicInfrastructureError, match="reward.json") as caught:
+        await publish_evaluation_result(evaluate_request, result, evidence)
+
+    assert caught.value.category == "submission_storage"
+    prefix = (
+        f"{evaluate_request.submission_root}/output/{evaluate_request.submission_id}/"
+        f"evaluations/evaluator%2Fmain/{evaluate_request.evaluator_version}"
+    )
+    assert not _object_path(store, f"{prefix}/result.json").exists()
 
 
 @pytest.mark.asyncio

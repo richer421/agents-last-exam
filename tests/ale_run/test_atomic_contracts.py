@@ -218,8 +218,10 @@ def test_evaluation_result_enforces_score_and_infrastructure_failure_shape():
         "harbor": HarborProvenance(
             reward={"score": 1.0},
             reward_path="evidence/reward.json",
+            reward_size_bytes=len(b'{"score":1.0}'),
             reward_sha256=hashlib.sha256(b'{"score":1.0}').hexdigest(),
             details_path="evidence/reward-details.json",
+            details_size_bytes=2,
             details_sha256=hashlib.sha256(b"{}").hexdigest(),
         ),
     }

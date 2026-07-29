@@ -12,7 +12,7 @@ import os
 import re
 import shlex
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from time import monotonic as _monotonic
 from typing import Any
@@ -82,6 +82,7 @@ async def read_existing_submission_manifest(
 def _canonical_json(value: Any) -> bytes:
     return json.dumps(
         value,
+        allow_nan=False,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -975,6 +976,8 @@ async def publish_evaluation_result(
     request: EvaluateRequest,
     result: EvaluationResult,
     evidence_paths: Mapping[str, Path],
+    *,
+    on_result_committed: Callable[[], None] | None = None,
 ) -> str:
     """Publish immutable Harbor evidence and commit canonical result.json last."""
     if result.status != "scored":
@@ -1068,6 +1071,8 @@ async def publish_evaluation_result(
             result_url,
             "--forbid-overwrite",
         )
+        if uploaded[0] == 0 and on_result_committed is not None:
+            on_result_committed()
     if uploaded[0] == 0:
         return result_url
 
@@ -1136,6 +1141,17 @@ async def _publish_immutable_host_object(
             raise AtomicInfrastructureError(
                 "submission_storage",
                 f"published evidence verification mismatch: {url}",
+            )
+        remote = await read_host_oss_object(
+            url,
+            limit=size,
+            missing_ok=False,
+            integrity_category="submission_storage",
+        )
+        if remote is None or len(remote) != size or hashlib.sha256(remote).hexdigest() != sha256:
+            raise AtomicInfrastructureError(
+                "submission_storage",
+                f"published evidence bytes mismatch: {url}",
             )
         return
 

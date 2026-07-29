@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -155,11 +156,8 @@ async def evaluate(request: EvaluateRequest) -> EvaluationResult:
                                     "evaluator",
                                     str(raw_result["error"]),
                                 )
-                            report = raw_result.get("report") or {}
-                            outcome = (
-                                "invalid_output"
-                                if report.get("hard_gate_passed") is False
-                                else str(raw_result.get("outcome") or "valid")
+                            score, outcome, hard_gate_passed = _validate_raw_evaluator_result(
+                                raw_result
                             )
                             harbor, evidence_paths = await _stage_harbor_evidence(
                                 sandbox,
@@ -172,13 +170,13 @@ async def evaluate(request: EvaluateRequest) -> EvaluationResult:
                                 **_evaluation_identity(request),
                                 status="scored",
                                 outcome=outcome,
-                                score=float(raw_result["score"]),
+                                score=score,
                                 rubric_hash=registry_record.rubric_hash,
                                 harbor=harbor,
                             )
                             _validate_scored_result_state(
                                 result,
-                                hard_gate_passed=report.get("hard_gate_passed"),
+                                hard_gate_passed=hard_gate_passed,
                                 category="evaluator",
                             )
                         except AtomicInfrastructureError:
@@ -190,10 +188,16 @@ async def evaluate(request: EvaluateRequest) -> EvaluationResult:
                             ) from exc
 
                         try:
+
+                            def mark_result_committed() -> None:
+                                nonlocal committed_result
+                                committed_result = result
+
                             await publish_evaluation_result(
                                 request,
                                 result,
                                 evidence_paths,
+                                on_result_committed=mark_result_committed,
                             )
                         except AtomicInfrastructureError:
                             raise
@@ -313,6 +317,46 @@ def _validate_scored_result_state(
         )
 
 
+def _validate_raw_evaluator_result(
+    raw_result: object,
+) -> tuple[float, str, bool | object]:
+    if not isinstance(raw_result, dict):
+        raise AtomicInfrastructureError("evaluator", "evaluator result must be a JSON object")
+    score = raw_result.get("score")
+    if type(score) not in (int, float) or not math.isfinite(score) or not 0.0 <= score <= 1.0:
+        raise AtomicInfrastructureError(
+            "evaluator", "evaluator result score must be a finite number from 0 to 1"
+        )
+    outcome = raw_result.get("outcome")
+    if type(outcome) is not str or outcome not in {"valid", "invalid_output"}:
+        raise AtomicInfrastructureError(
+            "evaluator", "evaluator result outcome must be valid or invalid_output"
+        )
+    report = raw_result.get("report", _CANONICAL_RESULT)
+    if report is not _CANONICAL_RESULT and not isinstance(report, dict):
+        raise AtomicInfrastructureError(
+            "evaluator", "evaluator result report must be a JSON object"
+        )
+    hard_gate_passed: bool | object = _CANONICAL_RESULT
+    if isinstance(report, dict) and "hard_gate_passed" in report:
+        hard_gate_passed = report["hard_gate_passed"]
+        if type(hard_gate_passed) is not bool:
+            raise AtomicInfrastructureError(
+                "evaluator", "evaluator hard_gate_passed must be a boolean"
+            )
+    if outcome == "invalid_output":
+        if score != 0.0 or hard_gate_passed is not False:
+            raise AtomicInfrastructureError(
+                "evaluator",
+                "invalid_output requires an exact 0.0 score and hard_gate_passed false",
+            )
+    elif hard_gate_passed is False:
+        raise AtomicInfrastructureError(
+            "evaluator", "valid outcome cannot have hard_gate_passed false"
+        )
+    return float(score), outcome, hard_gate_passed
+
+
 async def _stage_harbor_evidence(
     sandbox: Any,
     request: EvaluateRequest,
@@ -374,7 +418,18 @@ async def _stage_harbor_evidence(
         )
     _validate_evidence_identity(reward, request, name="reward.json")
     _validate_evidence_identity(details, request, name="reward-details.json")
-    _validate_reward_protocol(reward, raw_result, outcome)
+    _validate_evidence_protocol(
+        reward,
+        raw_result,
+        outcome,
+        name="reward.json",
+    )
+    _validate_evidence_protocol(
+        details,
+        raw_result,
+        outcome,
+        name="reward-details.json",
+    )
 
     reward_sha256 = hashlib.sha256(reward_bytes).hexdigest()
     details_sha256 = hashlib.sha256(details_bytes).hexdigest()
@@ -393,8 +448,10 @@ async def _stage_harbor_evidence(
         HarborProvenance(
             reward=reward,
             reward_path="evidence/reward.json",
+            reward_size_bytes=len(reward_bytes),
             reward_sha256=reward_sha256,
             details_path="evidence/reward-details.json",
+            details_size_bytes=len(details_bytes),
             details_sha256=details_sha256,
         ),
         {"reward.json": reward_path, "reward-details.json": details_path},
@@ -402,14 +459,27 @@ async def _stage_harbor_evidence(
 
 
 def _parse_evidence_object(raw: bytes, *, name: str) -> dict[str, Any]:
+    return _parse_strict_json_object(raw, name=name, category="evaluator")
+
+
+def _parse_strict_json_object(
+    raw: bytes,
+    *,
+    name: str,
+    category: str,
+) -> dict[str, Any]:
+    def reject_non_finite(value: str) -> None:
+        raise ValueError(f"non-finite JSON constant {value}")
+
     try:
-        value = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        value = json.loads(raw, parse_constant=reject_non_finite)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise AtomicInfrastructureError(
-            "evaluator", f"{name} must be one complete JSON object: {exc}"
+            category,
+            f"{name} must be one complete finite JSON object: {exc}",
         ) from exc
     if not isinstance(value, dict):
-        raise AtomicInfrastructureError("evaluator", f"{name} must be a JSON object")
+        raise AtomicInfrastructureError(category, f"{name} must be a JSON object")
     return value
 
 
@@ -418,6 +488,7 @@ def _validate_evidence_identity(
     request: EvaluateRequest,
     *,
     name: str,
+    category: str = "evaluator",
 ) -> None:
     expected = {
         "submission_id": str(request.submission_id),
@@ -428,53 +499,59 @@ def _validate_evidence_identity(
         "evaluator_id": request.evaluator_id,
         "evaluator_version": request.evaluator_version,
     }
-    mismatches = [
-        field
-        for field, expected_value in expected.items()
-        if field in evidence and evidence[field] != expected_value
-    ]
+    mismatches = []
+    for field, expected_value in expected.items():
+        if field not in evidence:
+            continue
+        actual = evidence[field]
+        expected_type = int if field == "variant_index" else str
+        if type(actual) is not expected_type or actual != expected_value:
+            mismatches.append(field)
     if mismatches:
         raise AtomicInfrastructureError(
-            "evaluator", f"{name} identity mismatch: {', '.join(mismatches)}"
+            category, f"{name} identity mismatch: {', '.join(mismatches)}"
         )
 
 
-def _validate_reward_protocol(
-    reward: dict[str, Any],
+def _validate_evidence_protocol(
+    evidence: dict[str, Any],
     raw_result: dict[str, Any],
     outcome: str,
+    *,
+    name: str,
+    category: str = "evaluator",
 ) -> None:
-    if "score" in reward:
-        score = reward["score"]
-        if isinstance(score, bool) or not isinstance(score, (int, float)):
-            raise AtomicInfrastructureError("evaluator", "reward.json score must be a number")
-        if float(score) != float(raw_result["score"]):
+    if "score" in evidence:
+        score = evidence["score"]
+        if type(score) not in (int, float) or not math.isfinite(score):
+            raise AtomicInfrastructureError(category, f"{name} score must be a finite number")
+        if score != raw_result["score"]:
             raise AtomicInfrastructureError(
-                "evaluator", "reward.json score mismatch with evaluator result"
+                category, f"{name} score mismatch with evaluator result"
             )
-    if "outcome" in reward and reward["outcome"] != outcome:
-        raise AtomicInfrastructureError(
-            "evaluator", "reward.json outcome mismatch with evaluator result"
-        )
+    if "outcome" in evidence and (
+        type(evidence["outcome"]) is not str or evidence["outcome"] != outcome
+    ):
+        raise AtomicInfrastructureError(category, f"{name} outcome mismatch with evaluator result")
 
     raw_report = raw_result.get("report")
-    expected_hard_gate = (
-        raw_report.get("hard_gate_passed") if isinstance(raw_report, dict) else None
-    )
+    expected_hard_gate = outcome != "invalid_output"
+    if isinstance(raw_report, dict) and "hard_gate_passed" in raw_report:
+        expected_hard_gate = raw_report["hard_gate_passed"]
     evidence_hard_gates: list[object] = []
-    if "hard_gate_passed" in reward:
-        evidence_hard_gates.append(reward["hard_gate_passed"])
-    if "report" in reward:
-        reward_report = reward["report"]
-        if not isinstance(reward_report, dict):
-            raise AtomicInfrastructureError("evaluator", "reward.json report must be a JSON object")
-        if "hard_gate_passed" in reward_report:
-            evidence_hard_gates.append(reward_report["hard_gate_passed"])
-    if expected_hard_gate is not None and any(
-        value is not expected_hard_gate for value in evidence_hard_gates
+    if "hard_gate_passed" in evidence:
+        evidence_hard_gates.append(evidence["hard_gate_passed"])
+    if "report" in evidence:
+        evidence_report = evidence["report"]
+        if not isinstance(evidence_report, dict):
+            raise AtomicInfrastructureError(category, f"{name} report must be a JSON object")
+        if "hard_gate_passed" in evidence_report:
+            evidence_hard_gates.append(evidence_report["hard_gate_passed"])
+    if any(
+        type(value) is not bool or value is not expected_hard_gate for value in evidence_hard_gates
     ):
         raise AtomicInfrastructureError(
-            "evaluator", "reward.json hard-gate mismatch with evaluator result"
+            category, f"{name} hard-gate mismatch with evaluator result"
         )
 
 
@@ -587,7 +664,12 @@ async def _read_existing_evaluation_result(
     if raw is None:
         return None
     try:
-        result = EvaluationResult.model_validate_json(raw)
+        payload = _parse_strict_json_object(
+            raw,
+            name="result.json",
+            category="idempotency_conflict",
+        )
+        result = EvaluationResult.model_validate(payload)
     except ValidationError as exc:
         raise AtomicInfrastructureError(
             "idempotency_conflict",
@@ -609,12 +691,122 @@ async def _read_existing_evaluation_result(
             "idempotency_conflict",
             f"existing result identity mismatch: {', '.join(mismatches)}",
         )
-    if raw != _canonical_json(result.model_dump(mode="json")):
+    try:
+        canonical_result = _canonical_json(result.model_dump(mode="json"))
+    except ValueError as exc:
+        raise AtomicInfrastructureError(
+            "idempotency_conflict",
+            f"existing result.json contains non-finite JSON: {exc}",
+        ) from exc
+    if raw != canonical_result:
         raise AtomicInfrastructureError(
             "idempotency_conflict",
             "existing result.json is not canonical",
         )
+    await _verify_existing_harbor_evidence(request, result)
     return result
+
+
+async def _verify_existing_harbor_evidence(
+    request: EvaluateRequest,
+    result: EvaluationResult,
+) -> None:
+    harbor = result.harbor
+    assert harbor is not None
+    if harbor.reward_size_bytes > _MAX_REWARD_EVIDENCE_BYTES:
+        raise AtomicInfrastructureError(
+            "idempotency_conflict",
+            "reward.json declared size exceeds its 32 KiB limit",
+        )
+    if harbor.details_size_bytes > _MAX_DETAILS_EVIDENCE_BYTES:
+        raise AtomicInfrastructureError(
+            "idempotency_conflict",
+            "reward-details.json declared size exceeds its 8 MiB limit",
+        )
+    if harbor.reward_size_bytes + harbor.details_size_bytes > _MAX_HARBOR_EVIDENCE_BYTES:
+        raise AtomicInfrastructureError(
+            "idempotency_conflict",
+            "canonical Harbor evidence declared size exceeds its combined 8 MiB limit",
+        )
+
+    prefix = _evaluation_prefix(request)
+    evidence_specs = (
+        (
+            "reward.json",
+            harbor.reward_size_bytes,
+            harbor.reward_sha256,
+            _MAX_REWARD_EVIDENCE_BYTES,
+        ),
+        (
+            "reward-details.json",
+            harbor.details_size_bytes,
+            harbor.details_sha256,
+            _MAX_DETAILS_EVIDENCE_BYTES,
+        ),
+    )
+    evidence: dict[str, dict[str, Any]] = {}
+    for name, expected_size, expected_sha256, limit in evidence_specs:
+        try:
+            raw = await _read_oss_object(
+                f"{prefix}/evidence/{name}",
+                limit=limit,
+                missing_ok=False,
+            )
+        except AtomicInfrastructureError as exc:
+            raise AtomicInfrastructureError(
+                "idempotency_conflict",
+                f"{name} verification failed: {exc.message}",
+            ) from exc
+        if raw is None:
+            raise AtomicInfrastructureError(
+                "idempotency_conflict",
+                f"{name} is missing",
+            )
+        if len(raw) != expected_size:
+            raise AtomicInfrastructureError(
+                "idempotency_conflict",
+                f"{name} size mismatch with result provenance",
+            )
+        if hashlib.sha256(raw).hexdigest() != expected_sha256:
+            raise AtomicInfrastructureError(
+                "idempotency_conflict",
+                f"{name} SHA-256 mismatch with result provenance",
+            )
+        evidence[name] = _parse_strict_json_object(
+            raw,
+            name=name,
+            category="idempotency_conflict",
+        )
+
+    reward = evidence["reward.json"]
+    try:
+        reward_matches = _canonical_json(reward) == _canonical_json(harbor.reward)
+    except ValueError as exc:
+        raise AtomicInfrastructureError(
+            "idempotency_conflict",
+            f"reward.json contains non-finite JSON: {exc}",
+        ) from exc
+    if not reward_matches:
+        raise AtomicInfrastructureError(
+            "idempotency_conflict",
+            "reward.json does not match embedded Harbor reward",
+        )
+
+    raw_result = {"score": result.score, "outcome": result.outcome}
+    for name, value in evidence.items():
+        _validate_evidence_identity(
+            value,
+            request,
+            name=name,
+            category="idempotency_conflict",
+        )
+        _validate_evidence_protocol(
+            value,
+            raw_result,
+            result.outcome,
+            name=name,
+            category="idempotency_conflict",
+        )
 
 
 async def _record_attempt_diagnostic(
@@ -853,6 +1045,7 @@ def _evaluation_prefix(request: EvaluateRequest) -> str:
 def _canonical_json(value: Any) -> bytes:
     return json.dumps(
         value,
+        allow_nan=False,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,

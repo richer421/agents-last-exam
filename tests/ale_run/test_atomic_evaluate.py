@@ -121,8 +121,10 @@ def _scored_result(
         harbor=HarborProvenance(
             reward=raw_reward,
             reward_path="evidence/reward.json",
+            reward_size_bytes=len(reward_bytes),
             reward_sha256=hashlib.sha256(reward_bytes).hexdigest(),
             details_path="evidence/reward-details.json",
+            details_size_bytes=2,
             details_sha256=hashlib.sha256(b"{}").hexdigest(),
         ),
     )
@@ -263,8 +265,10 @@ async def test_stage_harbor_evidence_ranges_exact_files_and_returns_compact_prov
     assert provenance == HarborProvenance(
         reward=json.loads(reward_bytes),
         reward_path="evidence/reward.json",
+        reward_size_bytes=len(reward_bytes),
         reward_sha256=hashlib.sha256(reward_bytes).hexdigest(),
         details_path="evidence/reward-details.json",
+        details_size_bytes=len(details_bytes),
         details_sha256=hashlib.sha256(details_bytes).hexdigest(),
     )
     assert evidence_paths["reward.json"].read_bytes() == reward_bytes
@@ -285,6 +289,12 @@ async def test_stage_harbor_evidence_ranges_exact_files_and_returns_compact_prov
         ("/logs/verifier/reward.json", b"{}", "non-empty"),
         ("/logs/verifier/reward-details.json", b"null", "JSON object"),
         ("/logs/verifier/reward-details.json", b"{} trailing", "JSON object"),
+        ("/logs/verifier/reward.json", b'{"nested":{"value":NaN}}', "finite JSON"),
+        (
+            "/logs/verifier/reward-details.json",
+            b'{"nested":[Infinity,-Infinity]}',
+            "finite JSON",
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -312,6 +322,97 @@ async def test_stage_harbor_evidence_rejects_missing_or_malformed_objects(
         )
 
     assert caught.value.category == "evaluator"
+
+
+@pytest.mark.parametrize(
+    ("request_variant", "evidence_name", "evidence_update"),
+    [
+        (0, "reward.json", {"variant_index": False}),
+        (1, "reward.json", {"variant_index": True}),
+        (0, "reward.json", {"submission_id": 123}),
+        (0, "reward-details.json", {"evaluator_id": 123}),
+        (0, "reward-details.json", {"score": 0.5}),
+        (0, "reward-details.json", {"outcome": "invalid_output"}),
+        (0, "reward-details.json", {"hard_gate_passed": False}),
+        (0, "reward-details.json", {"report": {"hard_gate_passed": False}}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_stage_harbor_evidence_requires_exact_identity_types_and_protocol(
+    request_variant: int,
+    evidence_name: str,
+    evidence_update: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    request = _make_evaluate_request(tmp_path).model_copy(update={"variant_index": request_variant})
+    reward: dict[str, object] = {
+        "score": 0.75,
+        "outcome": "valid",
+        "report": {"hard_gate_passed": True},
+    }
+    details: dict[str, object] = {}
+    target = reward if evidence_name == "reward.json" else details
+    target.update(evidence_update)
+    evaluate_module = import_module("ale_run.atomic.evaluate")
+
+    with pytest.raises(AtomicInfrastructureError) as caught:
+        await evaluate_module._stage_harbor_evidence(
+            _EvidenceSandbox(
+                {
+                    "/logs/verifier/reward.json": json.dumps(reward).encode(),
+                    "/logs/verifier/reward-details.json": json.dumps(details).encode(),
+                }
+            ),
+            request,
+            {"score": 0.75, "outcome": "valid", "report": {"hard_gate_passed": True}},
+            "valid",
+            tmp_path / "private-evidence",
+        )
+
+    assert caught.value.category == "evaluator"
+    assert evidence_name in caught.value.message
+
+
+@pytest.mark.parametrize(
+    ("reward", "details", "raw_result", "outcome"),
+    [
+        (
+            {"score": 0.0, "outcome": "invalid_output", "hard_gate_passed": False},
+            {},
+            {
+                "score": 0.0,
+                "outcome": "invalid_output",
+                "report": {"hard_gate_passed": False},
+            },
+            "invalid_output",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_stage_harbor_evidence_accepts_consistent_invalid_output_protocol(
+    reward: dict[str, object],
+    details: dict[str, object],
+    raw_result: dict[str, object],
+    outcome: str,
+    tmp_path: Path,
+) -> None:
+    request = _make_evaluate_request(tmp_path)
+    evaluate_module = import_module("ale_run.atomic.evaluate")
+
+    provenance, _ = await evaluate_module._stage_harbor_evidence(
+        _EvidenceSandbox(
+            {
+                "/logs/verifier/reward.json": json.dumps(reward).encode(),
+                "/logs/verifier/reward-details.json": json.dumps(details).encode(),
+            }
+        ),
+        request,
+        raw_result,
+        outcome,
+        tmp_path / "private-evidence",
+    )
+
+    assert provenance.reward == reward
 
 
 @pytest.mark.parametrize(
@@ -544,17 +645,26 @@ def _patch_happy_path(
             HarborProvenance(
                 reward=reward,
                 reward_path="evidence/reward.json",
+                reward_size_bytes=len(reward_bytes),
                 reward_sha256=hashlib.sha256(reward_bytes).hexdigest(),
                 details_path="evidence/reward-details.json",
+                details_size_bytes=2,
                 details_sha256=hashlib.sha256(b"{}").hexdigest(),
             ),
             {"reward.json": reward_path, "reward-details.json": details_path},
         )
 
-    async def publish(actual_request, result, evidence_paths):
+    async def publish(
+        actual_request,
+        result,
+        evidence_paths,
+        *,
+        on_result_committed,
+    ):
         events.append("publish result")
         assert actual_request is request
         assert set(evidence_paths) == {"reward.json", "reward-details.json"}
+        on_result_committed()
         return "oss://canonical/result.json"
 
     async def record_diagnostic(actual_request, attempt_id, error):
@@ -813,18 +923,27 @@ async def test_evaluate_real_atomic_runtime_orders_input_and_independent_boundar
             HarborProvenance(
                 reward=raw_result,
                 reward_path="evidence/reward.json",
+                reward_size_bytes=len(reward_bytes),
                 reward_sha256=hashlib.sha256(reward_bytes).hexdigest(),
                 details_path="evidence/reward-details.json",
+                details_size_bytes=2,
                 details_sha256=hashlib.sha256(b"{}").hexdigest(),
             ),
             {"reward.json": reward_path, "reward-details.json": details_path},
         )
 
-    async def publish(actual_request, result, evidence_paths):
+    async def publish(
+        actual_request,
+        result,
+        evidence_paths,
+        *,
+        on_result_committed,
+    ):
         events.append("publish result")
         assert actual_request is request
         assert result == _scored_result(request)
         assert set(evidence_paths) == {"reward.json", "reward-details.json"}
+        on_result_committed()
         return "oss://canonical/result.json"
 
     monkeypatch.setattr(runtime_module, "load_experiment", lambda _path: runtime_spec)
@@ -883,7 +1002,7 @@ async def test_evaluate_maps_only_a_legal_hard_gate_to_invalid_output_zero(
         request,
         sandbox_result={
             "score": 0.0,
-            "outcome": "valid",
+            "outcome": "invalid_output",
             "report": {"hard_gate_passed": False},
         },
     )
@@ -896,12 +1015,88 @@ async def test_evaluate_maps_only_a_legal_hard_gate_to_invalid_output_zero(
         score=0.0,
         reward={
             "score": 0.0,
-            "outcome": "valid",
+            "outcome": "invalid_output",
             "report": {"hard_gate_passed": False},
         },
     )
     assert "publish result" in events
     assert diagnostics == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "sandbox_result",
+    [
+        {"score": True, "outcome": "valid"},
+        {"score": False, "outcome": "valid"},
+        {"score": "0.75", "outcome": "valid"},
+        {"score": float("nan"), "outcome": "valid"},
+        {"score": float("inf"), "outcome": "valid"},
+        {"score": float("-inf"), "outcome": "valid"},
+        {"score": 0.75},
+        {"score": 0.75, "outcome": 1},
+        {"score": 0.75, "outcome": "unsupported"},
+        {"score": 0.75, "outcome": "valid", "report": []},
+        {"score": 0.75, "outcome": "valid", "report": "passed"},
+        {
+            "score": 0.75,
+            "outcome": "valid",
+            "report": {"hard_gate_passed": 1},
+        },
+        {
+            "score": 0.75,
+            "outcome": "valid",
+            "report": {"hard_gate_passed": None},
+        },
+        {
+            "score": 0.75,
+            "outcome": "valid",
+            "report": {"hard_gate_passed": "true"},
+        },
+        {"score": 0.0, "outcome": "invalid_output"},
+        {"score": 0.0, "outcome": "invalid_output", "report": {}},
+        {
+            "score": 0.0,
+            "outcome": "invalid_output",
+            "report": {"hard_gate_passed": True},
+        },
+        {
+            "score": 0.0,
+            "outcome": "valid",
+            "report": {"hard_gate_passed": False},
+        },
+    ],
+)
+async def test_evaluate_rejects_malformed_raw_evaluator_protocol(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_result: dict[str, object],
+) -> None:
+    request = _make_evaluate_request(tmp_path)
+    evaluate_module, events, diagnostics = _patch_happy_path(
+        monkeypatch,
+        request,
+        sandbox_result=sandbox_result,
+    )
+
+    result = await evaluate_module.evaluate(request)
+
+    _assert_infra_result(result, request)
+    assert "stage evidence" not in events
+    assert "publish result" not in events
+    assert len(diagnostics) == 1
+    assert diagnostics[0][1].category == "evaluator"
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    ["ale_run.atomic.evaluate", "ale_run.atomic.oss_submission"],
+)
+def test_canonical_json_rejects_non_finite_numbers(module_name: str) -> None:
+    module = import_module(module_name)
+
+    with pytest.raises(ValueError):
+        module._canonical_json({"nested": [float("nan")]})
 
 
 @pytest.mark.asyncio
@@ -1302,6 +1497,77 @@ async def test_diagnostic_write_failure_cannot_disguise_infrastructure_failure_a
 
     _assert_infra_result(result, request)
     assert "publish result" not in events
+
+
+@pytest.mark.asyncio
+async def test_result_temp_cleanup_after_successful_commit_preserves_score(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _make_evaluate_request(tmp_path)
+    evaluate_module, events, attempt_diagnostics = _patch_happy_path(
+        monkeypatch,
+        request,
+    )
+    oss_module = import_module("ale_run.atomic.oss_submission")
+    cleanup_diagnostics: list[AtomicInfrastructureError] = []
+    real_temporary_directory = oss_module.tempfile.TemporaryDirectory
+
+    class RaisingResultTemporaryDirectory:
+        def __init__(self, *args, **kwargs):
+            self.prefix = kwargs.get("prefix", args[0] if args else "")
+            self.delegate = real_temporary_directory(*args, **kwargs)
+
+        def __enter__(self):
+            return self.delegate.__enter__()
+
+        def __exit__(self, exc_type, exc, traceback):
+            suppressed = self.delegate.__exit__(exc_type, exc, traceback)
+            if self.prefix == "ale-evaluation-result-":
+                raise RuntimeError("result temp cleanup failed")
+            return suppressed
+
+    async def publish_evidence(*_args, **_kwargs):
+        return None
+
+    async def run_ossutil(*arguments: str):
+        assert arguments[0] == "cp"
+        assert arguments[2].endswith("/result.json")
+        events.append("result committed")
+        return 0, b"", b""
+
+    async def record_cleanup(_request, _attempt_id, error):
+        cleanup_diagnostics.append(error)
+
+    monkeypatch.setattr(
+        oss_module.tempfile,
+        "TemporaryDirectory",
+        RaisingResultTemporaryDirectory,
+    )
+    monkeypatch.setattr(
+        oss_module,
+        "_publish_immutable_host_object",
+        publish_evidence,
+    )
+    monkeypatch.setattr(oss_module, "run_host_ossutil", run_ossutil)
+    monkeypatch.setattr(
+        evaluate_module,
+        "publish_evaluation_result",
+        oss_module.publish_evaluation_result,
+    )
+    monkeypatch.setattr(
+        evaluate_module,
+        "_record_cleanup_diagnostic",
+        record_cleanup,
+    )
+
+    result = await evaluate_module.evaluate(request)
+
+    assert result == _scored_result(request)
+    assert "result committed" in events
+    assert attempt_diagnostics == []
+    assert len(cleanup_diagnostics) == 1
+    assert cleanup_diagnostics[0].category == "cleanup"
 
 
 @pytest.mark.asyncio

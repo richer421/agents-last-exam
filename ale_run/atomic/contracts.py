@@ -156,8 +156,10 @@ class HarborProvenance(BaseModel):
 
     reward: dict[str, Any] = Field(min_length=1)
     reward_path: Literal["evidence/reward.json"]
+    reward_size_bytes: int = Field(ge=0, strict=True)
     reward_sha256: Sha256
     details_path: Literal["evidence/reward-details.json"]
+    details_size_bytes: int = Field(ge=0, strict=True)
     details_sha256: Sha256
 
 
