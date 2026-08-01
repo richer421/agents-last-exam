@@ -42,6 +42,14 @@ _GIT_BLOB_MODES = {
     b"100644": 0o644,
     b"100755": 0o755,
 }
+_EVALUATOR_REGISTRY_IDENTITY_FIELDS = (
+    "task_path",
+    "variant_index",
+    "task_commit",
+    "evaluator_id",
+    "evaluator_version",
+    "image_id",
+)
 
 
 @dataclass(frozen=True)
@@ -55,6 +63,17 @@ class _GitProcessResult:
     returncode: int
     stdout: bytes
     stderr: bytes
+
+
+def evaluator_registry_key(identity: EvaluateRequest | EvaluatorRegistryRecord) -> str:
+    """Return the lookup key shared by evaluator publication and evaluation."""
+    encoded = json.dumps(
+        {field: getattr(identity, field) for field in _EVALUATOR_REGISTRY_IDENTITY_FIELDS},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def validate_evaluator_registry(
@@ -516,24 +535,7 @@ def _read_registry_record(
             "evaluator registry root must be absolute",
         )
 
-    identity = {
-        field: getattr(request, field)
-        for field in (
-            "task_path",
-            "variant_index",
-            "task_commit",
-            "evaluator_id",
-            "evaluator_version",
-            "image_id",
-        )
-    }
-    encoded_identity = json.dumps(
-        identity,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    filename = f"{hashlib.sha256(encoded_identity).hexdigest()}.json"
+    filename = f"{evaluator_registry_key(request)}.json"
     record_path = root / filename
     if record_path.parent != root:
         raise AtomicInfrastructureError(

@@ -22,6 +22,7 @@ from .contracts import (
     AuthorEvaluatorRegistryIdentity,
     EvaluatorRegistryRecord,
 )
+from .evaluator_registry import evaluator_registry_key
 
 _MAX_RECORD_BYTES = 1024 * 1024
 _PRIVATE_DIRECTORY_MODE = 0o700
@@ -202,7 +203,6 @@ class FilesystemAuthorRegistry:
         record: EvaluatorRegistryRecord,
     ) -> EvaluatorRegistryRecord:
         self._validate_identity(identity, record)
-        temporary_name: str | None = None
         try:
             existing = self._read_record(root_fd, key, identity)
             if existing is not None:
@@ -211,15 +211,53 @@ class FilesystemAuthorRegistry:
                         "author_registry",
                         "conflicting ready record exists for authoring identity",
                     )
+                self._publish_evaluator_index(identity, existing, key)
                 return existing
+            self._write_record(root_fd, key, record)
+            self._publish_evaluator_index(identity, record, key)
+            return record
+        except AtomicInfrastructureError:
+            raise
+        except OSError as exc:
+            raise AtomicInfrastructureError(
+                "author_registry",
+                f"cannot publish author registry record: {exc}",
+            ) from exc
 
-            payload = record.model_dump_json().encode("utf-8")
-            if len(payload) > _MAX_RECORD_BYTES:
-                raise AtomicInfrastructureError(
-                    "author_registry",
-                    "author registry record exceeds the 1 MiB limit",
-                )
-            temporary_name = f".{key}.{secrets.token_hex(16)}.tmp"
+    def _publish_evaluator_index(
+        self,
+        identity: AuthorEvaluatorRegistryIdentity,
+        record: EvaluatorRegistryRecord,
+        author_key: str,
+    ) -> None:
+        evaluator_key = evaluator_registry_key(record)
+        if evaluator_key == author_key:
+            return
+        with self._locked(evaluator_key) as root_fd:
+            existing = self._read_record(root_fd, evaluator_key, identity)
+            if existing is not None:
+                if existing != record:
+                    raise AtomicInfrastructureError(
+                        "author_registry",
+                        "conflicting ready record exists for evaluator identity",
+                    )
+                return
+            self._write_record(root_fd, evaluator_key, record)
+
+    def _write_record(
+        self,
+        root_fd: int,
+        key: str,
+        record: EvaluatorRegistryRecord,
+    ) -> None:
+        payload = record.model_dump_json().encode("utf-8")
+        if len(payload) > _MAX_RECORD_BYTES:
+            raise AtomicInfrastructureError(
+                "author_registry",
+                "author registry record exceeds the 1 MiB limit",
+            )
+        temporary_name = f".{key}.{secrets.token_hex(16)}.tmp"
+        try:
             temporary_fd = os.open(
                 temporary_name,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -241,18 +279,10 @@ class FilesystemAuthorRegistry:
                 src_dir_fd=root_fd,
                 dst_dir_fd=root_fd,
             )
-            temporary_name = None
+            temporary_name = ""
             os.fsync(root_fd)
-            return record
-        except AtomicInfrastructureError:
-            raise
-        except OSError as exc:
-            raise AtomicInfrastructureError(
-                "author_registry",
-                f"cannot publish author registry record: {exc}",
-            ) from exc
         finally:
-            if temporary_name is not None:
+            if temporary_name:
                 try:
                     os.unlink(temporary_name, dir_fd=root_fd)
                 except FileNotFoundError:

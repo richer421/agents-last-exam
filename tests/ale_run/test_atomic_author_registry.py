@@ -15,8 +15,10 @@ from ale_run.atomic.author_registry import (
 from ale_run.atomic.contracts import (
     AtomicInfrastructureError,
     AuthorEvaluatorRegistryIdentity,
+    EvaluateRequest,
     EvaluatorRegistryRecord,
 )
+from ale_run.atomic.evaluator_registry import _read_registry_record
 
 
 def _identity() -> AuthorEvaluatorRegistryIdentity:
@@ -89,11 +91,35 @@ def test_filesystem_registry_atomically_publishes_and_reuses_ready_record(
     assert published == _record()
     assert registry.get_ready(_identity()) == _record()
     assert root.stat().st_mode & 0o777 == 0o700
-    records = list(root.glob("*.json"))
-    assert len(records) == 1
-    assert records[0].stat().st_mode & 0o777 == 0o600
+    records = sorted(root.glob("*.json"))
+    assert len(records) == 2
+    assert all(record.stat().st_mode & 0o777 == 0o600 for record in records)
     assert registry.publish_ready(_identity(), _record()) == _record()
-    assert list(root.glob("*.json")) == records
+    assert sorted(root.glob("*.json")) == records
+
+
+def test_author_publication_is_readable_by_evaluator_registry(tmp_path: Path) -> None:
+    root = tmp_path / "control-plane"
+    registry = FilesystemAuthorRegistry(root)
+    record = _record()
+    request = EvaluateRequest(
+        submission_id="00000000-0000-0000-0000-000000000001",
+        runtime_spec_path=tmp_path / "runtime.yaml",
+        task_repo=tmp_path / "task-repo",
+        task_path=record.task_path,
+        variant_index=record.variant_index,
+        task_commit=record.task_commit,
+        image_id=record.image_id,
+        submission_root="oss://ale-submissions/example",
+        evaluator_id=record.evaluator_id,
+        evaluator_version=record.evaluator_version,
+    )
+
+    registry.publish_ready(_identity(), record)
+
+    assert (
+        EvaluatorRegistryRecord.model_validate_json(_read_registry_record(request, root)) == record
+    )
 
 
 def test_filesystem_registry_reuses_ready_record_when_only_ready_at_differs(
@@ -122,7 +148,7 @@ def test_filesystem_registry_serializes_concurrent_same_key_publication(
         )
 
     assert published == [_record()] * 24
-    assert len(list(registry.root.glob("*.json"))) == 1
+    assert len(list(registry.root.glob("*.json"))) == 2
 
 
 @pytest.mark.asyncio
@@ -247,7 +273,7 @@ def test_filesystem_registry_fails_closed_for_corrupt_record(
 ) -> None:
     registry = FilesystemAuthorRegistry(tmp_path / "author-registry")
     registry.publish_ready(_identity(), _record())
-    record_path = next(registry.root.glob("*.json"))
+    record_path = registry.root / f"{author_registry_key(_identity())}.json"
     if corruption == "invalid":
         record_path.write_text("{}", encoding="utf-8")
     elif corruption == "oversized":
