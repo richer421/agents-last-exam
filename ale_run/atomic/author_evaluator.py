@@ -44,8 +44,8 @@ from .host_oss import read_host_oss_object
 _MAX_TASK_CONTRACT_BYTES = 1024 * 1024
 _MAX_RUBRIC_BYTES = 8 * 1024 * 1024
 _MAX_REFERENCE_MANIFEST_BYTES = 1024 * 1024
-_MAX_REFERENCE_FILE_BYTES = 8 * 1024 * 1024
-_MAX_REFERENCE_TOTAL_BYTES = 32 * 1024 * 1024
+_MAX_REFERENCE_FILE_BYTES = 128 * 1024 * 1024
+_MAX_REFERENCE_TOTAL_BYTES = 256 * 1024 * 1024
 _MAX_TEST_OUTPUT_BYTES = 1024 * 1024
 _LOCAL_TEST_TIMEOUT_SECONDS = 1800
 
@@ -347,7 +347,7 @@ async def _default_input_loader(
         if total_bytes > _MAX_REFERENCE_TOTAL_BYTES:
             raise AtomicInfrastructureError(
                 "author_input",
-                "reference artifacts exceed 32 MiB",
+                "reference artifacts exceed 256 MiB",
             )
         artifacts[entry.path] = payload
 

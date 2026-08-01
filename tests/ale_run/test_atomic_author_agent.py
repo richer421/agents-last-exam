@@ -8,7 +8,12 @@ from uuid import UUID
 
 import pytest
 
-from ale_run.atomic.author_agent import AuthorAgent, AuthorInputBundle
+from ale_run.atomic.author_agent import (
+    AuthorAgent,
+    AuthorInputBundle,
+    _stage_inputs,
+    _validate_inputs,
+)
 from ale_run.atomic.author_workspace import AuthorWorkspace
 from ale_run.atomic.contracts import (
     AtomicInfrastructureError,
@@ -134,12 +139,47 @@ def _workspace(tmp_path: Path) -> AuthorWorkspace:
     )
 
 
+def test_author_agent_stages_large_photoshop_reference(tmp_path: Path) -> None:
+    artifact = b"x" * (50 * 1024 * 1024 + 1)
+    manifest = (
+        ReferenceManifest(
+            files=(
+                ReferenceFileEntry(
+                    path="final_result.psd",
+                    size_bytes=len(artifact),
+                    sha256=hashlib.sha256(artifact).hexdigest(),
+                ),
+            )
+        )
+        .model_dump_json()
+        .encode()
+    )
+    request = _request().model_copy(
+        update={"reference_manifest_hash": hashlib.sha256(manifest).hexdigest()}
+    )
+    bundle = AuthorInputBundle(
+        task_contract_files={"task_card.json": b"{}\n"},
+        rubric=_rubric_bytes(),
+        reference_manifest=manifest,
+        reference_artifacts={"final_result.psd": artifact},
+        evaluator_sdk_contract=b"{}\n",
+        image_capability_statement=b"{}\n",
+    )
+
+    _items, reference_manifest = _validate_inputs(request, bundle)
+    output = _stage_inputs(tmp_path, bundle, reference_manifest)
+
+    staged = output.parent / "inputs" / "reference" / "artifacts" / "final_result.psd"
+    assert staged.stat().st_size == len(artifact)
+
+
 def _author_script(
     tmp_path: Path,
     *,
     plan: dict[str, object] | None = None,
     phase_one_extra: bool = False,
     phase_two_plan: dict[str, object] | None = None,
+    provider_key: str | None = None,
 ) -> tuple[str, ...]:
     script = tmp_path / "author.py"
     phases = tmp_path / "phases.log"
@@ -151,6 +191,7 @@ import os
 from pathlib import Path
 
 assert "FORBIDDEN_SECRET" not in os.environ
+{f'assert os.environ["TRUE_SOTA_API_KEY"] == {provider_key!r}' if provider_key else ''}
 output = Path(os.environ["ALE_AUTHOR_OUTPUT_DIR"])
 phase = os.environ["ALE_AUTHOR_PHASE"]
 with Path({str(phases)!r}).open("a", encoding="utf-8") as stream:
@@ -186,6 +227,21 @@ async def test_author_agent_stages_only_declared_inputs_and_runs_plan_before_cod
         encoding="utf-8"
     ) == "CHECKS = []\n"
     assert (tmp_path / "phases.log").read_text(encoding="utf-8") == "plan\nimplement\n"
+
+
+@pytest.mark.asyncio
+async def test_author_agent_forwards_only_allowlisted_provider_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRUE_SOTA_API_KEY", "true-sota-key")
+    monkeypatch.setenv("FORBIDDEN_SECRET", "must-not-leak")
+    agent = AuthorAgent(
+        _author_script(tmp_path, provider_key="true-sota-key"),
+        timeout_seconds=5,
+    )
+
+    await agent.author(_request(), _workspace(tmp_path), _bundle())
 
 
 @pytest.mark.parametrize(

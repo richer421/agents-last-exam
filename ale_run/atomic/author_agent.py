@@ -25,8 +25,10 @@ from .contracts import (
     RubricPlan,
 )
 
-_MAX_FILE_BYTES = 8 * 1024 * 1024
-_MAX_STAGED_BYTES = 32 * 1024 * 1024
+_MAX_INPUT_FILE_BYTES = 128 * 1024 * 1024
+_MAX_INPUT_BYTES = 256 * 1024 * 1024
+_MAX_OUTPUT_FILE_BYTES = 8 * 1024 * 1024
+_MAX_OUTPUT_BYTES = 32 * 1024 * 1024
 _MAX_STAGED_ENTRIES = 4096
 _DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024
 _PROCESS_KILL_WAIT_SECONDS = 1
@@ -135,7 +137,16 @@ class AuthorAgent:
     ) -> None:
         environment = {
             key: os.environ[key]
-            for key in ("PATH", "TMPDIR", "LANG", "LC_ALL", "SSL_CERT_FILE")
+            for key in (
+                "PATH",
+                "TMPDIR",
+                "LANG",
+                "LC_ALL",
+                "SSL_CERT_FILE",
+                "TRUE_SOTA_API_KEY",
+                "ALE_AUTHOR_MODEL",
+                "ALE_AUTHOR_REASONING_EFFORT",
+            )
             if key in os.environ
         }
         private_home = stage / "home"
@@ -349,11 +360,11 @@ def _stage_inputs(
     for relative, payload in files.items():
         if not isinstance(payload, bytes):
             raise AtomicInfrastructureError("author_agent", "author inputs must be bytes")
-        if len(payload) > _MAX_FILE_BYTES:
-            raise AtomicInfrastructureError("author_agent", "staged author input exceeds 8 MiB")
+        if len(payload) > _MAX_INPUT_FILE_BYTES:
+            raise AtomicInfrastructureError("author_agent", "staged author input exceeds 128 MiB")
         total += len(payload)
-        if total > _MAX_STAGED_BYTES:
-            raise AtomicInfrastructureError("author_agent", "staged author inputs exceed 32 MiB")
+        if total > _MAX_INPUT_BYTES:
+            raise AtomicInfrastructureError("author_agent", "staged author inputs exceed 256 MiB")
         destination = input_root.joinpath(*relative.parts)
         destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         descriptor = os.open(
@@ -391,8 +402,8 @@ def _input_fingerprint(root: Path) -> str:
         digest.update(stat.S_IFMT(status_result.st_mode).to_bytes(4, "big"))
         if stat.S_ISREG(status_result.st_mode):
             payload = path.read_bytes()
-            if len(payload) > _MAX_FILE_BYTES:
-                raise AtomicInfrastructureError("author_agent", "author input exceeds 8 MiB")
+            if len(payload) > _MAX_INPUT_FILE_BYTES:
+                raise AtomicInfrastructureError("author_agent", "author input exceeds 128 MiB")
             digest.update(payload)
         elif not stat.S_ISDIR(status_result.st_mode):
             raise AtomicInfrastructureError("author_agent", "unsafe staged author input")
@@ -415,10 +426,10 @@ def _validate_output_tree(root: Path) -> tuple[str, ...]:
         if ".git" in relative.parts or stat.S_ISLNK(status_result.st_mode):
             raise AtomicInfrastructureError("author_agent", "unsafe authored output entry")
         if stat.S_ISREG(status_result.st_mode):
-            if status_result.st_size > _MAX_FILE_BYTES:
+            if status_result.st_size > _MAX_OUTPUT_FILE_BYTES:
                 raise AtomicInfrastructureError("author_agent", "authored output exceeds 8 MiB")
             total += status_result.st_size
-            if total > _MAX_STAGED_BYTES:
+            if total > _MAX_OUTPUT_BYTES:
                 raise AtomicInfrastructureError("author_agent", "authored outputs exceed 32 MiB")
             files.append(relative.as_posix())
         elif not stat.S_ISDIR(status_result.st_mode):
@@ -433,7 +444,7 @@ def _load_rubric_plan(path: Path) -> RubricPlan:
         payload = path.read_bytes()
     except OSError as exc:
         raise AtomicInfrastructureError("author_agent", "cannot read rubric-plan.json") from exc
-    if len(payload) > _MAX_FILE_BYTES:
+    if len(payload) > _MAX_OUTPUT_FILE_BYTES:
         raise AtomicInfrastructureError("author_agent", "rubric-plan.json exceeds 8 MiB")
     try:
         return RubricPlan.model_validate_json(payload)

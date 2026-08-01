@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,6 +12,7 @@ import pytest
 from ale_run.atomic.author_agent import AuthoredEvaluator, AuthorInputBundle
 from ale_run.atomic.author_evaluator import (
     AuthorEvaluatorDependencies,
+    _default_input_loader,
     author_evaluator,
 )
 from ale_run.atomic.contracts import (
@@ -89,6 +92,53 @@ def _plan() -> RubricPlan:
             ),
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_default_input_loader_accepts_large_photoshop_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact = b"x" * (50 * 1024 * 1024 + 1)
+    manifest = json.dumps(
+        {
+            "schema_version": 1,
+            "files": [
+                {
+                    "path": "final_result.psd",
+                    "size_bytes": len(artifact),
+                    "sha256": hashlib.sha256(artifact).hexdigest(),
+                }
+            ],
+        },
+        separators=(",", ":"),
+    ).encode()
+    request = _request().model_copy(
+        update={"reference_manifest_hash": hashlib.sha256(manifest).hexdigest()}
+    )
+    task_directory = tmp_path / "tasks" / "demo" / "example"
+    task_directory.mkdir(parents=True)
+    (task_directory / "task_card.json").write_text("{}\n", encoding="utf-8")
+    workspace = SimpleNamespace(task_directory=task_directory)
+
+    async def read_object(uri, *, limit, **_kwargs):
+        if uri == request.rubric_uri:
+            return b'{"rubrics":[]}\n'
+        if uri == request.reference_manifest_uri:
+            return manifest
+        assert uri.endswith("/final_result.psd")
+        if limit < len(artifact):
+            raise AtomicInfrastructureError("author_input", "object exceeds limit")
+        return artifact
+
+    monkeypatch.setattr(
+        "ale_run.atomic.author_evaluator.read_host_oss_object",
+        read_object,
+    )
+
+    bundle = await _default_input_loader(request, workspace)
+
+    assert len(bundle.reference_artifacts["final_result.psd"]) == len(artifact)
 
 
 class FakeRegistry:
