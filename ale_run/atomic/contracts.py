@@ -39,6 +39,13 @@ TaskPath = Annotated[
 CommitSha = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
 AliyunImageId = Annotated[str, Field(pattern=r"^m-[A-Za-z0-9-]+$")]
 OssRoot = Annotated[str, Field(pattern=r"^oss://")]
+GitHubRepositoryUrl = Annotated[
+    str,
+    Field(
+        pattern=r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?$",
+        max_length=1_000,
+    ),
+]
 Score = Annotated[float, Field(ge=0, le=1)]
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 MediaType = Annotated[str, Field(pattern=r"^[^\s/]+/[^\s/]+$", max_length=255)]
@@ -147,6 +154,69 @@ class ReferenceManifest(BaseModel):
 
     schema_version: Literal[1] = 1
     files: tuple[ReferenceFileEntry, ...]
+
+
+class RubricPlan(BaseModel):
+    """Immutable rubric and reference inputs for evaluator authoring."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal[1] = 1
+    rubric_uri: OssRoot
+    rubric_hash: Sha256
+    reference_manifest_uri: OssRoot
+    reference_manifest_hash: Sha256
+
+
+class AuthorEvaluatorRegistryIdentity(BaseModel):
+    """The complete immutable identity of an authored evaluator."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal[1] = 1
+    task_commit: CommitSha
+    rubric_hash: Sha256
+    reference_manifest_hash: Sha256
+    evaluator_sdk_version: NonEmptyString
+    image_id: AliyunImageId
+
+
+class AuthorEvaluatorRequest(BaseModel):
+    """Authoring inputs, deliberately isolated from candidate evaluation data."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal[1] = 1
+    task_repository_url: GitHubRepositoryUrl
+    task_path: TaskPath
+    task_commit: CommitSha
+    image_id: AliyunImageId
+    evaluator_sdk_version: NonEmptyString
+    rubric_plan: RubricPlan
+    max_retries: int = Field(ge=0, le=5, strict=True)
+    timeout_seconds: int = Field(ge=1, le=3_600, strict=True)
+
+
+class AuthorEvaluatorResult(BaseModel):
+    """Terminal outcome of authoring a versioned evaluator identity."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal[1] = 1
+    status: Literal["ready", "authoring_failed"]
+    registry_identity: AuthorEvaluatorRegistryIdentity | None = None
+    error: ErrorDetail | None = None
+    completed_at: datetime
+
+    @model_validator(mode="after")
+    def require_consistent_authoring_fields(self) -> "AuthorEvaluatorResult":
+        if self.status == "ready":
+            if self.registry_identity is None or self.error is not None:
+                raise ValueError("ready results require an identity and no error")
+            return self
+        if self.registry_identity is not None or self.error is None:
+            raise ValueError("authoring_failed results require an error and no identity")
+        return self
 
 
 class HarborProvenance(BaseModel):
