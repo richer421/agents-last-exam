@@ -53,6 +53,8 @@ _CATEGORY_PATTERNS: list[tuple[str, tuple[str, ...]]] = [
             "service unavailable",
             "deadline exceeded",
             "broken pipe",
+            "launch acknowledgement unavailable",
+            "pid acknowledgement transport failed",
             "remote end closed connection",
         ),
     ),

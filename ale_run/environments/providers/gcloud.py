@@ -25,6 +25,8 @@ import logging
 import random
 import re
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
 from typing import Any
@@ -32,6 +34,7 @@ from typing import Any
 import requests
 
 from ...base_interface import SandboxSpec, Provider, ReleaseMode, SandboxHandle
+from ...base_interface.sandbox import _direct_requests_session
 
 logger = logging.getLogger(__name__)
 
@@ -569,15 +572,16 @@ async def _poll_for_ip(name: str, zone: str, project: str, timeout: float = 120)
 
 def _probe_cua(cua_url: str, payload: dict) -> tuple[bool, str]:
     try:
-        with requests.post(
-            f"{cua_url}/cmd",
-            json=payload,
-            timeout=10,
-            stream=True,
-        ) as resp:
-            if resp.status_code != 200:
-                return False, f"status={resp.status_code}"
-            data = _read_cua_sse_event(resp)
+        with _direct_requests_session() as session:
+            with session.post(
+                f"{cua_url}/cmd",
+                json=payload,
+                timeout=10,
+                stream=True,
+            ) as resp:
+                if resp.status_code != 200:
+                    return False, f"status={resp.status_code}"
+                data = _read_cua_sse_event(resp)
         if _cua_command_succeeded(data):
             return True, ""
         return False, _summarize_cua_response(data)
@@ -719,7 +723,27 @@ else:
 # ======================================================================
 
 
-def _init_computer_skip_wait(session: Any) -> None:
+def _websocket_proxy_configured(api_url: str) -> bool:
+    parsed = urllib.parse.urlparse(api_url)
+    host = parsed.hostname
+    if not host or urllib.request.proxy_bypass(host):
+        return False
+
+    proxies = urllib.request.getproxies()
+    schemes = (
+        ("wss", "socks", "https")
+        if parsed.scheme == "https"
+        else (
+            "ws",
+            "socks",
+            "https",
+            "http",
+        )
+    )
+    return any(proxies.get(scheme) for scheme in schemes)
+
+
+def _init_computer_skip_wait(session: Any, *, prefer_websocket: bool = False) -> None:
     from computer import Computer
     from computer.interface.factory import InterfaceFactory
 
@@ -736,6 +760,9 @@ def _init_computer_skip_wait(session: Any) -> None:
         ip_address=session._api_host,
         api_port=session._api_port,
     )
+    if prefer_websocket:
+        # cua-computer has no transport flag; its REST client ignores env proxies.
+        interface._send_command = interface._send_command_ws
     computer._interface = interface
     computer._original_interface = interface
     computer._initialized = True
@@ -937,7 +964,10 @@ class GcloudProvider(Provider):
         w, h = resolution
         remote_path = r"C:\agenthle\_set_resolution.py"
         session = RemoteDesktopSession(api_url=cua_url, os_type="windows")
-        _init_computer_skip_wait(session)
+        _init_computer_skip_wait(
+            session,
+            prefer_websocket=_websocket_proxy_configured(cua_url),
+        )
         await session.run_command(
             r"cmd /c if not exist C:\agenthle mkdir C:\agenthle", check=False,
         )
@@ -982,7 +1012,10 @@ class GcloudProvider(Provider):
         )
 
         session = RemoteDesktopSession(api_url=cua_url, os_type=os_type)
-        _init_computer_skip_wait(session)
+        _init_computer_skip_wait(
+            session,
+            prefer_websocket=_websocket_proxy_configured(cua_url),
+        )
         await session.run_command(mk, check=False)
         await session.write_bytes(dest, data)
         logger.info("gcloud: injected GCS SA key -> %s (project=%s)", dest, project_id)
@@ -1013,7 +1046,10 @@ class GcloudProvider(Provider):
             api_url=vm.endpoint,
             os_type=vm.os,
         )
-        _init_computer_skip_wait(session)
+        _init_computer_skip_wait(
+            session,
+            prefer_websocket=_websocket_proxy_configured(vm.endpoint),
+        )
         return session
 
 

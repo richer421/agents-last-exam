@@ -1,4 +1,5 @@
 """CLI entry: ``python -m ale run experiments/foo.yaml``."""
+
 from __future__ import annotations
 
 import argparse
@@ -7,8 +8,10 @@ import json
 import logging
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 import ale_run as ale
+
 from .orchestration import Runner
 from .orchestration.config_loader import load_experiment
 from .orchestration.experiment_spec import RunUnit
@@ -32,25 +35,53 @@ def main(argv: list[str] | None = None) -> int:
 
     p_run = subparsers.add_parser("run", help="Run an experiment yaml.")
     p_run.add_argument("spec_path", type=Path, help="Path to experiment yaml.")
-    p_run.add_argument("--dry-run", action="store_true",
-                       help="Show the run matrix without executing.")
-    p_run.add_argument("--agent", action="append", dest="filter_agents",
-                       metavar="ID", help="Filter: only run agents with these ids.")
-    p_run.add_argument("--task", action="append", dest="filter_tasks",
-                       metavar="PATH", help="Filter: only run these task paths.")
     p_run.add_argument(
-        "--disable-resume", action="store_true",
+        "--dry-run", action="store_true", help="Show the run matrix without executing."
+    )
+    p_run.add_argument(
+        "--agent",
+        action="append",
+        dest="filter_agents",
+        metavar="ID",
+        help="Filter: only run agents with these ids.",
+    )
+    p_run.add_argument(
+        "--task",
+        action="append",
+        dest="filter_tasks",
+        metavar="PATH",
+        help="Filter: only run these task paths.",
+    )
+    p_run.add_argument(
+        "--disable-resume",
+        action="store_true",
         help="Run every selected unit exactly once, without scanning prior "
-             "results or automatically retrying failures.",
+        "results or automatically retrying failures.",
     )
     p_run.add_argument("--verbose", "-v", action="store_true")
 
     p_list = subparsers.add_parser("list", help="List discoverable tasks.")
     p_list.add_argument("--verbose", "-v", action="store_true")
 
+    p_solve = subparsers.add_parser("solve", help="Run one atomic solve request.")
+    p_solve.add_argument("request_path", type=Path, help="Path to solve request JSON.")
+
+    p_evaluate = subparsers.add_parser("evaluate", help="Run one atomic evaluate request.")
+    p_evaluate.add_argument("request_path", type=Path, help="Path to evaluate request JSON.")
+
+    p_author_evaluator = subparsers.add_parser(
+        "author-evaluator",
+        help="Run one atomic evaluator authoring request.",
+    )
+    p_author_evaluator.add_argument(
+        "request_path",
+        type=Path,
+        help="Path to author evaluator request JSON.",
+    )
+
     args = parser.parse_args(argv)
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
+        level=logging.DEBUG if getattr(args, "verbose", False) else logging.INFO,
         format="%(asctime)s  %(levelname)-7s  %(name)s  %(message)s",
     )
 
@@ -58,12 +89,71 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_cmd_run(args))
     if args.cmd == "list":
         return _cmd_list(args)
+    if args.cmd == "solve":
+        from .atomic.contracts import SolveRequest, SolveResult
+        from .atomic.solve import solve
+
+        return asyncio.run(
+            _run_atomic(
+                SolveRequest,
+                solve,
+                args.request_path,
+                lambda request, error: SolveResult(
+                    status="failed",
+                    submission_id=request.submission_id,
+                    error=error,
+                ),
+            )
+        )
+    if args.cmd == "evaluate":
+        from .atomic.contracts import EvaluateRequest, EvaluationResult
+        from .atomic.evaluate import evaluate
+
+        return asyncio.run(
+            _run_atomic(
+                EvaluateRequest,
+                evaluate,
+                args.request_path,
+                lambda request, error: EvaluationResult(
+                    status="infra_failed",
+                    submission_id=request.submission_id,
+                    task_path=request.task_path,
+                    variant_index=request.variant_index,
+                    task_commit=request.task_commit,
+                    image_id=request.image_id,
+                    evaluator_id=request.evaluator_id,
+                    evaluator_version=request.evaluator_version,
+                    error_category="cli",
+                    error_detail=error,
+                    attempt_id=f"cli-{uuid4().hex}",
+                ),
+            )
+        )
+    if args.cmd == "author-evaluator":
+        from .atomic.author_evaluator import author_evaluator
+        from .atomic.contracts import AuthorEvaluatorRequest, AuthorEvaluatorResult
+
+        return asyncio.run(
+            _run_atomic(
+                AuthorEvaluatorRequest,
+                author_evaluator,
+                args.request_path,
+                lambda request, error: AuthorEvaluatorResult(
+                    status="authoring_failed",
+                    authoring_id=request.authoring_id,
+                    evaluator_id=request.evaluator_id,
+                    error_category="cli",
+                    error_detail=error,
+                ),
+            )
+        )
     return 1
 
 
 # =============================================================================
 # Commands
 # =============================================================================
+
 
 async def _cmd_run(args: argparse.Namespace) -> int:
     spec = load_experiment(args.spec_path)
@@ -76,7 +166,9 @@ async def _cmd_run(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         env = spec.environment
-        kinds = sorted(set(env.snapshot_kind.values()) | ({env.default_kind} if env.default_kind else set()))
+        kinds = sorted(
+            set(env.snapshot_kind.values()) | ({env.default_kind} if env.default_kind else set())
+        )
         if env.snapshot_kind:
             routing = ", ".join(f"{s}->{k}" for s, k in sorted(env.snapshot_kind.items()))
             env_desc = f"{'+'.join(kinds)} ({routing})"
@@ -111,6 +203,24 @@ def _cmd_list(args: argparse.Namespace) -> int:
 # =============================================================================
 # Helpers
 # =============================================================================
+
+
+async def _run_atomic(request_type, operation, request_path: Path, error_result) -> int:
+    try:
+        request = request_type.model_validate_json(request_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"invalid atomic request: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        result = await operation(request)
+    except Exception as exc:  # noqa: BLE001 - CLI boundary converts operation failures to results.
+        error = (str(exc).strip() or exc.__class__.__name__)[:1_000]
+        print(f"atomic operation failed: {error}", file=sys.stderr)
+        result = error_result(request, error)
+    print(result.model_dump_json())
+    return 0 if result.status in {"submitted", "scored", "ready"} else 1
+
 
 def _filter_units(units: list[RunUnit], args: argparse.Namespace) -> list[RunUnit]:
     if args.filter_agents:
@@ -159,7 +269,8 @@ def _filter_resume(units: list[RunUnit], output_root: Path) -> list[RunUnit]:
     if skipped:
         logger.info(
             "resume: %d unit(s) already completed/timeout — skipping; running %d",
-            skipped, len(keep),
+            skipped,
+            len(keep),
         )
     else:
         logger.info("resume: no prior completed/timeout runs found; running all %d", len(keep))

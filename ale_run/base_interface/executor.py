@@ -7,8 +7,8 @@ The framework recognises three Executor types (in :mod:`ale_run.executors`):
 * :class:`DockerExecutor`  — ``docker run`` a fresh container per unit,
                              ship the deployer + ALE source into it,
                              entrypoint runs the deployer in-container.
-* :class:`SandboxExecutor` — scp the ALE source to the sandbox VM,
-                             ``cua.python_exec`` a bootstrap that runs
+* :class:`SandboxExecutor` — upload and extract an ALE source archive in the
+                             sandbox VM, then start a bootstrap that runs
                              the deployer inside the sandbox itself.
 
 What the executor IS to a deployer
@@ -71,6 +71,7 @@ class GatherReport:
     files: int = 0
     bytes: int = 0
     error: str | None = None
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -97,7 +98,7 @@ class BaseExecutor(abc.ABC):
     sandbox: SandboxHandle
     """The cua-server eval target. Deployer reads ``sandbox.endpoint /
     .os / .work_dir_base / ...`` to talk to its evaluation environment.
-    The Executor itself uses the handle internally for scp + cua RPC
+    The Executor itself uses the handle internally for archive upload + cua RPC
     when the substrate IS the sandbox (SandboxExecutor)."""
 
     env: dict[str, str] = field(default_factory=dict)
@@ -248,6 +249,7 @@ class BaseExecutor(abc.ABC):
         src: str,
         start: int,
         max_bytes: int,
+        timeout_s: float | None = None,
     ) -> RangeResult:
         """Read ``[start, start+max_bytes)`` of ``src`` on the substrate.
 
@@ -257,4 +259,5 @@ class BaseExecutor(abc.ABC):
         transcript.jsonl / stderr.log etc.) for sandbox runs; for local
         and docker runs the file IS on host and callers can just read
         directly — but the method is implemented uniformly so callers
-        don't have to special-case substrate type."""
+        don't have to special-case substrate type. ``timeout_s`` bounds the
+        underlying transport operation when the substrate supports it."""

@@ -22,8 +22,15 @@ egress); the AliyunProvider images bake both.
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
+import os
 import shlex
+import tempfile
+import urllib.request
+import zipfile
+from pathlib import Path
 from typing import Any
 
 from ...base_interface import SandboxHandle, TaskDataSpec
@@ -35,6 +42,7 @@ logger = logging.getLogger(__name__)
 async def stage_input(
     sandbox: SandboxHandle, task_data: TaskDataSpec, *, source: str,
 ) -> dict[str, Any]:
+    await _ensure_ossutil(sandbox)
     oss_prefix = _oss_prefix(source, task_data)
     base = task_subdir(sandbox, task_data)
     await sandbox.mkdir(base)
@@ -70,6 +78,7 @@ async def stage_input(
 async def stage_reference(
     sandbox: SandboxHandle, task_data: TaskDataSpec, *, source: str,
 ) -> dict[str, Any]:
+    await _ensure_ossutil(sandbox)
     oss_prefix = _oss_prefix(source, task_data)
     base = task_subdir(sandbox, task_data)
     src = f"{oss_prefix}/reference"
@@ -113,6 +122,136 @@ async def _has_baked_files(sandbox: SandboxHandle, path: str) -> bool:
 # the owner's — mirrors gcloud's ale-data-public / aws's requester-pays bucket).
 # Every read must carry --payer requester or OSS returns AccessDenied.
 _RP = "--payer requester"
+_WINDOWS_OSSUTIL = r"C:\Windows\Temp\ale-ossutil.exe"
+_WINDOWS_OSS_ENDPOINT = "oss-ap-southeast-1-internal.aliyuncs.com"
+_OSSUTIL_VERSION = "1.7.18"
+_OSSUTIL_WINDOWS_URL = (
+    f"https://gosspublic.alicdn.com/ossutil/{_OSSUTIL_VERSION}/ossutil64.zip"
+)
+_OSSUTIL_WINDOWS_ZIP_SHA256 = (
+    "6604343a846717a8ac4dbd77536cc6f802f4d1e6d2d51aa88524e92b8d6a0e42"
+)
+_OSSUTIL_WINDOWS_EXE_SHA256 = (
+    "ac5b0b40f20f380a14ef2d9ee9a8ae7f06f37789f9c75b08fbb61e1173c101a4"
+)
+
+
+def _windows_ossutil_candidates() -> list[Path]:
+    user_cache = Path(
+        os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))
+    ) / "ale"
+    return [
+        user_cache / f"ossutil-{_OSSUTIL_VERSION}/ossutil64.exe",
+    ]
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _resolve_windows_ossutil() -> Path:
+    configured = os.environ.get("ALE_OSSUTIL_WINDOWS_BIN")
+    if configured:
+        path = Path(configured).expanduser()
+        if not path.is_file():
+            raise RuntimeError(
+                f"ALE_OSSUTIL_WINDOWS_BIN does not exist: {path}"
+            )
+        return path
+
+    candidates = _windows_ossutil_candidates()
+    for path in candidates:
+        if path.is_file() and _file_sha256(path) == _OSSUTIL_WINDOWS_EXE_SHA256:
+            return path
+        path.unlink(missing_ok=True)
+
+    destination = candidates[-1]
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        archive = Path(tmp.name)
+    try:
+        with urllib.request.urlopen(_OSSUTIL_WINDOWS_URL, timeout=60) as response:
+            payload = response.read(20 * 1024 * 1024 + 1)
+        if len(payload) > 20 * 1024 * 1024:
+            raise RuntimeError("ossutil bootstrap archive exceeds 20 MiB")
+        digest = hashlib.sha256(payload).hexdigest()
+        if digest != _OSSUTIL_WINDOWS_ZIP_SHA256:
+            raise RuntimeError(
+                f"ossutil bootstrap checksum mismatch: {digest}"
+            )
+        archive.write_bytes(payload)
+        with zipfile.ZipFile(archive) as bundle:
+            member = bundle.getinfo("ossutil64/ossutil64.exe")
+            if member.file_size > 20 * 1024 * 1024:
+                raise RuntimeError("ossutil executable exceeds 20 MiB")
+            binary = bundle.read(member)
+        binary_digest = hashlib.sha256(binary).hexdigest()
+        if binary_digest != _OSSUTIL_WINDOWS_EXE_SHA256:
+            raise RuntimeError(
+                f"ossutil executable checksum mismatch: {binary_digest}"
+            )
+        with tempfile.NamedTemporaryFile(
+            dir=destination.parent, suffix=".tmp", delete=False,
+        ) as tmp_binary:
+            staged = Path(tmp_binary.name)
+            tmp_binary.write(binary)
+        try:
+            os.replace(staged, destination)
+        finally:
+            staged.unlink(missing_ok=True)
+        return destination
+    except Exception as exc:
+        raise RuntimeError(
+            "unable to bootstrap Windows ossutil; set "
+            "ALE_OSSUTIL_WINDOWS_BIN to a verified ossutil executable: "
+            f"{exc}"
+        ) from exc
+    finally:
+        archive.unlink(missing_ok=True)
+
+
+async def _ensure_ossutil(sandbox: SandboxHandle) -> None:
+    if sandbox.is_linux:
+        return
+    probe = await sandbox.run_command(
+        f"powershell -NoProfile -Command \"if (Test-Path -LiteralPath "
+        f"'{_WINDOWS_OSSUTIL}') {{ exit 0 }} else {{ exit 1 }}\"",
+        timeout=30,
+    )
+    if probe.returncode == 0:
+        return
+    binary_path = await asyncio.to_thread(_resolve_windows_ossutil)
+    binary = await asyncio.to_thread(binary_path.read_bytes)
+    await sandbox.write_file(_WINDOWS_OSSUTIL, binary)
+
+
+def _oss_command(sandbox: SandboxHandle, arguments: str) -> str:
+    if sandbox.is_linux:
+        return f"ossutil {arguments}"
+    metadata_url = (
+        "http://100.100.100.200/latest/meta-data/ram/security-credentials/"
+    )
+    return (
+        'powershell -NoProfile -Command "'
+        f"$role=(Invoke-RestMethod -UseBasicParsing -Uri '{metadata_url}').Trim(); "
+        f"& '{_WINDOWS_OSSUTIL}' {arguments} --mode EcsRamRole "
+        f"--ecs-role-name $role -e {_WINDOWS_OSS_ENDPOINT}"
+        '"'
+    )
+
+
+# Output upload and task-data staging must use the same resolved executable,
+# endpoint, and RAM-role authentication contract.
+ensure_ossutil = _ensure_ossutil
+oss_command = _oss_command
+
+
+def powershell_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 
 
 async def _oss_exists(sandbox: SandboxHandle, oss_url: str) -> bool:
@@ -122,16 +261,14 @@ async def _oss_exists(sandbox: SandboxHandle, oss_url: str) -> bool:
     rather than rely on the exit code — we ask for at most one object and parse
     the ``Object Number is: N`` summary line ossutil prints."""
     url = oss_url.rstrip("/") + "/"
-    if sandbox.is_linux:
-        cmd = f"ossutil ls {_RP} {shlex.quote(url)} --limited-num 1"
-    else:
-        cmd = (
-            "powershell -NoProfile -Command \""
-            f"ossutil ls {_RP} '{url}' --limited-num 1\""
-        )
+    quoted_url = shlex.quote(url) if sandbox.is_linux else powershell_literal(url)
+    cmd = _oss_command(sandbox, f"ls {_RP} {quoted_url} --limited-num 1")
     r = await sandbox.run_command(cmd, timeout=30)
     if r.returncode != 0:
-        return False
+        diagnostic = (r.stderr or r.stdout or "unknown ossutil failure").strip()
+        raise RuntimeError(
+            f"ossutil ls failed for {url} (rc={r.returncode}): {diagnostic[:300]}"
+        )
     out = (r.stdout or "")
     # "Object Number is: 0" → empty; any object line starts with the oss:// url.
     if "Object Number is: 0" in out:
@@ -148,9 +285,7 @@ def _sync_cmd(sandbox: SandboxHandle, src: str, dst: str) -> str:
             f"mkdir -p {shlex.quote(dst)} && "
             f"ossutil sync {_RP} {shlex.quote(src)} {shlex.quote(dst)}"
         )
-    return (
-        'powershell -NoProfile -Command "'
-        f"New-Item -ItemType Directory -Force -Path '{dst}' | Out-Null; "
-        f"ossutil sync {_RP} '{src}' '{dst}'"
-        '"'
+    return _oss_command(
+        sandbox,
+        f"sync {_RP} {powershell_literal(src)} {powershell_literal(dst)}",
     )

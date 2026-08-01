@@ -29,6 +29,119 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_MAX_EVAL_DETAILS_BYTES = 256 * 1024
+_SENSITIVE_DETAIL_KEY = re.compile(
+    r"(?i)^(?:access[_-]?key(?:_id)?|api[_-]?key|authorization|credentials?|"
+    r"password|secret|security[_-]?token|signature|token)$"
+)
+_SENSITIVE_QUERY_VALUE = re.compile(
+    r"(?i)(AccessKeyId|Signature|SecurityToken|AccessKeySecret|api[_-]?key|"
+    r"password|secret|token)=([^&\s\"']+)"
+)
+_AUTH_HEADER_VALUE = re.compile(r"(?i)(Authorization\s*:\s*(?:Bearer|Basic)\s+)\S+")
+_BARE_AUTH_VALUE = re.compile(r"(?i)\b(Bearer|Basic)\s+[^\s,;]+")
+_COLON_SECRET_VALUE = re.compile(r"(?i)\b(token|secret|password|api[_-]?key|cookie)\s*:\s*[^\s,;]+")
+_PRIVATE_KEY_BLOCK = re.compile(
+    r"-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?-----END [^-\r\n]*PRIVATE KEY-----",
+    re.DOTALL,
+)
+
+
+def _redact_text(value: str) -> str:
+    value = _SENSITIVE_QUERY_VALUE.sub(r"\1=[REDACTED]", value)
+    value = _AUTH_HEADER_VALUE.sub(r"\1[REDACTED]", value)
+    value = _BARE_AUTH_VALUE.sub(r"\1 [REDACTED]", value)
+    value = _COLON_SECRET_VALUE.sub(r"\1: [REDACTED]", value)
+    return _PRIVATE_KEY_BLOCK.sub("[REDACTED PRIVATE KEY]", value)
+
+
+def _redact_detail_values(
+    value: Any,
+    *,
+    seen: set[int] | None = None,
+    depth: int = 0,
+) -> Any:
+    if depth > 64:
+        raise ValueError("metadata nesting exceeds 64 levels")
+    if isinstance(value, str):
+        return _redact_text(value)
+    if seen is None:
+        seen = set()
+    if isinstance(value, (dict, list, tuple)):
+        identity = id(value)
+        if identity in seen:
+            raise ValueError("cyclic metadata")
+        seen.add(identity)
+    else:
+        identity = None
+    if isinstance(value, dict):
+        result = {
+            _redact_text(str(key)): (
+                "[REDACTED]"
+                if _SENSITIVE_DETAIL_KEY.search(str(key))
+                else _redact_detail_values(item, seen=seen, depth=depth + 1)
+            )
+            for key, item in value.items()
+        }
+    elif isinstance(value, (list, tuple)):
+        result = [_redact_detail_values(item, seen=seen, depth=depth + 1) for item in value]
+    elif value is None or isinstance(value, (bool, int, float)):
+        result = value
+    else:
+        result = _redact_text(str(value))
+    if identity is not None:
+        seen.remove(identity)
+    return result
+
+
+def _bounded_eval_details(details: dict[str, Any] | None) -> dict[str, Any] | None:
+    if details is None:
+        return None
+    try:
+        redacted = _redact_detail_values(details)
+        encoded = json.dumps(
+            redacted, ensure_ascii=False, default=str, separators=(",", ":")
+        ).encode("utf-8")
+    except Exception as exc:  # noqa: BLE001 - persistence must never break finalize
+        return {"_omitted": f"evaluator details were not serializable: {type(exc).__name__}"}
+    if len(encoded) > _MAX_EVAL_DETAILS_BYTES:
+        return {
+            "_omitted": f"evaluator details exceeded {_MAX_EVAL_DETAILS_BYTES} bytes",
+            "_bytes": len(encoded),
+        }
+    return redacted
+
+
+def _bounded_eval_error(error: dict[str, Any] | None) -> dict[str, Any] | None:
+    if error is None:
+        return None
+    try:
+        redacted = _redact_detail_values(error)
+        encoded = json.dumps(
+            redacted, ensure_ascii=False, default=str, separators=(",", ":")
+        ).encode("utf-8")
+    except Exception as exc:  # noqa: BLE001 - persistence must never break finalize
+        return {"type": type(exc).__name__, "message": "evaluation error metadata omitted"}
+    if len(encoded) > _MAX_EVAL_DETAILS_BYTES:
+        return {
+            "type": "OversizedMetadata",
+            "message": f"evaluation error exceeded {_MAX_EVAL_DETAILS_BYTES} bytes",
+        }
+    return redacted
+
+
+def sanitize_terminal_metadata(value: Any) -> Any:
+    """Redact JSON terminal metadata without allowing diagnostics to break writes."""
+    try:
+        return _redact_detail_values(value)
+    except Exception as exc:  # noqa: BLE001
+        return {"_omitted": f"terminal metadata was not serializable: {type(exc).__name__}"}
+
+
+def sanitize_evaluation_log(value: str) -> str:
+    return _redact_text(value)
+
+
 # ----------------------------------------------------------------- slugs
 
 _SLUG_RE = re.compile(r"[^a-z0-9-]+")
@@ -83,11 +196,7 @@ class RunWriter:
         )
         variant_dir.mkdir(parents=True, exist_ok=True)
         for collision_index in range(1000):
-            self._ts = (
-                base_ts
-                if collision_index == 0
-                else f"{base_ts}_{collision_index:02d}"
-            )
+            self._ts = base_ts if collision_index == 0 else f"{base_ts}_{collision_index:02d}"
             self._run_dir = variant_dir / self._ts
             try:
                 self._run_dir.mkdir(exist_ok=False)
@@ -95,9 +204,7 @@ class RunWriter:
                 continue
             break
         else:
-            raise FileExistsError(
-                f"could not allocate a unique run dir under {variant_dir}"
-            )
+            raise FileExistsError(f"could not allocate a unique run dir under {variant_dir}")
         (self._run_dir / "origin_log").mkdir(parents=True, exist_ok=True)
         (self._run_dir / "output").mkdir(parents=True, exist_ok=True)
 
@@ -136,7 +243,7 @@ class RunWriter:
             "run_id": self._run_id,
         }
         if data:
-            payload["data"] = data
+            payload["data"] = sanitize_terminal_metadata(data)
         line = json.dumps(payload, default=str, ensure_ascii=False)
         try:
             self._events_fh.write(line + "\n")
@@ -152,7 +259,12 @@ class RunWriter:
         path = self._run_dir / "run.json"
         try:
             path.write_text(
-                json.dumps(meta, indent=2, ensure_ascii=False, default=str),
+                json.dumps(
+                    sanitize_terminal_metadata(meta),
+                    indent=2,
+                    ensure_ascii=False,
+                    default=str,
+                ),
                 encoding="utf-8",
             )
         except OSError as e:
@@ -176,13 +288,15 @@ class RunWriter:
         score: float | None,
         eval_duration_s: float | None,
         error: dict[str, Any] | None,
+        details: dict[str, Any] | None = None,
     ) -> None:
         path = self._run_dir / "eval_result.json"
         payload = {
             "eval_status": eval_status,
             "score": score,
             "eval_duration_s": eval_duration_s,
-            "error": error,
+            "error": _bounded_eval_error(error),
+            "details": _bounded_eval_details(details),
         }
         try:
             path.write_text(
