@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import hashlib
 import json
 import os
 import secrets
 import stat
+import threading
+from collections.abc import AsyncIterator, Iterator
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Protocol
 
@@ -31,8 +35,21 @@ _IDENTITY_FIELDS = (
 )
 
 
+class AuthorRegistryTransaction(Protocol):
+    """One same-identity authoring transaction."""
+
+    def get_ready(self) -> EvaluatorRegistryRecord | None: ...
+
+    def publish_ready(self, record: EvaluatorRegistryRecord) -> EvaluatorRegistryRecord: ...
+
+
 class AuthorRegistry(Protocol):
     """Injected persistence boundary for authored evaluator identities."""
+
+    def claim(
+        self,
+        identity: AuthorEvaluatorRegistryIdentity,
+    ) -> AbstractAsyncContextManager[AuthorRegistryTransaction]: ...
 
     def get_ready(
         self,
@@ -62,6 +79,8 @@ class FilesystemAuthorRegistry:
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
+        self._claim_locks: dict[str, threading.Lock] = {}
+        self._claim_locks_guard = threading.Lock()
         if not self.root.is_absolute():
             raise AtomicInfrastructureError(
                 "author_registry",
@@ -79,17 +98,32 @@ class FilesystemAuthorRegistry:
         root_fd = self._open_root()
         os.close(root_fd)
 
+    @asynccontextmanager
+    async def claim(
+        self,
+        identity: AuthorEvaluatorRegistryIdentity,
+    ) -> AsyncIterator[AuthorRegistryTransaction]:
+        """Hold the same-identity lock without blocking the event loop."""
+        key = author_registry_key(identity)
+        acquisition = asyncio.create_task(asyncio.to_thread(self._acquire_claim, key))
+        try:
+            root_fd, lock_fd = await asyncio.shield(acquisition)
+        except asyncio.CancelledError:
+            acquisition.add_done_callback(lambda task: self._release_cancelled_claim(task, key))
+            raise
+        try:
+            yield _FilesystemAuthorRegistryTransaction(self, identity, root_fd, key)
+        finally:
+            self._release_claim(root_fd, lock_fd, key)
+
     def get_ready(
         self,
         identity: AuthorEvaluatorRegistryIdentity,
     ) -> EvaluatorRegistryRecord | None:
         key = author_registry_key(identity)
-        root_fd = self._open_root()
-        lock_fd: int | None = None
         try:
-            lock_fd = self._open_lock(root_fd, key)
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            return self._read_record(root_fd, key, identity)
+            with self._locked(key) as root_fd:
+                return self._read_record(root_fd, key, identity)
         except AtomicInfrastructureError:
             raise
         except OSError as exc:
@@ -97,10 +131,6 @@ class FilesystemAuthorRegistry:
                 "author_registry",
                 f"cannot read author registry: {exc}",
             ) from exc
-        finally:
-            if lock_fd is not None:
-                os.close(lock_fd)
-            os.close(root_fd)
 
     def publish_ready(
         self,
@@ -109,15 +139,100 @@ class FilesystemAuthorRegistry:
     ) -> EvaluatorRegistryRecord:
         self._validate_identity(identity, record)
         key = author_registry_key(identity)
-        root_fd = self._open_root()
-        lock_fd: int | None = None
-        temporary_name: str | None = None
         try:
+            with self._locked(key) as root_fd:
+                return self._publish_ready_locked(root_fd, key, identity, record)
+        except AtomicInfrastructureError:
+            raise
+        except OSError as exc:
+            raise AtomicInfrastructureError(
+                "author_registry",
+                f"cannot publish author registry record: {exc}",
+            ) from exc
+
+    @contextmanager
+    def _locked(self, key: str) -> Iterator[int]:
+        local_lock = self._claim_lock(key)
+        local_lock.acquire()
+        root_fd: int | None = None
+        lock_fd: int | None = None
+        try:
+            root_fd = self._open_root()
             lock_fd = self._open_lock(root_fd, key)
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield root_fd
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
+            if root_fd is not None:
+                os.close(root_fd)
+            local_lock.release()
+
+    def _acquire_claim(self, key: str) -> tuple[int, int]:
+        local_lock = self._claim_lock(key)
+        local_lock.acquire()
+        root_fd: int | None = None
+        lock_fd: int | None = None
+        acquired = False
+        try:
+            root_fd = self._open_root()
+            lock_fd = self._open_lock(root_fd, key)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            acquired = True
+            return root_fd, lock_fd
+        except AtomicInfrastructureError:
+            raise
+        except OSError as exc:
+            raise AtomicInfrastructureError(
+                "author_registry",
+                f"cannot claim author registry transaction: {exc}",
+            ) from exc
+        finally:
+            if not acquired:
+                if lock_fd is not None:
+                    os.close(lock_fd)
+                if root_fd is not None:
+                    os.close(root_fd)
+                local_lock.release()
+
+    def _release_cancelled_claim(
+        self,
+        acquisition: asyncio.Task[tuple[int, int]],
+        key: str,
+    ) -> None:
+        if acquisition.cancelled():
+            return
+        try:
+            root_fd, lock_fd = acquisition.result()
+        except (AtomicInfrastructureError, asyncio.CancelledError):
+            return
+        self._release_claim(root_fd, lock_fd, key)
+
+    def _release_claim(self, root_fd: int, lock_fd: int, key: str | None) -> None:
+        try:
+            os.close(lock_fd)
+        finally:
+            os.close(root_fd)
+            if key is not None:
+                self._claim_lock(key).release()
+
+    def _claim_lock(self, key: str) -> threading.Lock:
+        with self._claim_locks_guard:
+            return self._claim_locks.setdefault(key, threading.Lock())
+
+    def _publish_ready_locked(
+        self,
+        root_fd: int,
+        key: str,
+        identity: AuthorEvaluatorRegistryIdentity,
+        record: EvaluatorRegistryRecord,
+    ) -> EvaluatorRegistryRecord:
+        self._validate_identity(identity, record)
+        temporary_name: str | None = None
+        try:
             existing = self._read_record(root_fd, key, identity)
             if existing is not None:
-                if existing != record:
+                if existing.model_copy(update={"ready_at": record.ready_at}) != record:
                     raise AtomicInfrastructureError(
                         "author_registry",
                         "conflicting ready record exists for authoring identity",
@@ -168,9 +283,6 @@ class FilesystemAuthorRegistry:
                     os.unlink(temporary_name, dir_fd=root_fd)
                 except FileNotFoundError:
                     pass
-            if lock_fd is not None:
-                os.close(lock_fd)
-            os.close(root_fd)
 
     def _open_root(self) -> int:
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -305,3 +417,36 @@ class FilesystemAuthorRegistry:
                 "author_registry",
                 f"author registry identity mismatch: {', '.join(mismatches)}",
             )
+
+
+class _FilesystemAuthorRegistryTransaction:
+    def __init__(
+        self,
+        registry: FilesystemAuthorRegistry,
+        identity: AuthorEvaluatorRegistryIdentity,
+        root_fd: int,
+        key: str,
+    ) -> None:
+        self._registry = registry
+        self._identity = identity
+        self._root_fd = root_fd
+        self._key = key
+
+    def get_ready(self) -> EvaluatorRegistryRecord | None:
+        try:
+            return self._registry._read_record(self._root_fd, self._key, self._identity)
+        except AtomicInfrastructureError:
+            raise
+        except OSError as exc:
+            raise AtomicInfrastructureError(
+                "author_registry",
+                f"cannot read author registry: {exc}",
+            ) from exc
+
+    def publish_ready(self, record: EvaluatorRegistryRecord) -> EvaluatorRegistryRecord:
+        return self._registry._publish_ready_locked(
+            self._root_fd,
+            self._key,
+            self._identity,
+            record,
+        )

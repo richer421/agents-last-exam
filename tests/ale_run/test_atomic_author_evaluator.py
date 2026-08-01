@@ -97,6 +97,13 @@ class FakeRegistry:
         self.publish_error = publish_error
         self.get_calls = []
         self.publish_calls = []
+        self._claims = {}
+
+    @asynccontextmanager
+    async def claim(self, identity):
+        lock = self._claims.setdefault(identity.model_dump_json(), asyncio.Lock())
+        async with lock:
+            yield FakeRegistryClaim(self, identity)
 
     def get_ready(self, identity):
         self.get_calls.append(identity)
@@ -106,7 +113,20 @@ class FakeRegistry:
         self.publish_calls.append((identity, record))
         if self.publish_error:
             raise self.publish_error
-        return record
+        self.existing = self.existing or record
+        return self.existing
+
+
+class FakeRegistryClaim:
+    def __init__(self, registry, identity) -> None:
+        self.registry = registry
+        self.identity = identity
+
+    def get_ready(self):
+        return self.registry.get_ready(self.identity)
+
+    def publish_ready(self, record):
+        return self.registry.publish_ready(self.identity, record)
 
 
 class FakeAgent:
@@ -237,6 +257,30 @@ async def test_author_evaluator_reuses_ready_registry_without_other_dependencies
     assert agent.calls == []
     assert publisher.calls == []
     assert registry.publish_calls == []
+
+
+@pytest.mark.asyncio
+async def test_author_evaluator_serializes_same_identity_authoring() -> None:
+    registry = FakeRegistry()
+    agent = FakeAgent(delay=0.01)
+    publisher = FakePublisher()
+    dependencies = _dependencies(registry=registry, agent=agent, publisher=publisher)
+    second_request = _request().model_copy(
+        update={"authoring_id": UUID("00000000-0000-0000-0000-000000000002")}
+    )
+
+    first, second = await asyncio.gather(
+        author_evaluator(_request(), dependencies=dependencies),
+        author_evaluator(second_request, dependencies=dependencies),
+    )
+
+    assert len(agent.calls) == 1
+    assert len(publisher.calls) == 1
+    assert [first.authoring_id, second.authoring_id] == [
+        _request().authoring_id,
+        second_request.authoring_id,
+    ]
+    assert first.status == second.status == "ready"
 
 
 @pytest.mark.parametrize("failure_stage", ["author", "tests", "publish", "registry"])

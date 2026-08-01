@@ -109,54 +109,55 @@ async def _invoke_author_evaluator(
     dependencies: AuthorEvaluatorDependencies,
 ) -> AuthorEvaluatorResult:
     identity = _registry_identity(request)
-    existing = dependencies.registry.get_ready(identity)
-    if existing is not None:
-        _validate_ready_record(request, existing)
-        return _ready_result(request, existing)
+    async with dependencies.registry.claim(identity) as transaction:
+        existing = transaction.get_ready()
+        if existing is not None:
+            _validate_ready_record(request, existing)
+            return _ready_result(request, existing)
 
-    async with dependencies.workspace_factory(request) as workspace:
-        inputs = await dependencies.input_loader(request, workspace)
-        last_authoring_failure: AtomicInfrastructureError | None = None
-        for attempt in range(request.max_retries + 1):
-            try:
-                await dependencies.author_agent.author(request, workspace, inputs)
-                last_authoring_failure = None
-                break
-            except AtomicInfrastructureError as exc:
-                last_authoring_failure = exc
-                if attempt == request.max_retries:
-                    raise
-        assert last_authoring_failure is None
-        await dependencies.local_test_runner(workspace, float(request.timeout_seconds))
-        publication = await dependencies.publisher.publish(
-            repository_url=request.task_repository_url,
-            task_path=request.task_path,
-            evaluator_id=request.evaluator_id,
-            workspace=workspace,
-            timeout_seconds=float(request.timeout_seconds),
-        )
+        async with dependencies.workspace_factory(request) as workspace:
+            inputs = await dependencies.input_loader(request, workspace)
+            last_authoring_failure: AtomicInfrastructureError | None = None
+            for attempt in range(request.max_retries + 1):
+                try:
+                    await dependencies.author_agent.author(request, workspace, inputs)
+                    last_authoring_failure = None
+                    break
+                except AtomicInfrastructureError as exc:
+                    last_authoring_failure = exc
+                    if attempt == request.max_retries:
+                        raise
+            assert last_authoring_failure is None
+            await dependencies.local_test_runner(workspace, float(request.timeout_seconds))
+            publication = await dependencies.publisher.publish(
+                repository_url=request.task_repository_url,
+                task_path=request.task_path,
+                evaluator_id=request.evaluator_id,
+                workspace=workspace,
+                timeout_seconds=float(request.timeout_seconds),
+            )
 
-        record = EvaluatorRegistryRecord(
-            status="ready",
-            task_path=request.task_path,
-            variant_index=request.variant_index,
-            task_commit=request.task_commit,
-            evaluator_id=request.evaluator_id,
-            evaluator_version=publication.evaluator_version,
-            rubric_hash=request.rubric_hash,
-            reference_manifest_uri=request.reference_manifest_uri,
-            reference_manifest_hash=request.reference_manifest_hash,
-            evaluator_sdk_version=request.evaluator_sdk_version,
-            harbor_version=dependencies.harbor_version,
-            rewardkit_version=dependencies.rewardkit_version,
-            image_id=request.image_id,
-            pull_request_url=publication.pull_request_url,
-            ci_run_id=publication.ci_run_id,
-            ready_at=dependencies.now(),
-        )
-        published = dependencies.registry.publish_ready(identity, record)
-        _validate_ready_record(request, published)
-        return _ready_result(request, published)
+            record = EvaluatorRegistryRecord(
+                status="ready",
+                task_path=request.task_path,
+                variant_index=request.variant_index,
+                task_commit=request.task_commit,
+                evaluator_id=request.evaluator_id,
+                evaluator_version=publication.evaluator_version,
+                rubric_hash=request.rubric_hash,
+                reference_manifest_uri=request.reference_manifest_uri,
+                reference_manifest_hash=request.reference_manifest_hash,
+                evaluator_sdk_version=request.evaluator_sdk_version,
+                harbor_version=dependencies.harbor_version,
+                rewardkit_version=dependencies.rewardkit_version,
+                image_id=request.image_id,
+                pull_request_url=publication.pull_request_url,
+                ci_run_id=publication.ci_run_id,
+                ready_at=dependencies.now(),
+            )
+            published = transaction.publish_ready(record)
+            _validate_ready_record(request, published)
+            return _ready_result(request, published)
 
 
 def _default_dependencies(request: AuthorEvaluatorRequest) -> AuthorEvaluatorDependencies:

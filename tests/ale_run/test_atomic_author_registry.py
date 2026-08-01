@@ -75,6 +75,18 @@ def test_filesystem_registry_atomically_publishes_and_reuses_ready_record(
     assert list(root.glob("*.json")) == records
 
 
+def test_filesystem_registry_reuses_ready_record_when_only_ready_at_differs(
+    tmp_path: Path,
+) -> None:
+    registry = FilesystemAuthorRegistry(tmp_path / "author-registry")
+    original = _record()
+    later = original.model_copy(update={"ready_at": datetime(2026, 8, 3, tzinfo=UTC)})
+
+    registry.publish_ready(_identity(), original)
+
+    assert registry.publish_ready(_identity(), later) == original
+
+
 def test_filesystem_registry_serializes_concurrent_same_key_publication(
     tmp_path: Path,
 ) -> None:
