@@ -102,11 +102,11 @@ def _install_atomic_modules(
     ("command", "status", "expected_exit"),
     [
         ("solve", "submitted", 0),
-        ("solve", "failed", 1),
+        ("solve", "failed", 0),
         ("evaluate", "scored", 0),
-        ("evaluate", "infra_failed", 1),
+        ("evaluate", "infra_failed", 0),
         ("author-evaluator", "ready", 0),
-        ("author-evaluator", "authoring_failed", 1),
+        ("author-evaluator", "authoring_failed", 0),
     ],
 )
 def test_atomic_command_dispatches_only_its_own_capability(
@@ -218,7 +218,7 @@ def test_atomic_command_converts_operation_exception_to_result_json(
     request_path = tmp_path / "request.json"
     request_path.write_text("{}", encoding="utf-8")
 
-    assert main([command, str(request_path)]) == 1
+    assert main([command, str(request_path)]) == 0
     assert len(calls) == 1
     output = capsys.readouterr()
     result = json.loads(output.out)

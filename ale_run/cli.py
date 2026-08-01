@@ -219,7 +219,7 @@ async def _run_atomic(request_type, operation, request_path: Path, error_result)
         print(f"atomic operation failed: {error}", file=sys.stderr)
         result = error_result(request, error)
     print(result.model_dump_json())
-    return 0 if result.status in {"submitted", "scored", "ready"} else 1
+    return 0
 
 
 def _filter_units(units: list[RunUnit], args: argparse.Namespace) -> list[RunUnit]:
