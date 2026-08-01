@@ -46,6 +46,10 @@ GitHubRepositoryUrl = Annotated[
         max_length=1_000,
     ),
 ]
+GitHubPullRequestUrl = Annotated[
+    str,
+    Field(pattern=r"^https://github\.com/[^/]+/[^/]+/pull/[1-9][0-9]*$"),
+]
 Score = Annotated[float, Field(ge=0, le=1)]
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 MediaType = Annotated[str, Field(pattern=r"^[^\s/]+/[^\s/]+$", max_length=255)]
@@ -133,10 +137,7 @@ class EvaluatorRegistryRecord(BaseModel):
     harbor_version: NonEmptyString
     rewardkit_version: NonEmptyString
     image_id: AliyunImageId
-    pull_request_url: Annotated[
-        str,
-        Field(pattern=r"^https://github\.com/[^/]+/[^/]+/pull/[1-9][0-9]*$"),
-    ]
+    pull_request_url: GitHubPullRequestUrl
     ci_run_id: NonEmptyString
     ready_at: datetime
 
@@ -156,16 +157,41 @@ class ReferenceManifest(BaseModel):
     files: tuple[ReferenceFileEntry, ...]
 
 
+class RubricPlanEntry(BaseModel):
+    """One expert rubric item's selected evaluator implementation."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    rubric_id: Annotated[str, Field(pattern=r"^[A-Za-z0-9_.-]+$", max_length=255)]
+    implementation_mode: Literal["programmatic", "llm_judge", "hybrid"]
+    weight: float = Field(ge=0, allow_inf_nan=False)
+    score_min: float = Field(allow_inf_nan=False)
+    score_max: float = Field(allow_inf_nan=False)
+    required: bool
+    rationale: NonEmptyString
+
+    @model_validator(mode="after")
+    def require_ordered_score_range(self) -> "RubricPlanEntry":
+        if self.score_min > self.score_max:
+            raise ValueError("rubric plan score_min must not exceed score_max")
+        return self
+
+
 class RubricPlan(BaseModel):
-    """Immutable rubric and reference inputs for evaluator authoring."""
+    """Complete one-to-one implementation plan for an immutable rubric."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     schema_version: Literal[1] = 1
-    rubric_uri: OssRoot
     rubric_hash: Sha256
-    reference_manifest_uri: OssRoot
-    reference_manifest_hash: Sha256
+    items: tuple[RubricPlanEntry, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def require_unique_rubric_ids(self) -> "RubricPlan":
+        rubric_ids = [item.rubric_id for item in self.items]
+        if len(rubric_ids) != len(set(rubric_ids)):
+            raise ValueError("rubric plan contains duplicate rubric IDs")
+        return self
 
 
 class AuthorEvaluatorRegistryIdentity(BaseModel):
@@ -187,14 +213,20 @@ class AuthorEvaluatorRequest(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     schema_version: Literal[1] = 1
+    authoring_id: UUID
     task_repository_url: GitHubRepositoryUrl
     task_path: TaskPath
+    variant_index: int = Field(ge=0)
     task_commit: CommitSha
     image_id: AliyunImageId
+    rubric_uri: OssRoot
+    rubric_hash: Sha256
+    reference_manifest_uri: OssRoot
+    reference_manifest_hash: Sha256
+    evaluator_id: NonEmptyString
     evaluator_sdk_version: NonEmptyString
-    rubric_plan: RubricPlan
-    max_retries: int = Field(ge=0, le=5, strict=True)
-    timeout_seconds: int = Field(ge=1, le=3_600, strict=True)
+    max_retries: int = Field(default=2, ge=0, le=5, strict=True)
+    timeout_seconds: int = Field(default=18_000, ge=1, le=18_000, strict=True)
 
 
 class AuthorEvaluatorResult(BaseModel):
@@ -203,20 +235,40 @@ class AuthorEvaluatorResult(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     schema_version: Literal[1] = 1
+    authoring_id: UUID
     status: Literal["ready", "authoring_failed"]
-    registry_identity: AuthorEvaluatorRegistryIdentity | None = None
-    error: ErrorDetail | None = None
-    completed_at: datetime
+    evaluator_id: NonEmptyString
+    evaluator_version: CommitSha | None = None
+    pull_request_url: GitHubPullRequestUrl | None = None
+    ci_run_id: NonEmptyString | None = None
+    error_category: ErrorCategory | None = None
+    error_detail: ErrorDetail | None = None
 
     @model_validator(mode="after")
     def require_consistent_authoring_fields(self) -> "AuthorEvaluatorResult":
+        ready_fields = (
+            self.evaluator_version,
+            self.pull_request_url,
+            self.ci_run_id,
+        )
+        error_fields = (self.error_category, self.error_detail)
         if self.status == "ready":
-            if self.registry_identity is None or self.error is not None:
-                raise ValueError("ready results require an identity and no error")
+            if any(value is None for value in ready_fields) or any(
+                value is not None for value in error_fields
+            ):
+                raise ValueError("ready results require publication fields and no error")
             return self
-        if self.registry_identity is not None or self.error is None:
-            raise ValueError("authoring_failed results require an error and no identity")
+        if any(value is not None for value in ready_fields) or any(
+            value is None for value in error_fields
+        ):
+            raise ValueError(
+                "authoring_failed results require structured errors and no publication fields"
+            )
         return self
+
+    @model_serializer(mode="wrap")
+    def omit_absent_fields(self, handler):
+        return {key: value for key, value in handler(self).items() if value is not None}
 
 
 class HarborProvenance(BaseModel):
