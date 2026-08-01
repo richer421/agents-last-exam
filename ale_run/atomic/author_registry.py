@@ -26,6 +26,7 @@ from .contracts import (
 _MAX_RECORD_BYTES = 1024 * 1024
 _PRIVATE_DIRECTORY_MODE = 0o700
 _PRIVATE_FILE_MODE = 0o600
+_CLAIM_POLL_SECONDS = 0.01
 _IDENTITY_FIELDS = (
     "task_commit",
     "rubric_hash",
@@ -105,16 +106,37 @@ class FilesystemAuthorRegistry:
     ) -> AsyncIterator[AuthorRegistryTransaction]:
         """Hold the same-identity lock without blocking the event loop."""
         key = author_registry_key(identity)
-        acquisition = asyncio.create_task(asyncio.to_thread(self._acquire_claim, key))
+        local_lock = self._claim_lock(key)
+        local_lock_acquired = False
+        root_fd: int | None = None
+        lock_fd: int | None = None
         try:
-            root_fd, lock_fd = await asyncio.shield(acquisition)
-        except asyncio.CancelledError:
-            acquisition.add_done_callback(lambda task: self._release_cancelled_claim(task, key))
-            raise
-        try:
+            while not local_lock.acquire(blocking=False):
+                await asyncio.sleep(_CLAIM_POLL_SECONDS)
+            local_lock_acquired = True
+            root_fd = self._open_root()
+            lock_fd = self._open_lock(root_fd, key)
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    await asyncio.sleep(_CLAIM_POLL_SECONDS)
             yield _FilesystemAuthorRegistryTransaction(self, identity, root_fd, key)
+        except AtomicInfrastructureError:
+            raise
+        except OSError as exc:
+            raise AtomicInfrastructureError(
+                "author_registry",
+                f"cannot claim author registry transaction: {exc}",
+            ) from exc
         finally:
-            self._release_claim(root_fd, lock_fd, key)
+            if lock_fd is not None:
+                os.close(lock_fd)
+            if root_fd is not None:
+                os.close(root_fd)
+            if local_lock_acquired:
+                local_lock.release()
 
     def get_ready(
         self,
@@ -167,54 +189,6 @@ class FilesystemAuthorRegistry:
             if root_fd is not None:
                 os.close(root_fd)
             local_lock.release()
-
-    def _acquire_claim(self, key: str) -> tuple[int, int]:
-        local_lock = self._claim_lock(key)
-        local_lock.acquire()
-        root_fd: int | None = None
-        lock_fd: int | None = None
-        acquired = False
-        try:
-            root_fd = self._open_root()
-            lock_fd = self._open_lock(root_fd, key)
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            acquired = True
-            return root_fd, lock_fd
-        except AtomicInfrastructureError:
-            raise
-        except OSError as exc:
-            raise AtomicInfrastructureError(
-                "author_registry",
-                f"cannot claim author registry transaction: {exc}",
-            ) from exc
-        finally:
-            if not acquired:
-                if lock_fd is not None:
-                    os.close(lock_fd)
-                if root_fd is not None:
-                    os.close(root_fd)
-                local_lock.release()
-
-    def _release_cancelled_claim(
-        self,
-        acquisition: asyncio.Task[tuple[int, int]],
-        key: str,
-    ) -> None:
-        if acquisition.cancelled():
-            return
-        try:
-            root_fd, lock_fd = acquisition.result()
-        except (AtomicInfrastructureError, asyncio.CancelledError):
-            return
-        self._release_claim(root_fd, lock_fd, key)
-
-    def _release_claim(self, root_fd: int, lock_fd: int, key: str | None) -> None:
-        try:
-            os.close(lock_fd)
-        finally:
-            os.close(root_fd)
-            if key is not None:
-                self._claim_lock(key).release()
 
     def _claim_lock(self, key: str) -> threading.Lock:
         with self._claim_locks_guard:

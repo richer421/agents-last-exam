@@ -1,4 +1,6 @@
+import asyncio
 import json
+import multiprocessing
 import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
@@ -46,6 +48,25 @@ def _record() -> EvaluatorRegistryRecord:
         ci_run_id="987654",
         ready_at=datetime(2026, 8, 2, tzinfo=UTC),
     )
+
+
+async def _hold_claim(registry, identity, entered: asyncio.Event, release: asyncio.Event) -> None:
+    async with registry.claim(identity):
+        entered.set()
+        await release.wait()
+
+
+def _hold_claim_in_process(root: str, identity_json: str, entered, release) -> None:
+    identity = AuthorEvaluatorRegistryIdentity.model_validate_json(identity_json)
+
+    async def hold() -> None:
+        registry = FilesystemAuthorRegistry(root)
+        async with registry.claim(identity):
+            entered.set()
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+
+    asyncio.run(hold())
 
 
 def test_author_registry_key_is_canonical_and_uses_only_identity_tuple() -> None:
@@ -102,6 +123,108 @@ def test_filesystem_registry_serializes_concurrent_same_key_publication(
 
     assert published == [_record()] * 24
     assert len(list(registry.root.glob("*.json"))) == 1
+
+
+@pytest.mark.asyncio
+async def test_filesystem_registry_claim_serializes_same_key_across_instances(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "author-registry"
+    first_registry = FilesystemAuthorRegistry(root)
+    second_registry = FilesystemAuthorRegistry(root)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async with first_registry.claim(_identity()):
+        waiter = asyncio.create_task(_hold_claim(second_registry, _identity(), entered, release))
+        await asyncio.sleep(0.05)
+        assert not entered.is_set()
+
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    release.set()
+    await asyncio.wait_for(waiter, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_filesystem_registry_claim_does_not_serialize_different_keys(
+    tmp_path: Path,
+) -> None:
+    registry = FilesystemAuthorRegistry(tmp_path / "author-registry")
+    other_identity = _identity().model_copy(update={"rubric_hash": "e" * 64})
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async with registry.claim(_identity()):
+        waiter = asyncio.create_task(_hold_claim(registry, other_identity, entered, release))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        release.set()
+        await asyncio.wait_for(waiter, timeout=1)
+
+
+def test_filesystem_registry_claim_serializes_across_processes(tmp_path: Path) -> None:
+    root = tmp_path / "author-registry"
+    registry = FilesystemAuthorRegistry(root)
+    process_context = multiprocessing.get_context("spawn")
+    entered = process_context.Event()
+    release_process = process_context.Event()
+    process = process_context.Process(
+        target=_hold_claim_in_process,
+        args=(str(root), _identity().model_dump_json(), entered, release_process),
+    )
+    process.start()
+    try:
+        assert entered.wait(timeout=10)
+
+        async def acquire_after_process() -> None:
+            acquired = asyncio.Event()
+            release = asyncio.Event()
+            waiter = asyncio.create_task(_hold_claim(registry, _identity(), acquired, release))
+            await asyncio.sleep(0.05)
+            assert not acquired.is_set()
+            release_process.set()
+            await asyncio.wait_for(acquired.wait(), timeout=5)
+            release.set()
+            await asyncio.wait_for(waiter, timeout=1)
+
+        asyncio.run(acquire_after_process())
+    finally:
+        release_process.set()
+        process.join(timeout=10)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+    assert process.exitcode == 0
+
+
+def test_cancelled_filesystem_claim_does_not_leave_blocked_executor_work(
+    tmp_path: Path,
+) -> None:
+    registry = FilesystemAuthorRegistry(tmp_path / "author-registry")
+
+    async def cancel_waiter() -> None:
+        loop = asyncio.get_running_loop()
+        single_worker = ThreadPoolExecutor(max_workers=1)
+        loop.set_default_executor(single_worker)
+        try:
+            async with registry.claim(_identity()):
+                waiter = asyncio.create_task(registry.claim(_identity()).__aenter__())
+                await asyncio.sleep(0.05)
+                waiter.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await waiter
+
+                assert (
+                    await asyncio.wait_for(
+                        asyncio.to_thread(lambda: "available"),
+                        timeout=0.2,
+                    )
+                    == "available"
+                )
+        finally:
+            loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+            single_worker.shutdown(wait=True)
+
+    asyncio.run(cancel_waiter())
 
 
 def test_filesystem_registry_rejects_conflicting_record_for_same_identity(

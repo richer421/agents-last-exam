@@ -15,6 +15,7 @@ from ale_run.atomic.author_evaluator import (
     _default_input_loader,
     author_evaluator,
 )
+from ale_run.atomic.author_registry import FilesystemAuthorRegistry
 from ale_run.atomic.contracts import (
     AtomicInfrastructureError,
     AuthorEvaluatorRegistryIdentity,
@@ -312,6 +313,32 @@ async def test_author_evaluator_reuses_ready_registry_without_other_dependencies
 @pytest.mark.asyncio
 async def test_author_evaluator_serializes_same_identity_authoring() -> None:
     registry = FakeRegistry()
+    agent = FakeAgent(delay=0.01)
+    publisher = FakePublisher()
+    dependencies = _dependencies(registry=registry, agent=agent, publisher=publisher)
+    second_request = _request().model_copy(
+        update={"authoring_id": UUID("00000000-0000-0000-0000-000000000002")}
+    )
+
+    first, second = await asyncio.gather(
+        author_evaluator(_request(), dependencies=dependencies),
+        author_evaluator(second_request, dependencies=dependencies),
+    )
+
+    assert len(agent.calls) == 1
+    assert len(publisher.calls) == 1
+    assert [first.authoring_id, second.authoring_id] == [
+        _request().authoring_id,
+        second_request.authoring_id,
+    ]
+    assert first.status == second.status == "ready"
+
+
+@pytest.mark.asyncio
+async def test_author_evaluator_serializes_with_filesystem_registry(
+    tmp_path: Path,
+) -> None:
+    registry = FilesystemAuthorRegistry(tmp_path / "author-registry")
     agent = FakeAgent(delay=0.01)
     publisher = FakePublisher()
     dependencies = _dependencies(registry=registry, agent=agent, publisher=publisher)
