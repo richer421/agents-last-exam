@@ -70,6 +70,16 @@ def main(argv: list[str] | None = None) -> int:
     p_evaluate = subparsers.add_parser("evaluate", help="Run one atomic evaluate request.")
     p_evaluate.add_argument("request_path", type=Path, help="Path to evaluate request JSON.")
 
+    p_author_evaluator = subparsers.add_parser(
+        "author-evaluator",
+        help="Run one atomic evaluator authoring request.",
+    )
+    p_author_evaluator.add_argument(
+        "request_path",
+        type=Path,
+        help="Path to author evaluator request JSON.",
+    )
+
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if getattr(args, "verbose", False) else logging.INFO,
@@ -117,6 +127,24 @@ def main(argv: list[str] | None = None) -> int:
                     error_category="cli",
                     error_detail=error,
                     attempt_id=f"cli-{uuid4().hex}",
+                ),
+            )
+        )
+    if args.cmd == "author-evaluator":
+        from .atomic.author_evaluator import author_evaluator
+        from .atomic.contracts import AuthorEvaluatorRequest, AuthorEvaluatorResult
+
+        return asyncio.run(
+            _run_atomic(
+                AuthorEvaluatorRequest,
+                author_evaluator,
+                args.request_path,
+                lambda request, error: AuthorEvaluatorResult(
+                    status="authoring_failed",
+                    authoring_id=request.authoring_id,
+                    evaluator_id=request.evaluator_id,
+                    error_category="cli",
+                    error_detail=error,
                 ),
             )
         )
@@ -188,7 +216,7 @@ async def _run_atomic(request_type, operation, request_path: Path, error_result)
         print(f"atomic operation failed: {error}", file=sys.stderr)
         result = error_result(request, error)
     print(result.model_dump_json())
-    return 0 if result.status in {"submitted", "scored"} else 1
+    return 0 if result.status in {"submitted", "scored", "ready"} else 1
 
 
 def _filter_units(units: list[RunUnit], args: argparse.Namespace) -> list[RunUnit]:

@@ -10,6 +10,7 @@ import pytest
 from ale_run import cli
 from ale_run.atomic.contracts import (
     AtomicInfrastructureError,
+    AuthorEvaluatorResult,
     EvaluateRequest,
     EvaluationResult,
     SolveResult,
@@ -23,6 +24,7 @@ class _BlockedModule(ModuleType):
 
 
 class _Request:
+    authoring_id = UUID("00000000-0000-0000-0000-000000000002")
     submission_id = UUID("00000000-0000-0000-0000-000000000001")
     task_path = "visual_media/demo"
     variant_index = 0
@@ -56,6 +58,7 @@ def _install_atomic_modules(
     for name in (
         "ale_run.atomic",
         "ale_run.atomic.contracts",
+        "ale_run.atomic.author_evaluator",
         "ale_run.atomic.solve",
         "ale_run.atomic.evaluate",
     ):
@@ -70,19 +73,28 @@ def _install_atomic_modules(
         return _Result(status)
 
     contracts = ModuleType("ale_run.atomic.contracts")
+    contracts.AuthorEvaluatorRequest = _Request
     contracts.SolveRequest = _Request
     contracts.EvaluateRequest = _Request
+    contracts.AuthorEvaluatorResult = AuthorEvaluatorResult
     contracts.SolveResult = SolveResult
     contracts.EvaluationResult = EvaluationResult
-    implementation = ModuleType(f"ale_run.atomic.{command}")
-    setattr(implementation, command, operation)
+    implementation_name = command.replace("-", "_")
+    implementation = ModuleType(f"ale_run.atomic.{implementation_name}")
+    setattr(implementation, implementation_name, operation)
 
-    other = "evaluate" if command == "solve" else "solve"
     monkeypatch.setitem(sys.modules, "ale_run.atomic.contracts", contracts)
-    monkeypatch.setitem(sys.modules, f"ale_run.atomic.{command}", implementation)
     monkeypatch.setitem(
-        sys.modules, f"ale_run.atomic.{other}", _BlockedModule(f"ale_run.atomic.{other}")
+        sys.modules,
+        f"ale_run.atomic.{implementation_name}",
+        implementation,
     )
+    for other in {"author_evaluator", "solve", "evaluate"} - {implementation_name}:
+        monkeypatch.setitem(
+            sys.modules,
+            f"ale_run.atomic.{other}",
+            _BlockedModule(f"ale_run.atomic.{other}"),
+        )
     return calls
 
 
@@ -93,6 +105,8 @@ def _install_atomic_modules(
         ("solve", "failed", 1),
         ("evaluate", "scored", 0),
         ("evaluate", "infra_failed", 1),
+        ("author-evaluator", "ready", 0),
+        ("author-evaluator", "authoring_failed", 1),
     ],
 )
 def test_atomic_command_dispatches_only_its_own_capability(
@@ -112,7 +126,7 @@ def test_atomic_command_dispatches_only_its_own_capability(
     assert capsys.readouterr().out == json.dumps({"status": status}) + "\n"
 
 
-@pytest.mark.parametrize("command", ["solve", "evaluate"])
+@pytest.mark.parametrize("command", ["solve", "evaluate", "author-evaluator"])
 def test_atomic_command_rejects_malformed_request(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -180,6 +194,11 @@ def test_evaluate_command_accepts_envelope_without_registry_authority(
         ("solve", ValueError("invalid runtime input"), {"status": "failed"}),
         ("solve", RuntimeError("x" * 2_000), {"status": "failed"}),
         ("evaluate", RuntimeError("operation exploded"), {"status": "infra_failed"}),
+        (
+            "author-evaluator",
+            RuntimeError("operation exploded"),
+            {"status": "authoring_failed"},
+        ),
     ],
 )
 def test_atomic_command_converts_operation_exception_to_result_json(
@@ -210,13 +229,19 @@ def test_atomic_command_converts_operation_exception_to_result_json(
     if command == "solve":
         assert result["submission_id"] == str(_Request.submission_id)
         assert 0 < len(result["error"]) <= 1_000
-    else:
+    elif command == "evaluate":
         assert result["submission_id"] == str(_Request.submission_id)
         assert result["task_path"] == _Request.task_path
         assert result["error_category"] == "cli"
         assert result["error_detail"] == "operation exploded"
         assert result["attempt_id"].startswith("cli-")
         assert {"outcome", "score", "rubric_hash", "harbor"}.isdisjoint(result)
+    else:
+        assert result["authoring_id"] == str(_Request.authoring_id)
+        assert result["evaluator_id"] == _Request.evaluator_id
+        assert result["error_category"] == "cli"
+        assert result["error_detail"] == "operation exploded"
+        assert {"evaluator_version", "pull_request_url", "ci_run_id"}.isdisjoint(result)
 
 
 def test_existing_run_and_list_commands_keep_their_handlers(
