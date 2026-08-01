@@ -209,6 +209,9 @@ def _sanitise_catalog_for_fork(raw: str) -> str:
         if default is not None and default not in _FORK_KNOWN_REASONING_EFFORTS:
             dropped.append(f"{slug}.default_reasoning_level={default}->high")
             model["default_reasoning_level"] = "high"
+        if "supports_reasoning_summaries" not in model:
+            model["supports_reasoning_summaries"] = False
+            dropped.append(f"{slug}.supports_reasoning_summaries=<missing>->false")
 
     if not dropped:
         return raw

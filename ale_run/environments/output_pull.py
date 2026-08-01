@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import json
 import logging
+import ntpath
 import shlex
 import shutil
 from pathlib import Path
@@ -32,6 +34,8 @@ _QEMU_SHARE_COPY_TIMEOUT_S = 3600
 _GCS_PUSH_TIMEOUT_S = 3600
 _S3_PUSH_TIMEOUT_S = 3600
 _OSS_PUSH_TIMEOUT_S = 3600
+_WINDOWS_MANIFEST_SCRIPT = r"C:\Windows\Temp\ale-output-manifest.py"
+_LINUX_MANIFEST_SCRIPT = "/tmp/ale-output-manifest.py"
 
 
 def _output_dir(sandbox: SandboxHandle, task_data: TaskDataSpec) -> str:
@@ -257,11 +261,16 @@ async def pull_to_host(
     # rest, and many small files no longer serialise into a long tail.
     jobs: list[tuple[str, Path]] = []
     for entry in entries:
-        rel = entry["relpath"]
+        listed_path = entry["relpath"]
+        if not sandbox.is_linux and ntpath.isabs(listed_path):
+            rel = ntpath.relpath(listed_path, src)
+            remote_path = listed_path
+        else:
+            rel = listed_path
+            remote_path = f"{src.rstrip(sep)}{sep}{rel}"
         if entry.get("is_dir"):
             (dest_dir / rel.replace("\\", "/")).mkdir(parents=True, exist_ok=True)
             continue
-        remote_path = f"{src.rstrip(sep)}{sep}{rel}"
         local_path = dest_dir / rel.replace("\\", "/")
         local_path.parent.mkdir(parents=True, exist_ok=True)
         jobs.append((remote_path, local_path))
@@ -392,20 +401,96 @@ async def push_to_oss(
     # ``<dst>/output/output/...``; ``<dir>/`` copies its CONTENTS to ``<dst>/``.
     # (Same rule ossbucket._sync_cmd applies.)
     src = _output_dir(sandbox, task_data).rstrip("/") + "/"
-    oss_dst = f"{bucket.rstrip('/')}/{run_id}/output/"
+    oss_dst = (
+        f"{bucket.rstrip('/')}/{task_data.domain_name}/"
+        f"{task_data.task_name}/{task_data.variant_name}/"
+        f"runs/{run_id}/output/"
+    )
 
-    if sandbox.is_linux:
-        cmd = f"ossutil cp -r -f {shlex.quote(src)} {shlex.quote(oss_dst)}"
-    else:
-        cmd = (
-            'powershell -NoProfile -Command "'
-            f"ossutil cp -r -f '{src}' '{oss_dst}'"
-            '"'
-        )
+    from .task_data import ossbucket
+
+    await ossbucket.ensure_ossutil(sandbox)
+    await _write_output_manifest(sandbox, src.rstrip("/\\"), run_id=run_id)
+    quoted_src = (
+        shlex.quote(src)
+        if sandbox.is_linux
+        else ossbucket.powershell_literal(src)
+    )
+    quoted_dst = (
+        shlex.quote(oss_dst)
+        if sandbox.is_linux
+        else ossbucket.powershell_literal(oss_dst)
+    )
+    cmd = ossbucket.oss_command(
+        sandbox,
+        f"cp -r -f {quoted_src} {quoted_dst}",
+    )
     logger.info("push_to_oss: %s → %s", src, oss_dst)
     r = await sandbox.run_command(cmd, timeout=_OSS_PUSH_TIMEOUT_S)
     if r.returncode != 0:
+        diagnostic = (r.stderr or r.stdout or "unknown ossutil failure").strip()
         raise RuntimeError(
-            f"ossutil cp failed (rc={r.returncode}): {(r.stderr or '')[:300]}"
+            f"ossutil cp failed (rc={r.returncode}): {diagnostic[:300]}"
         )
-    return {"transport": "oss", "oss_path": oss_dst}
+    return {
+        "transport": "oss",
+        "oss_path": oss_dst,
+        "manifest": "output/artifact_manifest.json",
+    }
+
+
+async def _write_output_manifest(
+    sandbox: SandboxHandle,
+    output_root: str,
+    *,
+    run_id: str,
+) -> None:
+    script_path = (
+        _LINUX_MANIFEST_SCRIPT if sandbox.is_linux else _WINDOWS_MANIFEST_SCRIPT
+    )
+    script = f"""\
+import hashlib
+import json
+from pathlib import Path
+
+root = Path({json.dumps(output_root, ensure_ascii=False)})
+manifest_path = root / "artifact_manifest.json"
+temporary_path = manifest_path.with_suffix(".json.tmp")
+artifacts = []
+for path in sorted(root.rglob("*")):
+    if path.is_symlink():
+        raise RuntimeError(f"output contains unsupported symlink: {{path}}")
+    if not path.is_file() or path in (manifest_path, temporary_path):
+        continue
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    artifacts.append({{
+        "path": path.relative_to(root).as_posix(),
+        "size_bytes": path.stat().st_size,
+        "sha256": digest.hexdigest(),
+    }})
+temporary_path.write_text(
+    json.dumps({{
+        "schema_version": 1,
+        "run_id": {json.dumps(run_id)},
+        "artifacts": artifacts,
+    }}, ensure_ascii=False, indent=2),
+    encoding="utf-8",
+)
+temporary_path.replace(manifest_path)
+"""
+    await sandbox.write_file(script_path, script.encode("utf-8"))
+    python = sandbox.python or ("python3" if sandbox.is_linux else "python")
+    command = (
+        f"{shlex.quote(python)} {shlex.quote(script_path)}"
+        if sandbox.is_linux
+        else f'"{python}" "{script_path}"'
+    )
+    result = await sandbox.run_command(command, timeout=600)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "artifact manifest generation failed "
+            f"(rc={result.returncode}): {(result.stderr or result.stdout or '')[:300]}"
+        )

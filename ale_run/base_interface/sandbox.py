@@ -29,6 +29,7 @@ from __future__ import annotations
 import abc
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import os
@@ -47,6 +48,17 @@ ReleaseMode = Literal["delete", "stop", "keep"]
 
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _direct_requests_session():
+    """Create an HTTP session that never routes private CUA traffic via proxies."""
+    session = requests.Session()
+    session.trust_env = False
+    try:
+        yield session
+    finally:
+        session.close()
 
 
 # ============================================================================
@@ -84,7 +96,9 @@ class RangeResult:
 
     Cleanly distinguishes "remote file shrank" / "got data" / "no new
     bytes" / "error" for the caller (see
-    :func:`ale_run.executors.sandbox.tail_hot_artifacts`).
+    :func:`ale_run.executors.sandbox.tail_hot_artifacts`). On success,
+    ``new_size`` is the current total remote file size and ``new_data``
+    contains at most the requested bytes beginning at the requested offset.
     """
 
     success: bool
@@ -206,8 +220,10 @@ class SandboxHandle:
         self, remote_path: str, *, start: int, max_chunk_bytes: int,
         timeout: float = 60,
     ) -> RangeResult:
-        """Incremental fetch of a sandbox-side file. See
-        :class:`RangeResult`."""
+        """Fetch up to ``max_chunk_bytes`` at ``start`` from a sandbox file.
+
+        See :class:`RangeResult` for the returned size and data contract.
+        """
         return await asyncio.to_thread(
             _download_range_sync, self, remote_path, start, max_chunk_bytes, timeout,
         )
@@ -317,14 +333,15 @@ def _read_first_sse_event(
 
 def _post_cmd(sandbox: SandboxHandle, body: dict, *, timeout: float) -> dict[str, Any] | None:
     try:
-        with requests.post(
-            sandbox.cmd_url,
-            json=body,
-            headers={"Content-Type": "application/json"},
-            timeout=timeout,
-            stream=True,
-        ) as resp:
-            return _read_first_sse_event(resp, read_timeout=timeout)
+        with _direct_requests_session() as session:
+            with session.post(
+                sandbox.cmd_url,
+                json=body,
+                headers={"Content-Type": "application/json"},
+                timeout=timeout,
+                stream=True,
+            ) as resp:
+                return _read_first_sse_event(resp, read_timeout=timeout)
     except requests.RequestException as e:
         logger.debug("POST %s failed: %s", sandbox.cmd_url, e)
         return None
@@ -696,11 +713,12 @@ def _download_range_sync(
 
 def _check_reachable_sync(sandbox: SandboxHandle, label: str) -> None:
     try:
-        resp = requests.get(
-            f"{sandbox.endpoint.rstrip('/')}/status", timeout=10,
-        )
-        resp.raise_for_status()
-        body = resp.json()
+        with _direct_requests_session() as session:
+            resp = session.get(
+                f"{sandbox.endpoint.rstrip('/')}/status", timeout=10,
+            )
+            resp.raise_for_status()
+            body = resp.json()
         if body.get("status") != "ok":
             raise SandboxUnreachableError(
                 f"{label} {sandbox.endpoint} unhealthy: {body}"

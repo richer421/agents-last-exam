@@ -127,6 +127,7 @@ def test_reference_password_is_not_forwarded_to_agent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "agent-key")
+    monkeypatch.setenv("LLM_JUDGE_WIRE_API", "responses")
     monkeypatch.setenv(
         baked_in_sandbox.REFERENCE_ARCHIVE_PASSWORD_ENV,
         "host-only-password",
@@ -135,6 +136,7 @@ def test_reference_password_is_not_forwarded_to_agent(
     env = _collect_env_passthrough()
 
     assert env["OPENAI_API_KEY"] == "agent-key"
+    assert env["LLM_JUDGE_WIRE_API"] == "responses"
     assert baked_in_sandbox.REFERENCE_ARCHIVE_PASSWORD_ENV not in env
 
 

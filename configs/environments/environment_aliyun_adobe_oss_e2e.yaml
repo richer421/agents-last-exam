@@ -1,0 +1,18 @@
+snapshots:
+  adobe-v1:
+    provider: aliyun
+    image: ale-win10
+    image_id: m-t4n95lny5ogrb75ihdie
+    resolution: [1024, 768]
+    aliyun:
+      region: ap-southeast-1
+      security_group: ale-sandbox
+      instance_prefix: ale-blind
+      ram_role_name: ale-sandbox
+      cpu_instance_family: ecs.u1-c1m4
+      internet_max_bandwidth_out: 100
+      system_disk_category: cloud_essd
+      zones: [ap-southeast-1a, ap-southeast-1b]
+
+task_data_source: oss://ale-artifacts
+output_path: oss://ale-artifacts

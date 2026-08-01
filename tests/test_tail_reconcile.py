@@ -26,7 +26,7 @@ class _MockExec:
         self.content, self.fail, self.missing = content, fail, missing
         self.calls = 0
 
-    async def download_range(self, *, src, start, max_bytes):
+    async def download_range(self, *, src, start, max_bytes, timeout_s=None):
         self.calls += 1
         if self.fail:
             return RangeResult(success=False, error="simulated transport error")
@@ -77,7 +77,8 @@ def test_jsonl_boundary_safe():
     # a half-written trailing record (no newline) must NOT be committed.
     content = b'{"done":1}\n{"partial":'
     err, dst, _ = _run(content=content)
-    assert err is None
+    assert err is not None
+    assert "reconcile incomplete" in err
     with open(dst, "rb") as f:
         got = f.read()
     assert got == b'{"done":1}\n', f"committed a partial line: {got!r}"

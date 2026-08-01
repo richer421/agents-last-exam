@@ -1,7 +1,8 @@
 """SandboxExecutor — deployer runs INSIDE the cua-server sandbox VM.
 
-The framework ships the ``ale_run/`` source tree to the sandbox (one-time
-per run, size-skipped on repeats), writes a ``_spec.json`` into the
+The framework packs ``ale_run/``, ships the archive to the sandbox, and
+extracts it there (digest-skipped on repeats). It then writes
+a ``_spec.json`` into the
 deployer's work_dir, fires a small launcher that ``setsid``-spawns
 ``python -m ale_run.executors._sandbox_entry <spec>``, then polls until
 the in-sandbox process drops a ``_done.marker``.
@@ -29,9 +30,17 @@ declares ``hot_artifacts``) is exposed as a module-level function,
 from __future__ import annotations
 
 import asyncio
+import base64
+import gzip
+import hashlib
+import io
 import json
 import logging
+import re
 import shlex
+import stat
+import subprocess
+import tarfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +51,7 @@ from ..base_interface import (
     GatherReport,
     RangeResult,
     SandboxHandle,
+    SandboxUnreachableError,
 )
 from ._secrets import SECRET_GATHER_EXCLUDES, SECRETS_FILE
 
@@ -58,14 +68,20 @@ _GATHER_EXCLUDE_DIRS = frozenset({
     "__pycache__", "node_modules", ".git", ".venv", "venv",
     "site-packages", ".conda", ".cache", ".mypy_cache", ".pytest_cache",
 })
+_GATHER_ALLOWED_SUFFIXES = frozenset({
+    ".bat", ".json", ".jsonl", ".log", ".marker", ".md", ".pid",
+    ".ps1", ".py", ".scm", ".sh", ".txt", ".yaml", ".yml",
+})
 _GATHER_MAX_FILES = 5000
 _GATHER_DEADLINE_S = 300.0
 
 
 def _gather_skip(rel: str) -> bool:
-    """True if ``rel`` lives under a dependency/cache dir we never gather."""
+    """True unless ``rel`` is a code/text/log artifact safe for the host."""
     parts = Path(rel.replace("\\", "/")).parts
-    return any(p in _GATHER_EXCLUDE_DIRS or p.startswith(".venv") for p in parts)
+    if any(p in _GATHER_EXCLUDE_DIRS or p.startswith(".venv") for p in parts):
+        return True
+    return Path(parts[-1]).suffix.lower() not in _GATHER_ALLOWED_SUFFIXES
 
 
 # Convention: ale_run source ships to ``<home>/.ale-src/`` on the sandbox,
@@ -76,6 +92,26 @@ def _ale_src_root_for(sandbox: SandboxHandle) -> str:
         return f"{home}/.ale-src"
     home = sandbox.work_dir_base.rstrip("\\").rsplit("\\", 1)[0]
     return rf"{home}\.ale-src"
+
+
+def _evaluator_env(config: Any, inherited: dict[str, str]) -> dict[str, str]:
+    """Build standard OpenAI-compatible evaluator env without task coupling."""
+    result = dict(inherited or {})
+    mappings = (
+        ("OPENAI_API_KEY", "api_key"),
+        ("OPENAI_API_BASE", "base_url"),
+        ("LLM_JUDGE_MODEL", "model"),
+    )
+    for env_name, attribute in mappings:
+        value = getattr(config, attribute, None)
+        if value:
+            result.setdefault(env_name, str(value))
+    if getattr(config, "provider", None) == "openrouter":
+        openrouter_key = result.get("OPENROUTER_API_KEY")
+        if openrouter_key:
+            result.setdefault("OPENAI_API_KEY", openrouter_key)
+        result.setdefault("OPENAI_API_BASE", "https://openrouter.ai/api/v1")
+    return result
 
 
 # Gather retries
@@ -91,12 +127,13 @@ _POLL_INTERVAL_S = 10.0
 # declaring the sandbox gone, so one blip can't fail an already-completed run.
 _LIVENESS_MISS_THRESHOLD = 3
 _LIVENESS_REPROBE_S = 5.0
-_PID_WAIT_S = 4.5            # how long to wait for the launcher to write the PID file
+_PID_WAIT_S = 45.0           # tolerate several bounded CUA transport probes
 _PID_WAIT_TICK_S = 0.3
+_PID_PROBE_TIMEOUT_S = 10.0
 
 # Incremental tail tuning
 _TAIL_INTERVAL_S = 60.0
-_TAIL_RECONCILE_TIMEOUT_S = 60.0
+_TAIL_RECONCILE_TIMEOUT_S = 15.0
 _TAIL_RECONCILE_RETRIES = 3
 _TAIL_RECONCILE_DELAY_S = 1.0
 _TAIL_CHUNK_BYTES = 16 * 1024 * 1024
@@ -106,6 +143,88 @@ _TICK_FAILED = -2    # download_range failed (transport / remote command error)
 _TICK_NO_FILE = -1   # remote file does not exist (yet)
 _TAIL_LIVE_FAIL_WARN = 3  # consecutive live-tick failures before a WARNING log
 
+# Source archive deployment. The marker lives inside the installed tree and
+# makes retained sandboxes a one-command cache hit.
+_ALE_ARCHIVE_MARKER = ".archive.sha256"
+_ARCHIVE_IO_RETRIES = 3
+_ARCHIVE_IO_BACKOFFS_S = (0.5, 1.0)
+
+_ALE_ARCHIVE_CACHE_CHECK = """\
+import pathlib
+import sys
+
+marker = pathlib.Path(sys.argv[1])
+expected = sys.argv[2]
+try:
+    actual = marker.read_text(encoding="utf-8").strip()
+except OSError:
+    actual = ""
+raise SystemExit(0 if actual == expected else 1)
+"""
+
+_ALE_ARCHIVE_EXTRACT = """\
+import hashlib
+import pathlib
+import shutil
+import sys
+import tarfile
+
+archive = pathlib.Path(sys.argv[1])
+dest = pathlib.Path(sys.argv[2])
+expected = sys.argv[3]
+marker = dest / ".archive.sha256"
+
+try:
+    if marker.read_text(encoding="utf-8").strip() == expected:
+        archive.unlink(missing_ok=True)
+        raise SystemExit(0)
+except OSError:
+    pass
+
+payload = archive.read_bytes()
+actual = hashlib.sha256(payload).hexdigest()
+if actual != expected:
+    raise RuntimeError(f"archive digest mismatch: expected {expected}, got {actual}")
+
+suffix = expected[:16]
+tmp = dest.with_name(dest.name + ".tmp-" + suffix)
+backup = dest.with_name(dest.name + ".old-" + suffix)
+shutil.rmtree(tmp, ignore_errors=True)
+shutil.rmtree(backup, ignore_errors=True)
+tmp.mkdir(parents=True)
+
+with tarfile.open(archive, mode="r:gz") as tf:
+    root = tmp.resolve()
+    members = tf.getmembers()
+    for member in members:
+        target = (tmp / member.name).resolve()
+        if target != root and root not in target.parents:
+            raise RuntimeError(f"unsafe archive member: {member.name}")
+        if member.issym() or member.islnk():
+            raise RuntimeError(f"archive links are not allowed: {member.name}")
+    tf.extractall(tmp, members=members, filter="data")
+
+if dest.exists():
+    dest.replace(backup)
+try:
+    tmp.replace(dest)
+except BaseException:
+    if backup.exists() and not dest.exists():
+        backup.replace(dest)
+    raise
+shutil.rmtree(backup, ignore_errors=True)
+marker.write_text(expected + "\\n", encoding="utf-8")
+archive.unlink(missing_ok=True)
+"""
+
+
+@dataclass(frozen=True)
+class _AleArchive:
+    payload: bytes
+    digest: str
+    files: int
+    source_bytes: int
+
 
 @dataclass
 class SandboxExecutor(BaseExecutor):
@@ -113,6 +232,7 @@ class SandboxExecutor(BaseExecutor):
     a detached subprocess; host polls until done.marker."""
 
     type: ClassVar[str] = "sandbox"
+    hot_artifacts: tuple[str, ...] = ()
 
     async def run_deployer(
         self,
@@ -131,6 +251,7 @@ class SandboxExecutor(BaseExecutor):
         spec_path = f"{wd}{sep}_spec.json"
         secrets_path = f"{wd}{sep}{SECRETS_FILE}"
         pid_file = f"{wd}{sep}_pid"
+        launch_lock = f"{pid_file}.lock"
         result_path = f"{wd}{sep}_result.json"
         done_marker = f"{wd}{sep}_done.marker"
         entry_log = f"{wd}{sep}_entry.log"
@@ -139,10 +260,10 @@ class SandboxExecutor(BaseExecutor):
             else f"{wd}\\_launcher.ps1"
         )
 
-        # 1. Ship ale_run/ to sandbox (size-skip on repeats)
+        # 1. Ship the ale_run/ archive to the sandbox (digest-skip on repeats)
         try:
-            await self._ship_ale_subtree(ale_src_root)
-        except Exception as e:                                      # noqa: BLE001
+            await self.stage_runtime()
+        except Exception as e:
             logger.exception("ship_ale_subtree failed")
             return AgentRunResult(
                 status="failed",
@@ -153,7 +274,9 @@ class SandboxExecutor(BaseExecutor):
         await sb.mkdir(self.work_dir)
 
         # 3. Reset stale state from any prior attempt (best-effort)
-        await sb.rm([pid_file, result_path, done_marker, entry_log, secrets_path])
+        await sb.rm([
+            pid_file, launch_lock, result_path, done_marker, entry_log, secrets_path,
+        ])
 
         # 4. Write spec.json into the sandbox's work_dir.
         #    Secrets (api keys etc.) are deliberately KEPT OUT of the spec —
@@ -219,8 +342,27 @@ class SandboxExecutor(BaseExecutor):
                 spawn_res.returncode, (spawn_res.stderr or "").strip()[:120],
             )
 
-        # 6. Read PID (launcher writes it synchronously; tolerate tiny flush gap)
-        pid = await self._read_pid(pid_file)
+        # 6. Read PID. Prefer the launcher's scalar stdout acknowledgement;
+        # fall back to bounded scalar probes that never download the PID file.
+        probe_error: SandboxUnreachableError | None = None
+        pid = _parse_pid_ack(spawn_res.stdout)
+        if pid is None:
+            try:
+                pid = await self._read_pid(pid_file)
+            except SandboxUnreachableError as exc:
+                probe_error = exc
+        if pid is None:
+            # A dropped acknowledgement is ambiguous: the launcher may have
+            # run successfully. Replay its idempotent guard once; it reports
+            # the existing live PID instead of spawning a duplicate entry.
+            replay_res = await sb.run_command(spawn_cmd, timeout=60)
+            pid = _parse_pid_ack(replay_res.stdout)
+            if pid is None:
+                try:
+                    pid = await self._read_pid(pid_file)
+                    probe_error = None
+                except SandboxUnreachableError as exc:
+                    probe_error = exc
         if pid is None:
             entry_tail = await self._tail_log(entry_log)
             spawn_note = (
@@ -230,8 +372,16 @@ class SandboxExecutor(BaseExecutor):
             )
             return AgentRunResult(
                 status="failed",
-                error=f"launcher did not write usable PID; {spawn_note}"
-                      f"entry log tail: {entry_tail}",
+                error=(
+                    (
+                        f"infrastructure launch acknowledgement unavailable: "
+                        f"{probe_error}; "
+                        if probe_error is not None
+                        else "launcher did not write usable PID; "
+                    )
+                    + spawn_note
+                    + f"entry log tail: {entry_tail}"
+                ),
             )
 
         logger.info(
@@ -338,12 +488,45 @@ class SandboxExecutor(BaseExecutor):
             duration_s=out.get("duration_s") or duration_s,
         )
 
+    async def evaluate_task(
+        self, *, task_path: Path, variant: int, timeout_s: float,
+    ) -> dict[str, Any]:
+        """Run task evaluation in the sandbox and return only score metadata."""
+        from .sandbox_evaluator import evaluate_in_sandbox
+
+        ale_src_root = _ale_src_root_for(self.sandbox)
+        await self.stage_runtime()
+        evaluated = await evaluate_in_sandbox(
+            sandbox=self.sandbox,
+            ale_src_root=ale_src_root,
+            task_path=task_path,
+            variant=variant,
+            timeout_s=timeout_s,
+            evaluator_env=_evaluator_env(self.config, self.env),
+        )
+        if evaluated.log:
+            logger.info("sandbox evaluator log:\n%s", evaluated.log[-20_000:])
+        result = dict(evaluated.result)
+        result["_ale_evaluator_log"] = evaluated.log
+        return result
+
     async def gather_dir(
         self, *, src: str, dst: Path,
     ) -> GatherReport:
         dst.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + _GATHER_DEADLINE_S
         try:
-            entries = await self.sandbox.list_dir(src)
+            entries = await asyncio.wait_for(
+                self.sandbox.list_dir(src),
+                timeout=max(0.001, deadline - time.monotonic()),
+            )
+        except asyncio.TimeoutError:
+            error = (
+                f"gather capped (deadline_{_GATHER_DEADLINE_S:.0f}s) "
+                "before directory listing"
+            )
+            logger.warning("gather_dir: %s", error)
+            return GatherReport(transport="cua", error=error)
         except Exception as e:                                      # noqa: BLE001
             logger.warning("list_dir failed for %s: %s", src, e)
             return GatherReport(transport="cua", error=str(e))
@@ -355,8 +538,9 @@ class SandboxExecutor(BaseExecutor):
         total_bytes = 0
         last_error: str | None = None
         capped: str | None = None
-        deadline = time.monotonic() + _GATHER_DEADLINE_S
+        warnings: list[str] = []
         sep = "/" if self.sandbox.is_linux else "\\"
+        hot_artifacts = {name.replace("\\", "/") for name in self.hot_artifacts}
 
         for entry in entries:
             rel = entry["relpath"]
@@ -378,7 +562,46 @@ class SandboxExecutor(BaseExecutor):
                 break
             local.parent.mkdir(parents=True, exist_ok=True)
             remote_path = f"{src.rstrip(sep)}{sep}{rel.replace('/', sep)}"
-            ok = await _download_with_retry(self.sandbox, remote_path, local)
+            remote_size = entry.get("size")
+            try:
+                local_size = local.stat().st_size
+            except OSError:
+                local_size = None
+            normalized_rel = rel.replace("\\", "/")
+            if (
+                local_size is not None
+                and isinstance(remote_size, int)
+                and remote_size >= 0
+                and (
+                    local_size == remote_size
+                    or (
+                        local_size > 0
+                        and local_size < remote_size
+                        and normalized_rel in hot_artifacts
+                    )
+                )
+            ):
+                if local_size < remote_size:
+                    warnings.append(
+                        f"partial hot artifact {normalized_rel}: "
+                        f"host={local_size} remote={remote_size}"
+                    )
+                file_count += 1
+                total_bytes += local_size
+                continue
+
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                capped = f"deadline_{_GATHER_DEADLINE_S:.0f}s"
+                break
+            try:
+                ok = await asyncio.wait_for(
+                    _download_with_retry(self.sandbox, remote_path, local),
+                    timeout=remaining_s,
+                )
+            except asyncio.TimeoutError:
+                capped = f"deadline_{_GATHER_DEADLINE_S:.0f}s"
+                break
             if ok:
                 file_count += 1
                 try:
@@ -398,90 +621,126 @@ class SandboxExecutor(BaseExecutor):
             files=file_count,
             bytes=total_bytes,
             error=last_error,
+            warnings=warnings,
         )
 
     async def download_range(
         self, *, src: str, start: int, max_bytes: int,
+        timeout_s: float | None = None,
     ) -> RangeResult:
         return await self.sandbox.download_range(
-            src, start=start, max_chunk_bytes=max_bytes,
+            src,
+            start=start,
+            max_chunk_bytes=max_bytes,
+            timeout=60 if timeout_s is None else timeout_s,
         )
 
     # ------------------------------------------------------------------
     # internals
     # ------------------------------------------------------------------
 
-    async def _ship_ale_subtree(self, ale_src_root: str) -> None:
-        """scp every ``ale_run/**/*.py`` into the sandbox at ``ale_src_root``.
+    async def stage_runtime(self, ale_src_root: str | None = None) -> None:
+        """Upload one cached ``ale_run`` archive and extract it atomically.
 
-        Idempotent: per-file size compare against the remote first;
-        skip when bytes match.
-
-        Vendored upstream agent sources (``ale_run/agents/*/upstream/``) are
-        skipped: they carry no ``__init__.py``, are never imported by the
-        in-sandbox ``_sandbox_entry`` runner, and deployers that need them
-        re-fetch from their own git remote inside the container.  Shipping
-        them is pure waste -- the hermes fork alone is 1337 .py files, each a
-        base64 round-trip over the CUA endpoint, which under host load can
-        stretch the ship phase into tens of minutes.
+        A digest marker skips repeated deployment to a retained sandbox. The
+        archive excludes vendored upstream trees and ``node_modules`` because
+        deployers fetch or rebuild those independently.
         """
-        host_root = _host_ale_root()
+        if ale_src_root is None:
+            ale_src_root = _ale_src_root_for(self.sandbox)
+        started = time.monotonic()
+        archive = _build_ale_archive(_host_ale_root())
         sandbox = self.sandbox
         sep = "/" if sandbox.is_linux else "\\"
+        root = ale_src_root.rstrip(sep)
+        parent = root.rsplit(sep, 1)[0]
+        marker = f"{root}{sep}{_ALE_ARCHIVE_MARKER}"
+        remote_archive = f"{parent}{sep}.ale-src-{archive.digest[:16]}.tar.gz"
 
-        await sandbox.mkdir(ale_src_root)
-
-        files: list[tuple[Path, str]] = []
-        patterns = (
-            "*.py",
-            "agents/*/pyproject.toml",
-            # cua MCP bridge source (package.json + package-lock.json + src/*.js).
-            # Shipped so the in-sandbox ensure-step can install the bridge into
-            # mcp_server_dir; node_modules is never shipped (rebuilt on-VM by
-            # npm install). Scoped to the bridge dir so we don't sweep stray
-            # json across the tree. See ensure_cua_mcp_server.
-            "agents/_assets/cua_mcp_server/**/*.js",
-            "agents/_assets/cua_mcp_server/**/*.json",
+        cache_check = _python_command(
+            sandbox,
+            _ALE_ARCHIVE_CACHE_CHECK,
+            marker,
+            archive.digest,
         )
-        for pattern in patterns:
-            for src_path in sorted(host_root.rglob(pattern)):
-                rel = src_path.relative_to(host_root)
-                if "upstream" in rel.parts or "node_modules" in rel.parts:
-                    continue
-                sandbox_rel = "ale_run" + sep + rel.as_posix().replace("/", sep)
-                files.append((src_path, sandbox_rel))
+        cached = await _retry_archive_io(
+            lambda: sandbox.run_command(cache_check, timeout=30),
+            label="archive cache check",
+        )
+        if cached.returncode == 0:
+            logger.info(
+                "sandbox: ale archive cache hit sandbox=%s digest=%s elapsed=%.2fs",
+                sandbox.id, archive.digest[:16], time.monotonic() - started,
+            )
+            return
 
-        for src_path, rel in files:
-            remote_path = f"{ale_src_root.rstrip(sep)}{sep}{rel}"
-            data = src_path.read_bytes()
-            try:
-                remote_bytes = await sandbox.read_file(remote_path)
-                if remote_bytes == data:
-                    continue
-            except FileNotFoundError:
-                pass
-            except RuntimeError:
-                pass  # transport miss → treat as cache miss; overwrite below
-            parent = remote_path.rsplit(sep, 1)[0]
-            await sandbox.mkdir(parent)
-            await sandbox.write_file(remote_path, data)
+        await _retry_archive_io(
+            lambda: sandbox.write_file(remote_archive, archive.payload),
+            label="archive upload",
+        )
+        extract = _python_command(
+            sandbox,
+            _ALE_ARCHIVE_EXTRACT,
+            remote_archive,
+            root,
+            archive.digest,
+        )
+        result = await _retry_archive_io(
+            lambda: sandbox.run_command(extract, timeout=180),
+            label="archive extraction",
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"ale archive extract failed rc={result.returncode}: "
+                f"{(result.stderr or result.stdout or '')[:500]}"
+            )
+        logger.info(
+            "sandbox: ale archive shipped sandbox=%s files=%d source_bytes=%d "
+            "archive_bytes=%d digest=%s elapsed=%.2fs",
+            sandbox.id, archive.files, archive.source_bytes,
+            len(archive.payload), archive.digest[:16], time.monotonic() - started,
+        )
 
     async def _read_pid(self, pid_file: str) -> int | None:
-        """Poll for the launcher's pid file. Returns None on timeout."""
+        """Poll PID via small command responses, never remote file download."""
         deadline = time.monotonic() + _PID_WAIT_S
+        last_transport_error: str | None = None
+        saw_clean_response = False
         while time.monotonic() < deadline:
-            try:
-                raw = (await self.sandbox.read_text(pid_file)).strip()
-                if raw:
-                    try:
-                        return int(raw)
-                    except ValueError:
-                        return None
-            except FileNotFoundError:
-                pass
-            except Exception:                                       # noqa: BLE001
-                pass
+            if self.sandbox.is_linux:
+                command = (
+                    f"if [ -s {shlex.quote(pid_file)} ]; then "
+                    f"printf '__ALE_PID__=%s\\n' \"$(cat {shlex.quote(pid_file)})\"; "
+                    "else exit 3; fi"
+                )
+            else:
+                quoted = pid_file.replace("'", "''")
+                command = (
+                    'powershell -NoProfile -NonInteractive -Command "'
+                    f"if (Test-Path -LiteralPath '{quoted}') {{ "
+                    f"$v=(Get-Content -LiteralPath '{quoted}' -ErrorAction Stop | "
+                    "Select-Object -First 1); "
+                    "if ($v) { Write-Output ('__ALE_PID__=' + $v) } else { exit 3 } "
+                    '} else { exit 3 }"'
+                )
+            remaining = max(0.001, deadline - time.monotonic())
+            result = await self.sandbox.run_command(
+                command, timeout=min(_PID_PROBE_TIMEOUT_S, remaining),
+            )
+            if result.returncode == -1:
+                last_transport_error = (
+                    result.stderr or result.stdout or "unknown transport failure"
+                ).strip()
+            else:
+                saw_clean_response = True
+                pid = _parse_pid_ack(result.stdout) if result.returncode == 0 else None
+                if pid is not None:
+                    return pid
             await asyncio.sleep(_PID_WAIT_TICK_S)
+        if last_transport_error is not None and not saw_clean_response:
+            raise SandboxUnreachableError(
+                f"PID acknowledgement transport failed: {last_transport_error[:300]}"
+            )
         return None
 
     async def _kill(self, pid: int) -> None:
@@ -540,7 +799,19 @@ def _build_launcher(
             "#!/bin/bash\n"
             "set -u\n"
             f"PIDF={shlex.quote(pid_file)}\n"
+            "LOCK=\"${PIDF}.lock\"\n"
+            "if ! mkdir \"$LOCK\" 2>/dev/null; then\n"
+            "  for _ in $(seq 1 120); do\n"
+            "    if [ -s \"$PIDF\" ] && kill -0 \"$(cat \"$PIDF\")\" 2>/dev/null; then\n"
+            "      printf '__ALE_PID__=%s\\n' \"$(cat \"$PIDF\")\"; exit 0\n"
+            "    fi\n"
+            "    sleep 0.25\n"
+            "  done\n"
+            "  exit 75\n"
+            "fi\n"
+            "trap 'rmdir \"$LOCK\" 2>/dev/null || true' EXIT\n"
             "if [ -s \"$PIDF\" ] && kill -0 \"$(cat \"$PIDF\")\" 2>/dev/null; then\n"
+            "  printf '__ALE_PID__=%s\\n' \"$(cat \"$PIDF\")\"\n"
             "  exit 0\n"
             "fi\n"
             f"export PYTHONPATH={shlex.quote(ale_src_root)}:${{PYTHONPATH:-}}\n"
@@ -549,6 +820,7 @@ def _build_launcher(
             f"</dev/null >{shlex.quote(entry_log)} 2>&1 &\n"
             "CHILD=$!\n"
             "echo \"$CHILD\" > \"$PIDF\"\n"
+            "printf '__ALE_PID__=%s\\n' \"$CHILD\"\n"
             "disown $CHILD 2>/dev/null || true\n"
         )
     # Windows: PowerShell launcher
@@ -556,9 +828,11 @@ def _build_launcher(
     # Start-Process with -PassThru to capture the PID.
     py_quoted = python.replace("'", "''")
     src_quoted = ale_src_root.replace("'", "''")
-    spec_quoted = spec_path.replace("'", "''")
     pid_quoted = pid_file.replace("'", "''")
     log_quoted = entry_log.replace("'", "''")
+    argument_line = subprocess.list2cmdline(
+        ["-m", "ale_run.executors._sandbox_entry", spec_path]
+    ).replace("'", "''")
     # Idempotent guard (mirrors the Linux launcher): a dropped spawn-RPC
     # response triggers a host-side retry that re-runs this launcher. Without
     # the guard a second entry would spawn, and since the first entry reads +
@@ -567,21 +841,44 @@ def _build_launcher(
     return (
         "$ErrorActionPreference = 'Continue'\n"
         f"$pidFile = '{pid_quoted}'\n"
+        "$lockDir = $pidFile + '.lock'\n"
+        "$haveLock = $false\n"
+        "try { New-Item -ItemType Directory -Path $lockDir -ErrorAction Stop | Out-Null; "
+        "$haveLock = $true } catch {}\n"
+        "if (-not $haveLock) {\n"
+        "  for ($i=0; $i -lt 120; $i++) {\n"
+        "    if (Test-Path $pidFile) {\n"
+        "      $waitPid=(Get-Content $pidFile -ErrorAction SilentlyContinue | Select-Object -First 1)\n"
+        "      if ($waitPid -and (Get-Process -Id ([int]$waitPid) -ErrorAction SilentlyContinue)) "
+        "{ Write-Output ('__ALE_PID__=' + $waitPid); exit 0 }\n"
+        "    }\n"
+        "    Start-Sleep -Milliseconds 250\n"
+        "  }\n"
+        "  exit 75\n"
+        "}\n"
+        "try {\n"
         "if (Test-Path $pidFile) {\n"
         "  $oldPid = (Get-Content $pidFile -ErrorAction SilentlyContinue | Select-Object -First 1)\n"
         "  if ($oldPid) {\n"
         "    $running = Get-Process -Id ([int]$oldPid) -ErrorAction SilentlyContinue\n"
-        "    if ($running) { exit 0 }\n"
+        "    if ($running) { Write-Output ('__ALE_PID__=' + $oldPid); exit 0 }\n"
         "  }\n"
         "}\n"
         f"$env:PYTHONPATH = '{src_quoted};' + $env:PYTHONPATH\n"
         f"$proc = Start-Process -FilePath '{py_quoted}' "
-        f"-ArgumentList '-m','ale_run.executors._sandbox_entry','{spec_quoted}' "
+        f"-ArgumentList '{argument_line}' "
         f"-WindowStyle Hidden -PassThru "
         f"-RedirectStandardOutput '{log_quoted}' "
         f"-RedirectStandardError '{log_quoted}.err'\n"
         f"$proc.Id | Out-File -FilePath $pidFile -Encoding ascii -NoNewline\n"
+        "Write-Output ('__ALE_PID__=' + $proc.Id)\n"
+        "} finally { Remove-Item -LiteralPath $lockDir -Force -ErrorAction SilentlyContinue }\n"
     )
+
+
+def _parse_pid_ack(stdout: str | None) -> int | None:
+    match = re.search(r"__ALE_PID__=(\d+)", stdout or "")
+    return int(match.group(1)) if match else None
 
 
 # ======================================================================
@@ -641,13 +938,25 @@ async def tail_hot_artifacts(
         prev_size: int | None = None
         target_err: str | None = None
         for _ in range(_TAIL_RECONCILE_RETRIES + 1):
-            if time.monotonic() > deadline:
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
                 target_err = (
                     f"reconcile timeout after {_TAIL_RECONCILE_TIMEOUT_S}s for {src}"
                 )
                 break
             try:
-                size = await _tick_one(executor, src, dst, offsets)
+                size = await asyncio.wait_for(
+                    _tick_one(
+                        executor, src, dst, offsets,
+                        timeout_s=max(0.001, remaining_s),
+                    ),
+                    timeout=max(0.001, remaining_s),
+                )
+            except asyncio.TimeoutError:
+                target_err = (
+                    f"reconcile timeout after {_TAIL_RECONCILE_TIMEOUT_S}s for {src}"
+                )
+                break
             except Exception as e:                                  # noqa: BLE001
                 target_err = f"tick raised for {src}: {e}"
                 await asyncio.sleep(_TAIL_RECONCILE_DELAY_S)
@@ -658,7 +967,12 @@ async def tail_hot_artifacts(
                 continue
             target_err = None  # a successful pull clears a prior transient error
             if size == prev_size:
-                break          # size stabilized → host mirror is complete
+                if size == _TICK_NO_FILE or offsets[src] == size:
+                    break
+                target_err = (
+                    f"reconcile incomplete for {src}: "
+                    f"{offsets[src]}/{size} bytes committed"
+                )
             prev_size = size
             await asyncio.sleep(_TAIL_RECONCILE_DELAY_S)
         if target_err and last_err is None:
@@ -671,12 +985,16 @@ async def _tick_one(
     src: str,
     dst: Path,
     offsets: dict[str, int],
+    timeout_s: float | None = None,
 ) -> int:
     """Pull a chunk starting at ``offsets[src]``, commit jsonl-safe to
     ``dst``, return the remote size."""
     start = offsets[src]
     rr = await executor.download_range(
-        src=src, start=start, max_bytes=_TAIL_CHUNK_BYTES,
+        src=src,
+        start=start,
+        max_bytes=_TAIL_CHUNK_BYTES,
+        timeout_s=timeout_s,
     )
     if not rr.success:
         return _TICK_FAILED
@@ -734,6 +1052,91 @@ def _local_offset(dst: Path) -> int:
 def _host_ale_root() -> Path:
     """Host's ``ale_run/`` package root."""
     return Path(__file__).resolve().parents[1]
+
+
+def _build_ale_archive(host_root: Path) -> _AleArchive:
+    """Build a deterministic gzip-compressed tarball for one source root."""
+    files: list[Path] = []
+    patterns = (
+        "*.py",
+        "agents/*/pyproject.toml",
+        "agents/_assets/cua_mcp_server/**/*.js",
+        "agents/_assets/cua_mcp_server/**/*.json",
+    )
+    for pattern in patterns:
+        for src_path in sorted(host_root.rglob(pattern)):
+            rel = src_path.relative_to(host_root)
+            if "upstream" in rel.parts or "node_modules" in rel.parts:
+                continue
+            files.append(src_path)
+
+    out = io.BytesIO()
+    source_bytes = 0
+    with gzip.GzipFile(
+        fileobj=out,
+        mode="wb",
+        filename="",
+        mtime=0,
+        compresslevel=6,
+    ) as compressed:
+        with tarfile.open(
+            fileobj=compressed,
+            mode="w",
+            format=tarfile.PAX_FORMAT,
+        ) as tf:
+            for src_path in files:
+                data = src_path.read_bytes()
+                source_bytes += len(data)
+                rel = src_path.relative_to(host_root).as_posix()
+                info = tarfile.TarInfo(name=f"ale_run/{rel}")
+                info.size = len(data)
+                info.mode = stat.S_IMODE(src_path.stat().st_mode)
+                info.mtime = 0
+                info.uid = info.gid = 0
+                info.uname = info.gname = ""
+                tf.addfile(info, io.BytesIO(data))
+
+    payload = out.getvalue()
+    return _AleArchive(
+        payload=payload,
+        digest=hashlib.sha256(payload).hexdigest(),
+        files=len(files),
+        source_bytes=source_bytes,
+    )
+
+
+def _python_command(
+    sandbox: SandboxHandle,
+    script: str,
+    *args: str,
+) -> str:
+    """Build a shell-safe command that runs ``script`` with string args."""
+    encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    bootstrap = f"import base64;exec(base64.b64decode('{encoded}'))"
+    argv = [sandbox.python, "-c", bootstrap, *args]
+    if sandbox.is_linux:
+        return " ".join(shlex.quote(part) for part in argv)
+    return subprocess.list2cmdline(argv)
+
+
+async def _retry_archive_io(operation: Any, *, label: str) -> Any:
+    """Retry transport-level archive I/O failures with a short backoff."""
+    for attempt in range(_ARCHIVE_IO_RETRIES):
+        try:
+            result = await operation()
+            if getattr(result, "returncode", 0) < 0:
+                detail = getattr(result, "stderr", "") or getattr(result, "stdout", "")
+                raise RuntimeError(f"transport rc={result.returncode}: {detail[:200]}")
+            return result
+        except RuntimeError:
+            if attempt == _ARCHIVE_IO_RETRIES - 1:
+                raise
+            logger.warning(
+                "sandbox: %s transport failure (attempt %d/%d); retrying",
+                label, attempt + 1, _ARCHIVE_IO_RETRIES,
+            )
+            await asyncio.sleep(_ARCHIVE_IO_BACKOFFS_S[attempt])
+    raise AssertionError("unreachable")
 
 
 def _config_to_kwargs(cfg: Any) -> dict[str, Any]:

@@ -101,6 +101,7 @@ _ALIYUN_RETRYABLE_TRANSIENT = [          # matched against ErrorCode
 _TRANSIENT_TRANSPORT = [                  # matched against full stderr (no ErrorCode)
     "connection reset", "connection refused", "timed out", "timeout",
     "could not connect", "connection aborted", "i/o timeout", "no such host",
+    ": eof", "unexpected eof", "tls handshake timeout",
 ]
 _ALIYUN_RETRYABLE_ZONE = [               # matched against ErrorCode + message
     "operationdenied.nostock", "nostock", "out of stock",
@@ -187,6 +188,7 @@ class AliyunProviderConfig:
     internet_max_bandwidth_out: int = 100
     system_disk_category: str = "cloud_essd"
     instance_charge_type: str = "PostPaid"
+    cpu_instance_family: str = "ecs.g7"
     output_to_bucket: bool = False
     """Set by the config loader when ``output_path`` is an ``oss://`` bucket. It
     turns a missing ``ram_role_name`` from a tolerated skip into a hard error —
@@ -251,6 +253,7 @@ def _build_provider_config(raw: dict[str, Any]) -> AliyunProviderConfig:
         internet_max_bandwidth_out=int(raw.get("internet_max_bandwidth_out", 100)),
         system_disk_category=str(raw.get("system_disk_category") or "cloud_essd"),
         instance_charge_type=str(raw.get("instance_charge_type") or "PostPaid"),
+        cpu_instance_family=str(raw.get("cpu_instance_family") or "ecs.g7"),
         output_to_bucket=bool(raw.get("output_to_bucket", False)),
         snapshots=snapshots,
     )
@@ -296,7 +299,12 @@ _ECS_G7_SIZES: tuple[tuple[int, str], ...] = (
 )
 
 
-def _resolve_instance_type(machine_type: str | None, *, is_gpu: bool) -> str:
+def _resolve_instance_type(
+    machine_type: str | None,
+    *,
+    is_gpu: bool,
+    cpu_instance_family: str = "ecs.g7",
+) -> str:
     """Concrete ecs instance type for a task card's ``vm.machineType``.
 
     Task cards carry GCE-style names (``c4-standard-4``, ``g2-standard-8``) —
@@ -309,7 +317,7 @@ def _resolve_instance_type(machine_type: str | None, *, is_gpu: bool) -> str:
       only tells us the vCPU count, not that we want an Alibaba GPU SKU — that
       choice lives in the snapshot's ``gpu`` field.
     """
-    default = _DEFAULT_GPU_INSTANCE if is_gpu else _DEFAULT_CPU_INSTANCE
+    default = _DEFAULT_GPU_INSTANCE if is_gpu else f"{cpu_instance_family}.2xlarge"
     if not machine_type:
         return default
     if machine_type.startswith("ecs."):
@@ -325,7 +333,7 @@ def _resolve_instance_type(machine_type: str | None, *, is_gpu: bool) -> str:
     size = next(
         (s for cap, s in _ECS_G7_SIZES if shape.vcpus <= cap), _ECS_G7_SIZES[-1][1]
     )
-    return f"ecs.g7.{size}"
+    return f"{cpu_instance_family}.{size}"
 
 
 # ============================================================================
@@ -374,9 +382,43 @@ async def _run_aliyun(product: str, action: str, *args: str) -> tuple[int, str, 
     stdout_b, stderr_b = await proc.communicate()
     return (
         proc.returncode or 0,
-        stdout_b.decode(errors="replace"),
-        stderr_b.decode(errors="replace"),
+        _sanitize_aliyun_error(stdout_b.decode(errors="replace")),
+        _sanitize_aliyun_error(stderr_b.decode(errors="replace")),
     )
+
+
+_SIGNED_QUERY_VALUE = re.compile(
+    r"(?i)(AccessKeyId|Signature|SecurityToken|AccessKeySecret)=([^&\s\"']+)"
+)
+
+
+def _sanitize_aliyun_error(message: str) -> str:
+    """Redact signed-query credential material before logging or persistence."""
+    return _SIGNED_QUERY_VALUE.sub(r"\1=[REDACTED]", message)
+
+
+async def _run_aliyun_read(
+    product: str, action: str, *args: str,
+) -> tuple[int, str, str]:
+    """Retry idempotent Aliyun read APIs on transport/service transients."""
+    last = (1, "", "unknown Aliyun read failure")
+    for attempt in range(1, _ALIYUN_MAX_RETRIES_TRANSIENT + 1):
+        last = await _run_aliyun(product, action, *args)
+        rc, _, stderr = last
+        if rc == 0 or not _is_transient_error(stderr):
+            return last
+        if attempt < _ALIYUN_MAX_RETRIES_TRANSIENT:
+            delay = _ALIYUN_TRANSIENT_BASE_DELAY * (2 ** (attempt - 1))
+            logger.warning(
+                "%s transient error (attempt %d/%d): %s; retrying in %ds",
+                action,
+                attempt,
+                _ALIYUN_MAX_RETRIES_TRANSIENT,
+                stderr[:200],
+                delay,
+            )
+            await asyncio.sleep(delay)
+    return last
 
 
 def _error_code(stderr: str) -> str:
@@ -685,7 +727,7 @@ class AliyunProvider(Provider):
         if not name:
             self._ram_role = ""
             return ""
-        rc, _, _ = await _run_aliyun("ram", "GetRole", "--RoleName", name)
+        rc, _, _ = await _run_aliyun_read("ram", "GetRole", "--RoleName", name)
         if rc == 0:
             self._ram_role = name
         elif self._cfg.output_to_bucket:
@@ -714,7 +756,7 @@ class AliyunProvider(Provider):
         family = snap.image
         if family in self._image_cache:
             return self._image_cache[family]
-        rc, out, err = await _run_aliyun(
+        rc, out, err = await _run_aliyun_read(
             "ecs", "DescribeImages",
             "--RegionId", self._cfg.region,
             "--ImageOwnerAlias", "self",
@@ -750,7 +792,7 @@ class AliyunProvider(Provider):
         ref = self._cfg.security_group
         sel = (["--SecurityGroupId", ref] if ref.startswith("sg-")
                else ["--SecurityGroupName", ref])
-        rc, out, err = await _run_aliyun(
+        rc, out, err = await _run_aliyun_read(
             "ecs", "DescribeSecurityGroups",
             "--RegionId", self._cfg.region, *sel,
         )
@@ -781,7 +823,7 @@ class AliyunProvider(Provider):
             "--ZoneId", zone_id,
             "--VpcId", vpc_id,
         ]
-        rc, out, err = await _run_aliyun("ecs", "DescribeVSwitches", *base)
+        rc, out, err = await _run_aliyun_read("ecs", "DescribeVSwitches", *base)
         vswitch = ""
         if rc == 0:
             try:
@@ -824,7 +866,11 @@ class AliyunProvider(Provider):
         is_gpu = snap.gpu is not None
         zones = snap.zones
 
-        base_instance = _resolve_instance_type(spec.machine_type, is_gpu=is_gpu)
+        base_instance = _resolve_instance_type(
+            spec.machine_type,
+            is_gpu=is_gpu,
+            cpu_instance_family=self._cfg.cpu_instance_family,
+        )
         instances = _instance_chain(base_instance, is_gpu=is_gpu)
 
         # Resolve the image-family name (e.g. "ale-win10") to a concrete image id,
@@ -911,6 +957,7 @@ class AliyunProvider(Provider):
             # this resolves the in-box paths/port directly — one registry entry
             # serves all providers.
             from ..images import get as get_image
+
             image = get_image(snap.image)
 
             cua_url = f"http://{public_ip}:{image.cua_server_port}"

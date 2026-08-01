@@ -409,6 +409,7 @@ _AWS_CRED_KEYS = (
 _ALIYUN_CRED_KEYS = (
     "region", "security_group", "instance_prefix", "key_name", "ram_role_name",
     "internet_max_bandwidth_out", "system_disk_category", "instance_charge_type",
+    "cpu_instance_family",
 )
 
 

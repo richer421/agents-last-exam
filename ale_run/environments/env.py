@@ -114,12 +114,26 @@ class ALEEnv(Environment[Action, Observation, State]):
         if self._session is not None:
             await _force_close_session(self._session)
         self._session = None
-        if self._sandbox is not None:
-            try:
-                await self._provider.release(self._sandbox, mode=mode)
-            except Exception as e:
-                logger.warning("provider.release failed for %s: %s", self._sandbox.id, e)
-        self._sandbox = None
+        sandbox = self._sandbox
+        if sandbox is not None:
+            last_error: Exception | None = None
+            for attempt in range(1, 4):
+                try:
+                    await self._provider.release(sandbox, mode=mode)
+                    self._sandbox = None
+                    return
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        "provider.release attempt %d/3 failed for %s: %s",
+                        attempt,
+                        sandbox.id,
+                        e,
+                    )
+                    if attempt < 3:
+                        await asyncio.sleep(0.5 * attempt)
+            assert last_error is not None
+            raise last_error
 
     async def step_async(self, *args: Any, **kwargs: Any) -> Observation:
         raise NotImplementedError(
@@ -171,4 +185,3 @@ async def _force_close_session(session: Any) -> None:
         await asyncio.wait_for(session.close(), timeout=10)
     except (asyncio.TimeoutError, Exception) as e:
         logger.debug("session.close failed/timed out: %s", e)
-
