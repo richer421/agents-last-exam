@@ -95,6 +95,11 @@ class AuthorWorkspace:
                     "malformed Git status entry",
                 )
             status_code = record[:2]
+            if status_code == b"!!":
+                raise AtomicInfrastructureError(
+                    "author_workspace",
+                    "ignored authoring output would not be committed",
+                )
             if b"R" in status_code or b"C" in status_code:
                 raise AtomicInfrastructureError(
                     "author_workspace",
@@ -253,6 +258,7 @@ def _git_control_fingerprint(root: Path) -> str:
     protected = (
         git_directory / "config",
         git_directory / "HEAD",
+        git_directory / "index",
         git_directory / "packed-refs",
         git_directory / "shallow",
         git_directory / "hooks",
@@ -277,6 +283,7 @@ def _git_control_fingerprint(root: Path) -> str:
             status_result = entry.lstat()
             digest.update(relative)
             digest.update(stat.S_IFMT(status_result.st_mode).to_bytes(4, "big"))
+            digest.update(stat.S_IMODE(status_result.st_mode).to_bytes(2, "big"))
             if stat.S_ISREG(status_result.st_mode):
                 payload = entry.read_bytes()
                 if len(payload) > _MAX_PROCESS_OUTPUT_BYTES:

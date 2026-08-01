@@ -217,6 +217,30 @@ def test_workspace_rejects_author_mutation_of_git_control_state(tmp_path: Path) 
             workspace.validate_diff()
 
 
+def test_workspace_rejects_ignored_evaluator_output_that_would_not_be_committed(
+    tmp_path: Path,
+) -> None:
+    source, commit = _source_repository(tmp_path)
+    (source / ".gitignore").write_text(
+        "tasks/demo/example/evaluator/*.cache\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(source), "add", ".gitignore"], check=True)
+    subprocess.run(
+        ["git", "-C", str(source), "commit", "-qm", "ignore evaluator cache"],
+        check=True,
+    )
+    commit = _git(source, "rev-parse", "HEAD")
+
+    with isolated_author_workspace(source, _request(commit)) as workspace:
+        evaluator = workspace.task_directory / "evaluator"
+        evaluator.mkdir()
+        (evaluator / "generated.cache").write_text("must be committed\n", encoding="utf-8")
+
+        with pytest.raises(AtomicInfrastructureError, match="ignored"):
+            workspace.validate_diff()
+
+
 def test_workspace_is_removed_after_context_exit(tmp_path: Path) -> None:
     source, commit = _source_repository(tmp_path)
 
