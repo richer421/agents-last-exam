@@ -275,6 +275,19 @@ async def test_author_agent_rejects_invalid_rubric_plan(
 
 
 @pytest.mark.asyncio
+async def test_author_agent_reports_invalid_rubric_plan_fields(tmp_path: Path) -> None:
+    plan = _valid_plan()
+    plan["rubrics"] = plan.pop("items")
+    agent = AuthorAgent(_author_script(tmp_path, plan=plan), timeout_seconds=5)
+
+    with pytest.raises(AtomicInfrastructureError) as caught:
+        await agent.author(_request(), _workspace(tmp_path), _bundle())
+
+    assert "items: Field required" in caught.value.message
+    assert "rubrics: Extra inputs are not permitted" in caught.value.message
+
+
+@pytest.mark.asyncio
 async def test_author_agent_rejects_code_created_before_valid_plan(tmp_path: Path) -> None:
     agent = AuthorAgent(
         _author_script(tmp_path, phase_one_extra=True),

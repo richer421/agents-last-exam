@@ -31,6 +31,7 @@ from .contracts import (
     AuthorEvaluatorResult,
     EvaluatorRegistryRecord,
     ReferenceManifest,
+    RubricPlan,
 )
 from .github_publish import (
     GhGitHubClient,
@@ -376,6 +377,7 @@ async def _default_input_loader(
         {
             "evaluator_sdk_version": request.evaluator_sdk_version,
             "implementation_modes": ["programmatic", "llm_judge", "hybrid"],
+            "rubric_plan_schema": RubricPlan.model_json_schema(),
             "reward_path": "/logs/verifier/reward.json",
             "details_path": "/logs/verifier/reward-details.json",
         },

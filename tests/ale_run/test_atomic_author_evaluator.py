@@ -140,6 +140,9 @@ async def test_default_input_loader_accepts_large_photoshop_reference(
     bundle = await _default_input_loader(request, workspace)
 
     assert len(bundle.reference_artifacts["final_result.psd"]) == len(artifact)
+    sdk_contract = json.loads(bundle.evaluator_sdk_contract)
+    assert sdk_contract["rubric_plan_schema"] == RubricPlan.model_json_schema()
+    assert sdk_contract["rubric_plan_schema"]["additionalProperties"] is False
 
 
 class FakeRegistry:

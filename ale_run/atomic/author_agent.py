@@ -449,7 +449,17 @@ def _load_rubric_plan(path: Path) -> RubricPlan:
     try:
         return RubricPlan.model_validate_json(payload)
     except ValidationError as exc:
-        raise AtomicInfrastructureError("author_agent", "invalid rubric-plan.json") from exc
+        errors = exc.errors(
+            include_url=False,
+            include_context=False,
+            include_input=False,
+        )
+        details = "; ".join(
+            f"{'.'.join(str(part) for part in error['loc']) or '$'}: {error['msg']}"
+            for error in errors
+        )
+        message = f"invalid rubric-plan.json: {details}"[:4_000]
+        raise AtomicInfrastructureError("author_agent", message) from exc
 
 
 def _validate_rubric_coverage(
