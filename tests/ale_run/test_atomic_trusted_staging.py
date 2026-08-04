@@ -813,6 +813,35 @@ async def test_oss_metadata_accepts_documented_timezone_spaces_and_unicode_keys(
 
 
 @pytest.mark.asyncio
+async def test_oss_metadata_accepts_blank_line_before_elapsed_footer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_prefix = "oss://private-bucket/tasks/demo/toy/base/input/"
+    input_url = f"{input_prefix}required.txt"
+    calls: list[tuple[str, ...]] = []
+
+    async def host_ossutil(*arguments: str):
+        calls.append(arguments)
+        if arguments[0] == "ls":
+            if "/software/" in arguments[3]:
+                return 0, b"Object Number is: 0\n\n0.001(s) elapsed\n", b""
+            return 0, _oss_listing([(1, input_url)]) + b"\n0.123(s) elapsed\n", b""
+        Path(arguments[4]).write_bytes(b"x")
+        return 0, b"", b""
+
+    monkeypatch.setattr("ale_run.atomic.trusted_staging.run_host_ossutil", host_ossutil)
+
+    async with prepare_atomic_input(
+        source="oss://private-bucket/tasks",
+        task_data=_task_data(),
+        declared_input_paths=("input/required.txt",),
+    ):
+        pass
+
+    assert [call[3] for call in calls if call[0] == "cp"] == [input_url]
+
+
+@pytest.mark.asyncio
 async def test_oss_metadata_rejects_a_backward_pagination_marker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

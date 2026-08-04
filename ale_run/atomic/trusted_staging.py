@@ -671,6 +671,8 @@ async def _list_prefix_objects(
             lines.pop()
         if lines and _OSS_LIST_ELAPSED_RE.fullmatch(lines[-1]):
             lines.pop()
+            while lines and not lines[-1]:
+                lines.pop()
         if lines == ["Object Number is: 0"]:
             row_lines: list[str] = []
             page_count = 0
